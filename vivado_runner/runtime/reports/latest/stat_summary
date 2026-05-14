@@ -1,0 +1,13 @@
+================ Run Configuration ================
+Host                : 1216530906db
+SVN Version         : unknown_svn
+Parallel Max        : 12
+Time Limit(s)       : 10800
+Enabled Modules     : write_bitstream, bit_cmp, msk_cmp, bgn_cmp
+================ Statistics =======================
+Total Cases         : 2
+Pass Cases          : 2
+Failed Cases        : 0
+Timeout Cases       : 0
+Average Runtime(s)  : 0.5
+===================================================

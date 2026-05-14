@@ -1,0 +1,37 @@
+# report_timing_summary
+report_timing_summary 0
+
+# opt_design
+opt_design 0
+
+# place_design
+place_design 0
+
+# place_design_from_syn
+place_design_from_syn 0
+
+# phys_opt_design
+phys_opt_design 0
+
+# route_design
+route_design 0
+
+# route_design_from_place
+route_design_from_place 0
+
+# write checkpoint
+write_checkpoint 0
+
+# write output.bit
+write_bitstream 1
+  # bit compare
+  bit_cmp 1
+  # msk compare
+  msk_cmp 1
+  # bgn compare
+  bgn_cmp 1
+
+dcp_cmp 0
+checksum_cmp 0
+# enable report copy when run.sh uses --copy
+enable_copy 0

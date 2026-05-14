@@ -1,0 +1,2 @@
+/tmp/build_test2_pkg/project/test2/kintexplus/sample/demo/run.tcl
+/tmp/build_test2_pkg/project/test2/virtexplus/sample/demo/run.tcl

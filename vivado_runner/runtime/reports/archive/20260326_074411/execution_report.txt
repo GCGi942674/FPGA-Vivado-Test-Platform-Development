@@ -1,0 +1,17 @@
+Execution Report
+================
+Host: 1216530906db
+SVN Version: unknown_svn
+Flow Config: /tmp/build_test2_pkg/project/test2/flow_config
+Enabled Modules: write_bitstream, bit_cmp, msk_cmp, bgn_cmp
+Parallel Max: 12
+Time Limit(s): 10800
+
+Total cases: 2
+PASS: 2
+FAIL/TIMEOUT: 0
+TIMEOUT: 0
+Average runtime (sec): 0.5
+
+Top failure reasons:
+  PASS: 2

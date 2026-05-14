@@ -1,0 +1,11 @@
+[2026-03-26 07:44:05] [INFO] Workspace root: /tmp/build_test2_pkg/project/test2
+[2026-03-26 07:44:05] [INFO] Input target: .
+[2026-03-26 07:44:05] [INFO] Flow config: /tmp/build_test2_pkg/project/test2/flow_config
+[2026-03-26 07:44:05] [INFO] Runtime root: /tmp/build_test2_pkg/project/test2/vivado_runner/runtime
+[2026-03-26 07:44:05] [INFO] Discovered 2 case(s)
+[2026-03-26 07:44:05] [INFO] Dispatching: /tmp/build_test2_pkg/project/test2/kintexplus/sample/demo/run.tcl
+[2026-03-26 07:44:05] [INFO] Dispatching: /tmp/build_test2_pkg/project/test2/virtexplus/sample/demo/run.tcl
+[2026-03-26 07:44:11] [INFO] Skip copying reports. Use --copy to export final summary.
+[2026-03-26 07:44:11] [INFO] Latest summary: /tmp/build_test2_pkg/project/test2/vivado_runner/runtime/reports/latest/runTime_Summary
+[2026-03-26 07:44:11] [INFO] Latest fail list: /tmp/build_test2_pkg/project/test2/vivado_runner/runtime/reports/latest/list_fail_to_run
+[2026-03-26 07:44:11] [INFO] Latest stat file: /tmp/build_test2_pkg/project/test2/vivado_runner/runtime/reports/latest/stat_summary

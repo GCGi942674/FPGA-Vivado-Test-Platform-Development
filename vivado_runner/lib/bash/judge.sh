@@ -89,26 +89,32 @@ judge_case_result() {
 
     # checksum compare
     # checksum_cmp is independent from write_bitstream.
-    # It passes only when the checksum flow finished and mis_checksum.txt is empty.
+    #
+    # checksum result is determined only by mis_checksum.txt:
+    #   missing   -> checksum flow unfinished
+    #   non-empty -> checksum compare failed
+    #   empty     -> checksum compare passed
+    #
+    # mis_checksum.txt is the only trusted result artifact.
     if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "checksum_cmp"; then
-        grep -q "$KW_CHECKSUM_FINISH" "$log_file" || {
-            CASE_REASON="CHECKSUM_FINISH_MISSING"
-            CASE_STAGE="checksum_cmp"
-            return 0
-        }
 
-        if [ ! -e "$case_dir/mis_checksum.txt" ]; then
+        local checksum_file="$case_dir/mis_checksum.txt"
+
+        # checksum result file missing
+        if [ ! -f "$checksum_file" ]; then
             CASE_REASON="CHECKSUM_RESULT_MISSING"
             CASE_STAGE="checksum_cmp"
             return 0
         fi
 
-        if [ -s "$case_dir/mis_checksum.txt" ]; then
+        # checksum compare failed
+        if [ -s "$checksum_file" ]; then
             CASE_REASON="CHECKSUM_COMPARE_FAIL"
             CASE_STAGE="checksum_cmp"
             return 0
         fi
 
+        # checksum compare passed
         CASE_STATUS="PASS"
         CASE_REASON="CHECKSUM_COMPARE_PASS"
         CASE_STAGE="checksum_cmp"

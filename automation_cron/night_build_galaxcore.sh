@@ -210,7 +210,13 @@ run_step() {
     log "============================================================"
 
     set +e
-    "$@" >> "$LOG_FILE" 2>&1
+
+    if [[ "$step_name" == "mk compile" ]]; then
+        "$@" > /dev/null 2>&1
+    else
+        "$@" >> "$LOG_FILE" 2>&1
+    fi
+
     rc=$?
     set -e
 

@@ -125,7 +125,7 @@ def build_reports(records, meta):
     for rec in records:
         if rec.get('STATUS', 'UNKNOWN') == 'PASS':
             summary_lines.append(
-                f"Runtime: {rec.get('RUNTIME_SEC', '0')}  {rec.get('CASE_DIR', '')}"
+                f"{rec.get('CASE_DIR', '')}"
             )
 
     failed_lines = []

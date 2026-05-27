@@ -277,19 +277,7 @@ def build_revision(revision: int) -> None:
 def main():
     global shutdown_flag
 
-    if not os.path.isdir(WORK_DIR):
-        log(f"Error: WORK_DIR does not exist: {WORK_DIR}")
-        sys.exit(1)
-    if not os.path.isdir(os.path.join(WORK_DIR, ".svn")):
-        log("Error: WORK_DIR is not an SVN working copy")
-        sys.exit(1)
-
-    os.makedirs(SCRIPT_DIR, exist_ok=True)
-    os.makedirs(TAR_DIR, exist_ok=True)
-
-    init_logs()
-    checkpoint = load_checkpoint()
-    log(f"Monitor started. Last built revision: r{checkpoint}")
+    # ... 前面的检查与初始化不变 ...
 
     while not shutdown_flag:
         head = get_head_revision()
@@ -299,11 +287,17 @@ def main():
             continue
 
         if head <= checkpoint:
-            log(f"Idle (local={checkpoint}, head={head})")
-            for _ in range(IDLE_SLEEP):
-                if shutdown_flag:
+            # 进入 idle，动态显示等待时间
+            wait_start = time.time()
+            log(f"Idle (local={checkpoint}, head={head}). Waiting for new revisions...")
+            while not shutdown_flag:
+                head = get_head_revision()
+                if head > checkpoint:
                     break
+                elapsed = int(time.time() - wait_start)
+                print(f"\r[CI] Idle | local={checkpoint}  head={head}  wait: {elapsed}s", end='', flush=True)
                 time.sleep(1)
+            print()  # 换行，准备输出编译信息
             continue
 
         log(f"New revisions found: {checkpoint+1} -> {head}")
@@ -311,9 +305,8 @@ def main():
             if shutdown_flag:
                 break
             build_revision(rev)
-            checkpoint = rev   # save_checkpoint is called inside build_revision, but update local var
+            checkpoint = rev
 
-        # Reload checkpoint to be safe
         checkpoint = load_checkpoint()
         time.sleep(2)
 

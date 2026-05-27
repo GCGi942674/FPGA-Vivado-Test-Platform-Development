@@ -212,7 +212,7 @@ void init_log()
     f << "Starting monitor time: " << now() << "\n";
     f << "Starting version: r" << load_checkpoint() << "\n";
     f << "============================================================\n";
-    f << "No.\tRevision\tAuthor\tTime\t\t\tResult\n";
+    f << "No.\t\tRevision\t\tAuthor\t\tTime\t\t\tResult\n";
     f << "------------------------------------------------------------\n";
 }
 
@@ -225,14 +225,8 @@ void log_row(int rev,
 {
     std::ofstream f(HISTORY_LOG, std::ios::app);
 
-    build_no++;
-
-    f << build_no << "\t"
-      << "r" << rev << "\t"
-      << author << "\t"
-      << time << "\t"
-      << result
-      << "\n";
+    f << "r" << rev << " | " << author << " | " << time << " | " << result << "\n";
+    f << "------------------------------------------------------------\n";
 }
 
 // ================= FAIL LOG =================
@@ -318,14 +312,21 @@ int main()
 
         if (head <= local)
         {
-            std::cout
-                << "[CI] idle | local="
-                << local
-                << " head="
-                << head
-                << std::endl;
+            time_t wait_start = time(nullptr);
 
-            sleep(10);
+            // Idle loop: update display every second, exit when new revision appears
+            while (running && get_head() <= local)
+            {
+                int elapsed = static_cast<int>(time(nullptr) - wait_start);
+                std::cout << "\r[CI] Idle | local=" << local
+                        << " head=" << head
+                        << " wait: " << elapsed << "s" << std::flush;
+                sleep(1);
+            }
+            std::cout << std::endl;  // newline after idle ends
+
+            // Refresh head for the outer loop
+            head = get_head();
             continue;
         }
 

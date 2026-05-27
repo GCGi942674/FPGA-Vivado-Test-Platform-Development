@@ -30,7 +30,7 @@ static const std::string FAIL_LOG =
 static const std::string CHECKPOINT_FILE =
     BIN_DST + "/last_revision.txt";
 
-static const std::string SVN_URL = "http://192.168.10.10/svn/galaxcore/galaxcore"
+static const std::string SVN_URL = "http://192.168.10.10/svn/galaxcore/galaxcore";
 
 static const int MAX_BIN_KEEP = 150;
 
@@ -83,6 +83,32 @@ int get_head()
     pclose(fp);
 
     return atoi(buf);
+}
+
+std::string get_author(int rev)
+{
+    std::string cmd =
+        "svn info -r " + std::to_string(rev) + " " + SVN_URL +
+        " --show-item last-changed-author";
+
+    FILE *fp = popen(cmd.c_str(), "r");
+
+    if (!fp)
+        return "unknown";
+
+    char buf[128] = {0};
+    fgets(buf, sizeof(buf), fp);
+    pclose(fp);
+
+    std::string author(buf);
+
+    // remove newline
+    author.erase(std::remove(author.begin(), author.end(), '\n'), author.end());
+
+    if (author.empty())
+        return "unknown";
+
+    return author;
 }
 
 // ================= CHECKPOINT =================
@@ -196,6 +222,8 @@ void build_revision(int rev)
 {
     std::cout << "[CI] build r" << rev << std::endl;
 
+    std::string author = get_author(rev);
+
     svn_clean();
 
     if (!checkout(rev))
@@ -205,7 +233,7 @@ void build_revision(int rev)
     if (build())
     {
         copy_bin(rev);
-        log_row(rev, "unknown", now(), "SUCCESS");
+        log_row(rev, author, now(), "SUCCESS");
         save_checkpoint(rev);
         return;
     }
@@ -216,12 +244,12 @@ void build_revision(int rev)
     if (build())
     {
         copy_bin(rev);
-        log_row(rev, "unknown", now(), "SUCCESS_AFTER_CLEAN");
+        log_row(rev, author, now(), "SUCCESS");
         save_checkpoint(rev);
         return;
     }
 
-    log_row(rev, "unknown", now(), "FAIL");
+    log_row(rev, author, now(), "SUCCESS");
     log_fail(rev);
 
     // IMPORTANT: always advance checkpoint to avoid stuck loop

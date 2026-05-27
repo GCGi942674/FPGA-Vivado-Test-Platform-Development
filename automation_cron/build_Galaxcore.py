@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+build_Galaxcore - continuously compile each SVN revision of Galaxcore.
+Working directory: /home/user3/workspace/galaxcore
+Binary source:     /home/user3/workspace/galaxcore/bin/Linux_64/GalaxCore
+ZIP archives:      /home/xiaonan/Share/zw_cache/Galaxcore_bin/zip/
+Logs & state:      /home/xiaonan/Share/zw_cache/Galaxcore_bin/
+"""
 
 import os
 import sys
@@ -7,354 +13,311 @@ import time
 import signal
 import shutil
 import subprocess
-from datetime import datetime
+import glob
+import re
+import struct
 
-# ================= CONFIG =================
+# ------------------ Configuration ------------------
+WORK_DIR        = "/home/user3/workspace/galaxcore"
+BIN_SRC         = os.path.join(WORK_DIR, "bin/Linux_64/GalaxCore")
+SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
+TAR_DIR         = os.path.join(SCRIPT_DIR, "zip")
+HISTORY_LOG     = os.path.join(SCRIPT_DIR, "build_history.log")
+FAIL_LOG        = os.path.join(SCRIPT_DIR, "mk_fail")
+CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, "last_revision.txt")
+SVN_URL         = "http://192.168.10.10/svn/galaxcore/galaxcore"
+MAX_BIN_KEEP    = 150
 
-WORK_DIR = "/home/user3/workspace/galaxcore"
+# Build command (adjust if needed)
+MAKE_CMD        = ["csh", "-c", "mk"]
+MAKE_CLEAN_CMD  = ["make", "clean"]
 
-BIN_SRC = "/home/user3/workspace/galaxcore/bin/Linux_64/GalaxCore"
+# Retry settings for svn update
+SVN_RETRY       = 3
+SVN_RETRY_DELAY = 5
 
-BIN_DST = "/home/xiaonan/Share/zw_cache/Galaxcore_bin"
+# Idle sleep when no new revisions are available
+IDLE_SLEEP      = 60
 
-SVN_URL = "http://192.168.10.10/svn/galaxcore/galaxcore"
+# Global shutdown flag
+shutdown_flag   = False
 
-HISTORY_LOG = os.path.join(BIN_DST, "build_history.log")
-FAIL_LOG = os.path.join(BIN_DST, "mk_fail")
-CHECKPOINT_FILE = os.path.join(BIN_DST, "last_revision.txt")
+# ------------------ Utility functions ------------------
+def log(msg: str) -> None:
+    """Print a timestamped message to the terminal."""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
-MAX_KEEP = 150
+def run_cmd(cmd, cwd: str = WORK_DIR, timeout: int = 600) -> int:
+    """
+    Execute a command, discard stdout/stderr, return exit code.
+    Returns -1 on timeout or exception.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout
+        )
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        log(f"Command timed out: {' '.join(cmd)}")
+        return -1
+    except Exception as e:
+        log(f"Command exception: {e}")
+        return -1
 
-# ================= GLOBAL =================
+def svn_update(revision: int) -> bool:
+    """
+    Update working copy to a specific revision.
+    Performs revert first to avoid conflicts.
+    Retries on failure.
+    """
+    # Discard local modifications before update
+    run_cmd(["svn", "revert", "-R", "."])
+    cmd = ["svn", "update", "-r", str(revision)]
+    for attempt in range(1, SVN_RETRY + 1):
+        ret = run_cmd(cmd)
+        if ret == 0:
+            return True
+        log(f"svn update -r {revision} failed, attempt {attempt}/{SVN_RETRY}")
+        time.sleep(SVN_RETRY_DELAY)
+    return False
 
-running = True
-mk_proc = None
-build_no = 0
+def get_svn_info(revision: int):
+    """
+    Retrieve author and date for a revision.
+    Returns ('unknown', 'unknown') on failure.
+    """
+    cmd = ["svn", "log", "-r", str(revision), "--xml", SVN_URL]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode != 0:
+            return "unknown", "unknown"
+        # Simple XML parsing (no external library)
+        author_match = re.search(r"<author>(.*?)</author>", result.stdout)
+        date_match   = re.search(r"<date>(.*?)</date>", result.stdout)
+        author = author_match.group(1) if author_match else "unknown"
+        date   = date_match.group(1) if date_match else "unknown"
+        # Format date to "YYYY-MM-DD HH:MM:SS"
+        if date != "unknown":
+            date = date.replace("T", " ").replace("Z", "")
+        return author, date
+    except Exception:
+        return "unknown", "unknown"
 
-# ================= TIME =================
+def do_make() -> bool:
+    """
+    Attempt build. On first failure, runs make clean and tries again.
+    Returns True on success.
+    """
+    if run_cmd(MAKE_CMD) == 0:
+        return True
+    log("First build attempt failed, trying make clean ...")
+    run_cmd(MAKE_CLEAN_CMD)
+    return run_cmd(MAKE_CMD) == 0
 
+def compress_to_zip(revision: int) -> bool:
+    """
+    Zip the compiled binary into the tar directory.
+    Returns True on success.
+    """
+    os.makedirs(TAR_DIR, exist_ok=True)
+    zipfile = os.path.join(TAR_DIR, f"Galaxcore_{revision}.zip")
+    # -j : junk directory names, store just the file
+    cmd = ["zip", "-j", zipfile, BIN_SRC]
+    return run_cmd(cmd, cwd=SCRIPT_DIR) == 0
 
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ================= SIGNAL =================
-
-
-def signal_handler(sig, frame):
-    global running
-    global mk_proc
-
-    running = False
-
-    print("\n[CI] stopping safely...")
-
-    if mk_proc and mk_proc.poll() is None:
+def clean_old_archives() -> None:
+    """Keep only the latest MAX_BIN_KEEP zip files, remove older ones."""
+    pattern = os.path.join(TAR_DIR, "Galaxcore_*.zip")
+    files = glob.glob(pattern)
+    # Extract revision numbers
+    archives = []
+    for f in files:
+        base = os.path.basename(f)
+        if base.startswith("Galaxcore_") and base.endswith(".zip"):
+            rev_str = base[len("Galaxcore_"):-4]
+            if rev_str.isdigit():
+                archives.append((int(rev_str), f))
+    if len(archives) <= MAX_BIN_KEEP:
+        return
+    # Sort by revision ascending, delete the oldest ones
+    archives.sort(key=lambda x: x[0])
+    to_delete = archives[:len(archives) - MAX_BIN_KEEP]
+    for _, path in to_delete:
         try:
-            print(f"[CI] killing mk process group pid={mk_proc.pid}")
-
-            os.killpg(os.getpgid(mk_proc.pid), signal.SIGINT)
-            time.sleep(1)
-
-            if mk_proc.poll() is None:
-                os.killpg(os.getpgid(mk_proc.pid), signal.SIGKILL)
-
+            os.remove(path)
+            log(f"Deleted old archive: {os.path.basename(path)}")
         except Exception as e:
-            print(f"[CI] kill mk failed: {e}")
+            log(f"Failed to delete {path}: {e}")
 
+# ------------------ Logging ------------------
+def write_build_log(revision: int, author: str, date: str, status: str) -> None:
+    """
+    Append one build record to build_history.log using the required format:
+    ----------------------------------------------------
+    rREV | AUTHOR | DATE | STATUS
+    ----------------------------------------------------
+    """
+    with open(HISTORY_LOG, 'a') as f:
+        f.write("-" * 60 + "\n")
+        f.write(f"r{revision} | {author} | {date} | {status}\n")
+        f.write("-" * 60 + "\n")
+
+def write_fail_log(revision: int) -> None:
+    """Append a failure entry to mk_fail (kept simple)."""
+    with open(FAIL_LOG, 'a') as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] FAIL r{revision}\n")
+
+def init_logs() -> None:
+    """Write a startup marker to the history log."""
+    with open(HISTORY_LOG, 'a') as f:
+        f.write("\n" + "=" * 60 + "\n")
+        f.write(f"Monitor started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 60 + "\n")
+
+# ------------------ Checkpoint management ------------------
+def load_checkpoint() -> int:
+    """Return the last successfully built revision (or HEAD-1 if no file)."""
+    try:
+        with open(CHECKPOINT_FILE, 'r') as f:
+            return int(f.read().strip())
+    except:
+        # Start from HEAD-1 to only build the very latest revision
+        head = get_head_revision()
+        return max(head - 1, 0) if head else 0
+
+def save_checkpoint(revision: int) -> None:
+    """Store the latest built revision."""
+    with open(CHECKPOINT_FILE, 'w') as f:
+        f.write(str(revision))
+
+def get_head_revision() -> int:
+    """Return the newest revision in the repository (or -1 on error)."""
+    cmd = ["svn", "info", "--show-item", "revision", SVN_URL]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except:
+        pass
+    return -1
+
+# ------------------ Signal handling ------------------
+def signal_handler(sig, frame):
+    global shutdown_flag
+    log("Received termination signal, exiting gracefully...")
+    shutdown_flag = True
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# ================= SVN =================
-
-
-def get_head_revision():
-    try:
-        out = subprocess.check_output(
-            ["svn", "info", SVN_URL, "--show-item", "revision"],
-            text=True
-        ).strip()
-
-        return int(out)
-
-    except Exception:
-        return -1
-
-
-def get_local_revision():
-    try:
-        out = subprocess.check_output(
-            ["svn", "info", "--show-item", "revision"],
-            cwd=WORK_DIR,
-            text=True
-        ).strip()
-
-        return int(out)
-
-    except Exception:
-        return 0
-
-
-# ================= CHECKPOINT =================
-
-
-def load_checkpoint():
-    if not os.path.exists(CHECKPOINT_FILE):
-        return get_local_revision()
-
-    try:
-        with open(CHECKPOINT_FILE, "r") as f:
-            return int(f.read().strip())
-
-    except Exception:
-        return get_local_revision()
-
-
-def save_checkpoint(rev):
-    with open(CHECKPOINT_FILE, "w") as f:
-        f.write(str(rev))
-
-
-# ================= LOG =================
-
-
-def init_log():
-    with open(HISTORY_LOG, "a") as f:
-        f.write("============================================================\n")
-        f.write(f"Starting monitor time: {now()}\n")
-        f.write(f"Starting version: r{load_checkpoint()}\n")
-        f.write("============================================================\n")
-        f.write("No.\tRevision\tAuthor\tTime\t\t\tResult\n")
-        f.write("------------------------------------------------------------\n")
-
-
-def log_history(rev, result):
-    global build_no
-
-    build_no += 1
-
-    with open(HISTORY_LOG, "a") as f:
-        f.write(
-            f"{build_no}\t"
-            f"r{rev}\t"
-            f"unknown\t"
-            f"{now()}\t"
-            f"{result}\n"
-        )
-
-
-def log_fail(rev):
-    with open(FAIL_LOG, "a") as f:
-        f.write("==================================================\n")
-        f.write(f"[{now()}] FAIL r{rev}\n")
-        f.write("==================================================\n")
-
-
-# ================= SVN CLEAN =================
-
-
-def svn_clean():
-    print("[CI] svn clean start")
-
-    subprocess.call(
-        "svn revert -R . > /dev/null 2>&1",
-        cwd=WORK_DIR,
-        shell=True
-    )
-
-    subprocess.call(
-        "svn cleanup > /dev/null 2>&1",
-        cwd=WORK_DIR,
-        shell=True
-    )
-
-    print("[CI] svn clean done")
-
-
-# ================= CHECKOUT =================
-
-
-def checkout_revision(rev):
-    print(f"[CI] svn update r{rev}")
-
-    ret = subprocess.call(
-        f"svn update -r {rev} > /dev/null 2>&1",
-        cwd=WORK_DIR,
-        shell=True
-    )
-
-    if ret == 0:
-        print("[CI] svn update OK")
-        return True
-
-    print("[CI] svn update FAIL")
-    return False
-
-
-# ================= BUILD =================
-
-
-def build():
-    global mk_proc
-
-    print("[CI] mk starting...")
-
-    devnull = open(os.devnull, "w")
-
-    mk_proc = subprocess.Popen(
-        'csh -c "mk"',
-        cwd=WORK_DIR,
-        shell=True,
-        stdout=devnull,
-        stderr=devnull,
-        preexec_fn=os.setsid
-    )
-
-    ret = mk_proc.wait()
-
-    print(f"[CI] mk finished exit={ret}")
-
-    return ret == 0
-
-
-# ================= CLEAN =================
-
-
-def make_clean():
-    print("[CI] make clean start")
-
-    subprocess.call(
-        "make clean > /dev/null 2>&1",
-        cwd=WORK_DIR,
-        shell=True
-    )
-
-    print("[CI] make clean done")
-
-
-# ================= COPY BIN =================
-
-
-def copy_binary(rev):
-    dst = os.path.join(BIN_DST, f"Galaxcore_{rev}")
-
-    if not os.path.exists(BIN_SRC):
-        return False
-
-    try:
-        shutil.copy2(BIN_SRC, dst)
-        return True
-
-    except Exception:
-        return False
-
-
-# ================= KEEP LIMIT =================
-
-
-def cleanup_old_bins():
-    files = []
-
-    for name in os.listdir(BIN_DST):
-        if name.startswith("Galaxcore_"):
-            path = os.path.join(BIN_DST, name)
-
-            if os.path.isfile(path):
-                files.append(path)
-
-    files.sort(key=lambda x: os.path.getmtime(x))
-
-    while len(files) > MAX_KEEP:
-        old = files.pop(0)
-
-        try:
-            print(f"[CI] remove old bin {os.path.basename(old)}")
-            os.remove(old)
-
-        except Exception:
-            pass
-
-
-# ================= BUILD FLOW =================
-
-
-def build_revision(rev):
-    print("\n==============================")
-    print(f"[CI] build r{rev}")
-    print("==============================")
-
-    svn_clean()
-
-    if not checkout_revision(rev):
+# ------------------ Build one revision ------------------
+def build_revision(revision: int) -> None:
+    """Checkout, build, archive, and log a single revision."""
+    log(f"Building r{revision}")
+
+    author, date = get_svn_info(revision)
+
+    if not svn_update(revision):
+        write_build_log(revision, author, date, "FAILED (svn update)")
+        write_fail_log(revision)
+        save_checkpoint(revision)
         return
 
-    # first build
-    if build():
-        if copy_binary(rev):
-            print(f"[CI] binary saved: Galaxcore_{rev}")
+    # First build attempt
+    if do_make():
+        # Success
+        if os.path.isfile(BIN_SRC):
+            if compress_to_zip(revision):
+                clean_old_archives()
+            else:
+                log(f"Warning: zip failed for r{revision}")
+            write_build_log(revision, author, date, "SUCCESS")
+            save_checkpoint(revision)
+            return
+        else:
+            log(f"Binary not found after build: {BIN_SRC}")
+            write_build_log(revision, author, date, "FAILED (binary missing)")
+            write_fail_log(revision)
+            save_checkpoint(revision)
+            return
 
-        log_history(rev, "SUCCESS")
-        save_checkpoint(rev)
+    # Second attempt after clean
+    log("Retrying after make clean...")
+    run_cmd(MAKE_CLEAN_CMD)
+    if do_make():
+        if os.path.isfile(BIN_SRC):
+            if compress_to_zip(revision):
+                clean_old_archives()
+            else:
+                log(f"Warning: zip failed for r{revision}")
+            write_build_log(revision, author, date, "SUCCESS")
+            save_checkpoint(revision)
+            return
 
-        cleanup_old_bins()
-        return
+    # Final failure
+    write_build_log(revision, author, date, "FAILED")
+    write_fail_log(revision)
+    save_checkpoint(revision)   # advance to avoid infinite loop
 
-    # retry after clean
-    make_clean()
-
-    if build():
-        if copy_binary(rev):
-            print(f"[CI] binary saved: Galaxcore_{rev}")
-
-        log_history(rev, "SUCCESS_AFTER_CLEAN")
-        save_checkpoint(rev)
-
-        cleanup_old_bins()
-        return
-
-    log_history(rev, "FAIL")
-    log_fail(rev)
-
-    save_checkpoint(rev)
-
-
-# ================= MAIN =================
-
-
+# ------------------ Main loop ------------------
 def main():
-    os.chdir(BIN_DST)
+    global shutdown_flag
 
-    init_log()
+    if not os.path.isdir(WORK_DIR):
+        log(f"Error: WORK_DIR does not exist: {WORK_DIR}")
+        sys.exit(1)
+    if not os.path.isdir(os.path.join(WORK_DIR, ".svn")):
+        log("Error: WORK_DIR is not an SVN working copy")
+        sys.exit(1)
 
-    print("[CI] SVN build watcher started")
+    os.makedirs(SCRIPT_DIR, exist_ok=True)
+    os.makedirs(TAR_DIR, exist_ok=True)
 
-    while running:
+    init_logs()
+    checkpoint = load_checkpoint()
+    log(f"Monitor started. Last built revision: r{checkpoint}")
+
+    while not shutdown_flag:
         head = get_head_revision()
-        local = load_checkpoint()
-
         if head < 0:
+            log("Cannot retrieve HEAD revision, retrying in 10s...")
             time.sleep(10)
             continue
 
-        if head <= local:
-            print(f"[CI] idle | local={local} head={head}")
-
-            time.sleep(10)
+        if head <= checkpoint:
+            log(f"Idle (local={checkpoint}, head={head})")
+            for _ in range(IDLE_SLEEP):
+                if shutdown_flag:
+                    break
+                time.sleep(1)
             continue
 
-        print(f"[CI] update detected {local} -> {head}")
-
-        for rev in range(local + 1, head + 1):
-            if not running:
+        log(f"New revisions found: {checkpoint+1} -> {head}")
+        for rev in range(checkpoint + 1, head + 1):
+            if shutdown_flag:
                 break
-
             build_revision(rev)
+            checkpoint = rev   # save_checkpoint is called inside build_revision, but update local var
 
+        # Reload checkpoint to be safe
+        checkpoint = load_checkpoint()
         time.sleep(2)
 
-    print("[CI] exit")
-
+    log("Monitor stopped.")
 
 if __name__ == "__main__":
     main()

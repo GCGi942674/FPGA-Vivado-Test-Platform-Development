@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <ctime>
 #include <iomanip>
+#include <sys/stat.h> 
 
 // ================= CONFIG =================
 
@@ -20,6 +21,8 @@ static const std::string BIN_SRC =
 
 static const std::string BIN_DST =
     "/home/xiaonan/Share/zw_cache/Galaxcore_bin";
+
+static const std::string TAR_DIR = BIN_DST + "/zip";
 
 static const std::string HISTORY_LOG =
     BIN_DST + "/build_history.log";
@@ -145,7 +148,7 @@ void svn_clean()
 
 bool build()
 {
-    return run_in_workdir("csh -c \"mk -j\"") == 0;
+    return run_in_workdir("csh -c \"mk\"") == 0;
 }
 
 void make_clean()
@@ -170,6 +173,33 @@ bool copy_bin(int rev)
         BIN_DST + "/Galaxcore_" + std::to_string(rev);
 
     return system(("cp " + BIN_SRC + " " + dst).c_str()) == 0;
+}
+
+// 将编译产物打包为 Galaxcore_<rev>.zip 并放入 tar 目录
+bool compress_to_tar(int rev)
+{
+    // 确保 tar 目录存在
+    struct stat st = {0};
+    if (stat(TAR_DIR.c_str(), &st) == -1) {
+        mkdir(TAR_DIR.c_str(), 0755);
+    }
+
+    std::string zipfile = TAR_DIR + "/Galaxcore_" + std::to_string(rev) + ".zip";
+    // -j : 不保留目录结构，只存储文件本身
+    std::string cmd = "zip -j " + zipfile + " " + BIN_SRC + " > /dev/null 2>&1";
+
+    return system(cmd.c_str()) == 0;
+}
+
+// 保留最新的 MAX_BIN_KEEP 个 zip 文件，删除旧的
+void clean_old_tars()
+{
+    std::string cmd =
+        "cd " + TAR_DIR +
+        " && ls -1v Galaxcore_*.zip 2>/dev/null | head -n -" +
+        std::to_string(MAX_BIN_KEEP) + " | xargs -r rm -f";
+
+    system(cmd.c_str());
 }
 
 // ================= LOG INIT =================
@@ -229,31 +259,37 @@ void build_revision(int rev)
     if (!checkout(rev))
         return;
 
-    // first build
+    // 第一次编译
     if (build())
     {
-        copy_bin(rev);
+        if (compress_to_tar(rev)) {
+            clean_old_tars();
+        } else {
+            std::cerr << "[CI] WARNING: compress failed for r" << rev << std::endl;
+        }
         log_row(rev, author, now(), "SUCCESS");
         save_checkpoint(rev);
         return;
     }
 
-    // retry once after clean
+    // 失败后 clean 再试一次
     make_clean();
-
     if (build())
     {
-        copy_bin(rev);
+        if (compress_to_tar(rev)) {
+            clean_old_tars();
+        } else {
+            std::cerr << "[CI] WARNING: compress failed for r" << rev << std::endl;
+        }
         log_row(rev, author, now(), "SUCCESS");
         save_checkpoint(rev);
         return;
     }
 
-    log_row(rev, author, now(), "SUCCESS");
+    // 两次都失败 → 记录失败
+    log_row(rev, author, now(), "FAILURE");   // 原为 SUCCESS，已修正
     log_fail(rev);
-
-    // IMPORTANT: always advance checkpoint to avoid stuck loop
-    save_checkpoint(rev);
+    save_checkpoint(rev);                     // 仍然推进版本，避免死循环
 }
 
 // ================= MAIN LOOP =================

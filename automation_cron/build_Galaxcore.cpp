@@ -10,6 +10,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sys/stat.h> 
+#include <sys/wait.h>
 
 // ================= CONFIG =================
 
@@ -38,7 +39,6 @@ static const std::string SVN_URL = "http://192.168.10.10/svn/galaxcore/galaxcore
 static const int MAX_BIN_KEEP = 150;
 
 static bool running = true;
-static int build_no = 0;
 
 // ================= SIGNAL =================
 
@@ -60,18 +60,23 @@ std::string now()
 
 // ================= CORE EXEC =================
 
-// IMPORTANT: all build-related commands must go through WORK_DIR
-int run_in_workdir(const std::string &cmd)
+bool run_in_workdir(const std::string &cmd)
 {
-    std::string full =
-        "cd " + WORK_DIR + " && " + cmd + " > /dev/null 2>&1";
-
-    return system(full.c_str());
+    std::string full = "cd " + WORK_DIR + " && " + cmd + " > /dev/null 2>&1";
+    int status = system(full.c_str());
+    if (status == -1) {
+        // fork/exec failed
+        return false;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status) == 0;
+    }
+    // killed by signal
+    return false;
 }
 
 // ================= SVN =================
 
-// remote HEAD (NOT in workspace)
 int get_head()
 {
     std::string cmd =
@@ -95,7 +100,6 @@ std::string get_author(int rev)
         " --show-item last-changed-author";
 
     FILE *fp = popen(cmd.c_str(), "r");
-
     if (!fp)
         return "unknown";
 
@@ -104,10 +108,7 @@ std::string get_author(int rev)
     pclose(fp);
 
     std::string author(buf);
-
-    // remove newline
     author.erase(std::remove(author.begin(), author.end(), '\n'), author.end());
-
     if (author.empty())
         return "unknown";
 
@@ -120,13 +121,11 @@ int load_checkpoint()
 {
     std::ifstream f(CHECKPOINT_FILE);
     int v = 0;
-
     if (!(f >> v))
     {
         int head = get_head();
         return head > 0 ? head - 1 : 0;
     }
-
     return v;
 }
 
@@ -148,7 +147,9 @@ void svn_clean()
 
 bool build()
 {
-    return run_in_workdir("csh -c \"mk\"") == 0;
+    return run_in_workdir(
+        "csh -c 'mk; exit $status'"
+    );
 }
 
 void make_clean()
@@ -156,67 +157,50 @@ void make_clean()
     run_in_workdir("make clean");
 }
 
-// ================= CHECKOUT REV =================
+// ================= CHECKOUT =================
 
 bool checkout(int rev)
 {
     return run_in_workdir(
         "svn update -r " + std::to_string(rev)
-    ) == 0;
+    );
 }
 
-// ================= COPY BIN =================
+// ================= ZIP =================
 
-bool copy_bin(int rev)
-{
-    std::string dst =
-        BIN_DST + "/Galaxcore_" + std::to_string(rev);
-
-    return system(("cp " + BIN_SRC + " " + dst).c_str()) == 0;
-}
-
-// 将编译产物打包为 Galaxcore_<rev>.zip 并放入 tar 目录
 bool compress_to_tar(int rev)
 {
-    // 确保 tar 目录存在
     struct stat st = {0};
     if (stat(TAR_DIR.c_str(), &st) == -1) {
         mkdir(TAR_DIR.c_str(), 0755);
     }
 
     std::string zipfile = TAR_DIR + "/Galaxcore_" + std::to_string(rev) + ".zip";
-    // -j : 不保留目录结构，只存储文件本身
     std::string cmd = "zip -j " + zipfile + " " + BIN_SRC + " > /dev/null 2>&1";
-
     return system(cmd.c_str()) == 0;
 }
 
-// 保留最新的 MAX_BIN_KEEP 个 zip 文件，删除旧的
 void clean_old_tars()
 {
     std::string cmd =
         "cd " + TAR_DIR +
         " && ls -1v Galaxcore_*.zip 2>/dev/null | head -n -" +
         std::to_string(MAX_BIN_KEEP) + " | xargs -r rm -f";
-
     system(cmd.c_str());
 }
 
-// ================= LOG INIT =================
+// ================= LOGGING =================
 
 void init_log()
 {
     std::ofstream f(HISTORY_LOG, std::ios::app);
-
     f << "============================================================\n";
     f << "Starting monitor time: " << now() << "\n";
     f << "Starting version: r" << load_checkpoint() << "\n";
     f << "============================================================\n";
-    f << "No.\t\tRevision\t\tAuthor\t\tTime\t\t\tResult\n";
+    f << "Revision\tAuthor\t\tTime\t\t\tResult\n";
     f << "------------------------------------------------------------\n";
 }
-
-// ================= HISTORY LOG =================
 
 void log_row(int rev,
              const std::string &author,
@@ -224,20 +208,14 @@ void log_row(int rev,
              const std::string &result)
 {
     std::ofstream f(HISTORY_LOG, std::ios::app);
-
     f << "r" << rev << " | " << author << " | " << time << " | " << result << "\n";
     f << "------------------------------------------------------------\n";
 }
 
-// ================= FAIL LOG =================
-
 void log_fail(int rev)
 {
     std::ofstream f(FAIL_LOG, std::ios::app);
-
-    f << "==================================================\n";
     f << "[" << now() << "] FAIL r" << rev << "\n";
-    f << "==================================================\n";
 }
 
 // ================= BUILD FLOW =================
@@ -250,40 +228,55 @@ void build_revision(int rev)
 
     svn_clean();
 
+    // 1. checkout
     if (!checkout(rev))
-        return;
-
-    // 第一次编译
-    if (build())
     {
-        if (compress_to_tar(rev)) {
-            clean_old_tars();
-        } else {
-            std::cerr << "[CI] WARNING: compress failed for r" << rev << std::endl;
-        }
-        log_row(rev, author, now(), "SUCCESS");
+        std::cerr << "[CI] svn update failed for r" << rev << std::endl;
+        log_row(rev, author, now(), "failed (svn update)");
+        log_fail(rev);
         save_checkpoint(rev);
         return;
     }
 
-    // 失败后 clean 再试一次
+    // 2. first build attempt
+    if (build())
+    {
+        if (!compress_to_tar(rev))
+        {
+            std::cerr << "[CI] compress failed for r" << rev << std::endl;
+            log_row(rev, author, now(), "failed (compress)");
+            log_fail(rev);
+            save_checkpoint(rev);
+            return;
+        }
+        clean_old_tars();
+        log_row(rev, author, now(), "successful");
+        save_checkpoint(rev);
+        return;
+    }
+
+    // 3. retry after make clean
     make_clean();
     if (build())
     {
-        if (compress_to_tar(rev)) {
-            clean_old_tars();
-        } else {
-            std::cerr << "[CI] WARNING: compress failed for r" << rev << std::endl;
+        if (!compress_to_tar(rev))
+        {
+            std::cerr << "[CI] compress failed for r" << rev << std::endl;
+            log_row(rev, author, now(), "failed (compress)");
+            log_fail(rev);
+            save_checkpoint(rev);
+            return;
         }
-        log_row(rev, author, now(), "SUCCESS");
+        clean_old_tars();
+        log_row(rev, author, now(), "successful");
         save_checkpoint(rev);
         return;
     }
 
-    // 两次都失败 → 记录失败
-    log_row(rev, author, now(), "FAILURE");   // 原为 SUCCESS，已修正
+    // 4. build failed after retry
+    log_row(rev, author, now(), "failed");
     log_fail(rev);
-    save_checkpoint(rev);                     // 仍然推进版本，避免死循环
+    save_checkpoint(rev);
 }
 
 // ================= MAIN LOOP =================
@@ -313,27 +306,24 @@ int main()
         if (head <= local)
         {
             time_t wait_start = time(nullptr);
-
-            // Idle loop: update display every second, exit when new revision appears
-            while (running && get_head() <= local)
+            while (running)
             {
+                int current_head = get_head();           // 实时获取
+                if (current_head > local) break;         // 新版本出现，退出 idle
+
                 int elapsed = static_cast<int>(time(nullptr) - wait_start);
                 std::cout << "\r[CI] Idle | local=" << local
-                        << " head=" << head
+                        << " head=" << current_head    // 显示实时值
                         << " wait: " << elapsed << "s" << std::flush;
                 sleep(1);
             }
-            std::cout << std::endl;  // newline after idle ends
-
-            // Refresh head for the outer loop
-            head = get_head();
+            std::cout << std::endl;
+            head = get_head();   // 更新外层 head，后续继续主循环
             continue;
         }
 
-        std::cout
-            << "[CI] update detected "
-            << local << " -> " << head
-            << std::endl;
+        std::cout << "[CI] update detected "
+                  << local << " -> " << head << std::endl;
 
         for (int r = local + 1; r <= head && running; ++r)
         {

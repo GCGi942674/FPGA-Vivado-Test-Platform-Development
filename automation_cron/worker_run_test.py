@@ -181,7 +181,7 @@ def replace_binary(zip_path: str, log_file: str):
 
 
 def update_flow_config(log_file: str):
-    """Ensure test2/flow_config contains: enable_copy = 1."""
+    """Ensure test2/flow_config contains: enable_copy 1."""
     if not os.path.exists(FLOW_CONFIG_FILE):
         log(f"ERROR: flow_config not found: {FLOW_CONFIG_FILE}", log_file)
         return False
@@ -194,7 +194,7 @@ def update_flow_config(log_file: str):
 
     for line in lines:
         if re.match(r"^\s*enable_copy\b", line):
-            new_lines.append("enable_copy = 1\n")
+            new_lines.append("enable_copy 1\n")
             found = True
         else:
             new_lines.append(line)

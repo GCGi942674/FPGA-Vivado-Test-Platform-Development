@@ -1,11 +1,243 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Initialize or migrate the SQLite database for the distributed GalaxCore test system.
+
+Schema notes:
+- revision is nullable. If it is NULL, the worker should use the latest GalaxCore zip.
+- cmd is stored exactly as provided by taskctl/templates and executed by worker unchanged.
+- target_arg and target_type are derived from cmd for display/query only.
+"""
+
 import sqlite3
 from pathlib import Path
+from datetime import datetime
 
 
 DB_PATH = Path("/home/user3/distributed_test_system/data/task_queue.db")
+
+
+TASK_COLUMNS = [
+    "id",
+    "task_id",
+    "revision",
+    "suite",
+    "cmd",
+    "target_arg",
+    "target_type",
+    "flow_config_json",
+    "target_worker",
+    "assigned_worker",
+    "status",
+    "priority",
+    "retry_count",
+    "max_retry",
+    "created_at",
+    "started_at",
+    "finished_at",
+    "result_path",
+    "error_message",
+]
+
+
+def table_exists(cur, table_name):
+    cur.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ?
+        """,
+        (table_name,),
+    )
+    return cur.fetchone() is not None
+
+
+def get_columns(cur, table_name):
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return cur.fetchall()
+
+
+def get_column_names(cur, table_name):
+    return [row[1] for row in get_columns(cur, table_name)]
+
+
+def create_builds_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS builds (
+            revision INTEGER PRIMARY KEY,
+            zip_path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'success',
+            build_time TEXT DEFAULT CURRENT_TIMESTAMP,
+            error_message TEXT
+        );
+        """
+    )
+
+
+def create_tasks_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT UNIQUE NOT NULL,
+
+            revision INTEGER,
+            suite TEXT NOT NULL,
+
+            cmd TEXT,
+            target_arg TEXT,
+            target_type TEXT,
+
+            flow_config_json TEXT NOT NULL,
+
+            target_worker TEXT DEFAULT 'any',
+            assigned_worker TEXT,
+
+            status TEXT NOT NULL DEFAULT 'pending',
+            priority INTEGER DEFAULT 100,
+
+            retry_count INTEGER DEFAULT 0,
+            max_retry INTEGER DEFAULT 1,
+
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            finished_at TEXT,
+
+            result_path TEXT,
+            error_message TEXT
+        );
+        """
+    )
+
+
+def create_workers_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workers (
+            worker_name TEXT PRIMARY KEY,
+            host TEXT,
+
+            status TEXT DEFAULT 'offline',
+            current_task_id TEXT,
+
+            last_heartbeat TEXT,
+            registered_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+def create_task_events_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            worker_name TEXT,
+            event TEXT NOT NULL,
+            message TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+
+def create_indexes(cur):
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
+        ON tasks(status, priority, created_at);
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_assigned_worker
+        ON tasks(assigned_worker);
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_target_type
+        ON tasks(target_type);
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_events_task_id
+        ON task_events(task_id);
+        """
+    )
+
+
+def add_missing_task_columns(conn):
+    """Add columns required by the current scheduler/taskctl without dropping data."""
+    cur = conn.cursor()
+    existing_columns = set(get_column_names(cur, "tasks"))
+
+    column_sql = {
+        "cmd": "ALTER TABLE tasks ADD COLUMN cmd TEXT",
+        "target_arg": "ALTER TABLE tasks ADD COLUMN target_arg TEXT",
+        "target_type": "ALTER TABLE tasks ADD COLUMN target_type TEXT",
+    }
+
+    for column_name, sql in column_sql.items():
+        if column_name not in existing_columns:
+            cur.execute(sql)
+
+    conn.commit()
+
+
+def revision_column_is_notnull(cur):
+    """Return True if tasks.revision is defined as NOT NULL in an old schema."""
+    for row in get_columns(cur, "tasks"):
+        # PRAGMA table_info columns:
+        # cid, name, type, notnull, dflt_value, pk
+        if row[1] == "revision":
+            return int(row[3]) == 1
+    return False
+
+
+def migrate_tasks_revision_nullable(conn):
+    """
+    Rebuild the tasks table if revision was created as NOT NULL.
+
+    SQLite cannot remove a NOT NULL constraint with ALTER TABLE, so we rename the
+    old table, create the new schema, and copy common columns back.
+    """
+    cur = conn.cursor()
+
+    if not table_exists(cur, "tasks"):
+        return
+
+    if not revision_column_is_notnull(cur):
+        return
+
+    backup_table = "tasks_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"Migrating tasks.revision to nullable. Backup table: {backup_table}")
+
+    cur.execute(f"ALTER TABLE tasks RENAME TO {backup_table}")
+    create_tasks_table(cur)
+
+    old_columns = set(get_column_names(cur, backup_table))
+    new_columns = set(get_column_names(cur, "tasks"))
+    common_columns = [col for col in TASK_COLUMNS if col in old_columns and col in new_columns]
+
+    column_list = ", ".join(common_columns)
+    cur.execute(
+        f"""
+        INSERT INTO tasks ({column_list})
+        SELECT {column_list}
+        FROM {backup_table}
+        """
+    )
+
+    conn.commit()
 
 
 def init_db():
@@ -17,87 +249,17 @@ def init_db():
 
     cur = conn.cursor()
 
-    # GalaxCore 构建版本表
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS builds (
-        revision INTEGER PRIMARY KEY,
-        zip_path TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'success',
-        build_time TEXT DEFAULT CURRENT_TIMESTAMP,
-        error_message TEXT
-    );
-    """)
+    create_builds_table(cur)
+    create_tasks_table(cur)
+    create_workers_table(cur)
+    create_task_events_table(cur)
 
-    # 测试任务表
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id TEXT UNIQUE NOT NULL,
+    conn.commit()
 
-        revision INTEGER NOT NULL,
-        suite TEXT NOT NULL,
+    add_missing_task_columns(conn)
+    migrate_tasks_revision_nullable(conn)
 
-        flow_config_json TEXT NOT NULL,
-
-        target_worker TEXT DEFAULT 'any',
-        assigned_worker TEXT,
-
-        status TEXT NOT NULL DEFAULT 'pending',
-        priority INTEGER DEFAULT 100,
-
-        retry_count INTEGER DEFAULT 0,
-        max_retry INTEGER DEFAULT 1,
-
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        started_at TEXT,
-        finished_at TEXT,
-
-        result_path TEXT,
-        error_message TEXT
-    );
-    """)
-
-    # worker 状态表
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS workers (
-        worker_name TEXT PRIMARY KEY,
-        host TEXT,
-
-        status TEXT DEFAULT 'offline',
-        current_task_id TEXT,
-
-        last_heartbeat TEXT,
-        registered_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-
-    # 任务事件日志表
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS task_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id TEXT NOT NULL,
-        worker_name TEXT,
-        event TEXT NOT NULL,
-        message TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-
-    # 常用索引
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
-    ON tasks(status, priority, created_at);
-    """)
-
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_tasks_assigned_worker
-    ON tasks(assigned_worker);
-    """)
-
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_task_events_task_id
-    ON task_events(task_id);
-    """)
+    create_indexes(cur)
 
     conn.commit()
     conn.close()

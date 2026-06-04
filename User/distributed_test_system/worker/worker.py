@@ -6,19 +6,23 @@ worker.py
 
 Distributed GalaxCore worker.
 
-工作流程：
-1. 向 pudong 调度中心拉取任务
-2. 分析任务：
-   2.1 如果任务指定 revision，则使用指定版本 GalaxCore_xxx.zip；否则使用共享目录中最新 GalaxCore_xxx.zip
-       然后 svn update -r <revision>，解压 zip，替换本地 bin/Linux_64/GalaxCore
-   2.2 读取任务 JSON 的 flow_config 字段，批量替换本地 test2/flow_config 中对应字段
-3. 执行任务 cmd，比如 cd ~/workspace/galaxcore/test2 && ./run.sh .
-4. 将 success / failed 回报给调度中心
+Workflow:
+1. Pull a task from the pudong scheduler.
+2. Analyze the task:
+   2.1 If the task specifies a revision, use the designated GalaxCore_xxx.zip;
+       otherwise use the latest GalaxCore_xxx.zip from the shared directory.
+       Then update the workspace source code to the latest SVN revision, unzip
+       the selected zip, replace the local bin/Linux_64/GalaxCore, and pass the
+       selected GalaxCore build revision to vivado_runner.
+   2.2 Read the flow_config field from the task JSON and bulk-update the
+       corresponding fields in the local test2/flow_config.
+3. Execute the task command, e.g. cd ~/workspace/galaxcore/test2 && ./run.sh .
+4. Report success / failure back to the scheduler.
 
-注意：
-- enable_copy 只是 flow_config 里的普通字段，由 vivado_runner 读取。
-- revision 控制 GalaxCore 版本。
-- flow_config 控制 vivado_runner 跑哪些阶段。
+Notes:
+- enable_copy is just an ordinary field in flow_config, consumed by vivado_runner.
+- revision controls the selected GalaxCore binary zip version, not the source workspace revision.
+- flow_config controls which stages vivado_runner executes.
 """
 
 import fcntl
@@ -44,61 +48,62 @@ from typing import Callable, Dict, Optional, Tuple, Any
 
 PROJECT_NAME = "galaxcore"
 
-# 调度中心配置
+# Scheduler configuration
 SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "http://0.0.0.0:9000").rstrip("/")
 PULL_API = os.environ.get("PULL_API", "/api/task/pull")
 REPORT_API = os.environ.get("REPORT_API", "/api/task/report")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 
-# worker 名称；建议每台机器启动前显式设置 WORKER_NAME
+# Worker name – recommended to set WORKER_NAME explicitly before starting the worker on each machine
 WORKER_NAME = os.environ.get("WORKER_NAME", socket.gethostname().split(".")[0])
 
-# 本地 GalaxCore 工程路径
+# Local GalaxCore workspace path
 WORKSPACE_DIR = os.path.expanduser(os.environ.get("WORKSPACE_DIR", "~/workspace/galaxcore"))
 TEST_DIR = os.environ.get("TEST_DIR", os.path.join(WORKSPACE_DIR, "test2"))
 FLOW_CONFIG_FILE = os.environ.get("FLOW_CONFIG_FILE", os.path.join(TEST_DIR, "flow_config"))
 
-# GalaxCore zip 共享目录
+# GalaxCore zip shared directory
 SHARE_ZIP_DIR = os.environ.get("SHARE_ZIP_DIR", "/home/xiaonan/Share/zw_cache/GalaxCore_bin/zip")
 
-# 本地 GalaxCore 二进制位置
+# Local GalaxCore binary location
 BIN_DIR = os.environ.get("BIN_DIR", os.path.join(WORKSPACE_DIR, "bin/Linux_64"))
 TARGET_BINARY = os.environ.get("TARGET_BINARY", os.path.join(BIN_DIR, "GalaxCore"))
 
-# Runtime library required by GalaxCore, same as night_build_galaxcore.sh / worker_run_test.py
+# Runtime library required by GalaxCore (same as night_build_galaxcore.sh / worker_run_test.py)
 PROTOBUF_LIB_DIR = os.environ.get("PROTOBUF_LIB_DIR", "/home/fpga/lib/protobuf-3.9.0/lib")
 
-# 默认测试目标，cmd 没给的时候用
+# Default test target when cmd is not provided
 TEST_RUN_DIR = os.environ.get("GALAXCORE_TEST_TARGET", ".")
 DEFAULT_CMD = os.environ.get("DEFAULT_CMD", "cd \"{}\" && ./run.sh \"{}\"".format(TEST_DIR, TEST_RUN_DIR))
 
-# 是否忽略 ./run.sh 返回码。
-# 与之前 worker_run_test.py 默认一致：测试用例失败不一定让 worker flow 失败。
-# 如果你希望 run.sh 非 0 时任务直接 failed：export GALAXCORE_IGNORE_RUN_RC=0
+# Whether to ignore ./run.sh return code.
+# By default (matching the old worker_run_test.py behaviour) a non‑zero
+# test return code does **not** fail the whole worker flow.
+# If you want a non‑zero rc to cause a failed task: export GALAXCORE_IGNORE_RUN_RC=0
 IGNORE_RUN_SH_RC = os.environ.get("GALAXCORE_IGNORE_RUN_RC", "1") != "0"
 
-# 单个任务失败后的重试次数。
-# worker 是常驻拉任务的，不建议默认重试很多次。
+# Maximum retries for a single task.
+# The worker is a long‑running polling process; retrying many times is usually not desired.
 MAX_ATTEMPTS = int(os.environ.get("GALAXCORE_WORKER_MAX_ATTEMPTS", "1"))
 RETRY_INTERVAL = int(os.environ.get("GALAXCORE_WORKER_RETRY_INTERVAL", "1800"))
 
-# 日志位置：~/logs/galaxcore/YYYY-MM-DD/
+# Log location: ~/logs/galaxcore/YYYY-MM-DD/
 LOG_ROOT = os.path.expanduser(os.environ.get("LOG_ROOT", "~/logs/galaxcore"))
 DATE_TAG = datetime.now().strftime("%Y-%m-%d")
 LOG_DIR = os.path.join(LOG_ROOT, DATE_TAG)
 SUMMARY_FILE = os.path.join(LOG_ROOT, "worker_summary.tsv")
 
-# worker 进程锁，防止同一台机器开多个 worker 同时替换 GalaxCore
+# Worker lock to prevent multiple workers from replacing GalaxCore concurrently on the same host
 LOCK_FILE = os.environ.get("LOCK_FILE", "/tmp/galaxcore_worker.lock")
 
-# zip 解压临时目录
+# Temporary directory for zip extraction
 TMP_DIR = os.environ.get("TMP_DIR", "/tmp/galaxcore_worker")
 CLEAN_TMP_DIR = os.environ.get("CLEAN_TMP_DIR", "1") != "0"
 
-# 默认不清理 testcase 输出，方便排查
+# By default we keep test output for investigation
 POST_RUN_CLEANUP = os.environ.get("POST_RUN_CLEANUP", "0") == "1"
 
-# flow_config 中追加新字段时的格式：space -> key value；equal -> key = value
+# Format used when appending a new field to flow_config: "space" -> key value; "equal" -> key = value
 FLOW_CONFIG_APPEND_STYLE = os.environ.get("FLOW_CONFIG_APPEND_STYLE", "space").strip().lower()
 
 START_TS = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -200,9 +205,9 @@ def find_csh() -> Optional[str]:
 
 def csh_runtime_prefix() -> str:
     """
-    模拟手动终端环境：
+    Emulate a manual terminal session:
     1. source ~/.cshrc
-    2. 设置 LD_LIBRARY_PATH，避免 csh 里 LD_LIBRARY_PATH 未定义时报错
+    2. set LD_LIBRARY_PATH so that even if it is undefined inside csh, we don't get an error
     """
     return """
 if ( -f ~/.cshrc ) source ~/.cshrc
@@ -253,7 +258,7 @@ def run_csh(script: str) -> int:
         log("[ERROR] neither tcsh nor csh found in PATH")
         return 127
 
-    # -f：不自动加载 cshrc；脚本里手动 source ~/.cshrc
+    # -f : do not automatically load cshrc; we source ~/.cshrc explicitly in the script
     return run_process([csh_bin, "-f", "-c", script])
 
 
@@ -400,7 +405,7 @@ def parse_flow_config_string(text: str) -> Dict[str, Any]:
     if not text:
         return {}
 
-    # 兼容 JSON 字符串
+    # Try to parse as JSON first
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
@@ -408,14 +413,14 @@ def parse_flow_config_string(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 兼容 key=value / key value 文本
+    # Fallback to key=value or key value text
     result = {}
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
 
-        # 去掉行尾注释
+        # Remove inline comments
         if "#" in line:
             line = line.split("#", 1)[0].strip()
 
@@ -521,7 +526,7 @@ def find_revision_zip(revision: str) -> Tuple[Optional[int], Optional[str]]:
             log("[INFO] Specific zip found: {}".format(name))
             return int(revision), path
 
-    # 模糊匹配兜底，但仍然必须包含指定 revision 数字
+    # Fuzzy fallback – still must contain the revision digits somewhere
     fuzzy = []
     for filename in os.listdir(SHARE_ZIP_DIR):
         if filename.endswith(".zip") and revision in filename:
@@ -539,8 +544,8 @@ def find_revision_zip(revision: str) -> Tuple[Optional[int], Optional[str]]:
 
 def select_zip_for_task(task: Dict[str, Any]) -> Tuple[Optional[int], Optional[str], str]:
     """
-    如果任务指定 revision：使用指定版本。
-    如果任务没有 revision：使用共享目录里的最新 GalaxCore_xxx.zip。
+    If the task specifies a revision, use that version.
+    Otherwise use the latest GalaxCore_xxx.zip from the shared directory.
     """
     task_rev = get_task_revision(task)
 
@@ -645,7 +650,8 @@ def replace_binary_from_tmp() -> int:
 
 def split_inline_comment(body: str) -> Tuple[str, str]:
     """
-    简单保留行尾注释。flow_config 通常是纯 key value，不处理复杂引号场景。
+    Simple inline comment splitter. flow_config is usually plain key-value,
+    we do not handle complex quoting scenarios.
     """
     if "#" not in body:
         return body.rstrip(), ""
@@ -705,10 +711,10 @@ def backup_flow_config() -> Optional[str]:
 
 def update_local_flow_config(flow_config_updates: Dict[str, Any]) -> int:
     """
-    用任务 JSON 中的 flow_config 字段批量覆盖本机 test2/flow_config。
+    Bulk-update the local test2/flow_config with the fields from the task JSON.
+    Only the provided fields are modified; others are left unchanged.
 
-    只修改传过来的字段；没传的字段保持原样。
-    支持本地 flow_config 的两种格式：
+    Supports both local formats:
         key value
         key = value
     """

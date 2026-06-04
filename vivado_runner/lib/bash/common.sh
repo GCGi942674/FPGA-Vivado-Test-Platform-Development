@@ -59,24 +59,32 @@ get_host_name() {
 
 get_svn_version() {
     # Backward-compatible function name.
-    # In distributed runs this returns the selected GalaxCore binary build
-    # revision from worker metadata, not necessarily the SVN workspace revision.
+    #
+    # Distributed worker run:
+    #   return the selected GalaxCore binary build revision, for example r14819.
+    #
+    # Manual ./run.sh run:
+    #   return the current workspace SVN revision.
+    #
+    # This avoids accidentally using a stale .galaxcore_build_info file left by
+    # a previous distributed worker run.
     local ver=""
-    local info_file=""
+    local distributed_run="0"
 
-    if [ -n "${GALAXCORE_BUILD_REVISION:-}" ]; then
-        ver="$GALAXCORE_BUILD_REVISION"
-    elif [ -n "${GALAXCORE_REVISION:-}" ]; then
-        ver="$GALAXCORE_REVISION"
-    else
-        if [ -n "${GALAXCORE_BUILD_INFO:-}" ] && [ -f "$GALAXCORE_BUILD_INFO" ]; then
-            info_file="$GALAXCORE_BUILD_INFO"
-        elif [ -f "$WORKSPACE_ROOT/.galaxcore_build_info" ]; then
-            info_file="$WORKSPACE_ROOT/.galaxcore_build_info"
-        fi
+    if [ "${GALAXCORE_RUN_MODE:-}" = "distributed" ] || \
+       [ "${DTS_RUN_MODE:-}" = "distributed" ] || \
+       [ -n "${DTS_TASK_ID:-}" ] || \
+       [ -n "${GALAXCORE_TASK_ID:-}" ]; then
+        distributed_run="1"
+    fi
 
-        if [ -n "$info_file" ]; then
-            ver=$(awk '$1 == "GALAXCORE_BUILD_REVISION" {print $2; exit}' "$info_file")
+    if [ "$distributed_run" = "1" ]; then
+        if [ -n "${GALAXCORE_BUILD_REVISION:-}" ]; then
+            ver="$GALAXCORE_BUILD_REVISION"
+        elif [ -n "${GALAXCORE_REVISION:-}" ]; then
+            ver="$GALAXCORE_REVISION"
+        elif [ -n "${GALAXCORE_BUILD_INFO:-}" ] && [ -f "$GALAXCORE_BUILD_INFO" ]; then
+            ver=$(awk '$1 == "GALAXCORE_BUILD_REVISION" {print $2; exit}' "$GALAXCORE_BUILD_INFO")
         fi
     fi
 

@@ -11,8 +11,9 @@ Workflow:
 2. Analyze the task:
    2.1 If the task specifies a revision, use the designated GalaxCore_xxx.zip;
        otherwise use the latest GalaxCore_xxx.zip from the shared directory.
-       Then svn update -r <revision>, unzip the zip, and replace the local
-       bin/Linux_64/GalaxCore.
+       Then update the workspace source code to the latest SVN revision, unzip
+       the selected zip, replace the local bin/Linux_64/GalaxCore, and pass the
+       selected GalaxCore build revision to vivado_runner.
    2.2 Read the flow_config field from the task JSON and bulk-update the
        corresponding fields in the local test2/flow_config.
 3. Execute the task command, e.g. cd ~/workspace/galaxcore/test2 && ./run.sh .
@@ -20,7 +21,7 @@ Workflow:
 
 Notes:
 - enable_copy is just an ordinary field in flow_config, consumed by vivado_runner.
-- revision controls the GalaxCore version.
+- revision controls the selected GalaxCore binary zip version, not the source workspace revision.
 - flow_config controls which stages vivado_runner executes.
 """
 
@@ -558,18 +559,12 @@ def select_zip_for_task(task: Dict[str, Any]) -> Tuple[Optional[int], Optional[s
     return rev, zip_path, mode
 
 
-def svn_update_latest() -> int:
-    """Update workspace source code to latest revision.
-
-    The GalaxCore binary version is controlled by the selected GalaxCore_xxx.zip,
-    not by the source workspace revision. Avoid svn update -r <old_rev> here to
-    prevent conflicts when the local workspace has newer files.
-    """
+def svn_update_to_revision(rev: int) -> int:
     script = """
 {prefix}
 cd "{workspace}"
-svn update
-""".format(prefix=csh_runtime_prefix(), workspace=WORKSPACE_DIR)
+svn update -r {rev}
+""".format(prefix=csh_runtime_prefix(), workspace=WORKSPACE_DIR, rev=rev)
     return run_csh(script)
 
 
@@ -835,26 +830,17 @@ ldd "{target_binary}" | grep 'not found' || true
     return run_csh(script)
 
 
-def run_task_command(cmd: str, build_revision: int, zip_path: str, build_info_path: str) -> int:
+def run_task_command(cmd: str) -> int:
     ignore_flag = "1" if IGNORE_RUN_SH_RC else "0"
 
     script = """
 {prefix}
-setenv GALAXCORE_BUILD_REVISION "{build_revision}"
-setenv GALAXCORE_REVISION "{build_revision}"
-setenv GALAXCORE_BUILD_ZIP "{zip_path}"
-setenv GALAXCORE_BUILD_INFO "{build_info_path}"
 setenv GALAXCORE_WORKER_NAME "{worker}"
 setenv GALAXCORE_TASK_ID "{task_id}"
 setenv GALAXCORE_FLOW_CONFIG "{flow_config}"
 setenv DTS_WORKER "{worker}"
 setenv DTS_TASK_ID "{task_id}"
 setenv DTS_FLOW_CONFIG "{flow_config}"
-
-echo "[INFO] GALAXCORE_BUILD_REVISION: $GALAXCORE_BUILD_REVISION"
-echo "[INFO] GALAXCORE_BUILD_ZIP: $GALAXCORE_BUILD_ZIP"
-echo "[INFO] GALAXCORE_BUILD_INFO: $GALAXCORE_BUILD_INFO"
-
 {cmd}
 set run_rc = $status
 echo "[INFO] task command finished with exit code $run_rc"
@@ -866,9 +852,6 @@ else
 endif
 """.format(
         prefix=csh_runtime_prefix(),
-        build_revision=build_revision,
-        zip_path=zip_path,
-        build_info_path=build_info_path,
         worker=WORKER_NAME,
         task_id=CURRENT_TASK_ID,
         flow_config=FLOW_CONFIG_FILE,
@@ -953,7 +936,7 @@ def run_attempt(task: Dict[str, Any]) -> int:
     if rc != 0:
         return rc
 
-    rc = run_step("svn update latest", svn_update_latest)
+    rc = run_step("svn update", lambda: svn_update_to_revision(int(rev_zip["rev"])))
     if rc != 0:
         return rc
 
@@ -966,20 +949,6 @@ def run_attempt(task: Dict[str, Any]) -> int:
         return rc
 
     rc = run_step("replace GalaxCore binary", replace_binary_from_tmp)
-    if rc != 0:
-        return rc
-    
-    build_info_path_holder = {"path": ""}
-
-    def step_write_build_info() -> int:
-        build_info_path_holder["path"] = write_galaxcore_build_info(
-            task_id=str(task_id),
-            build_revision=int(rev_zip["rev"]),
-            zip_path=str(rev_zip["zip_path"]),
-        )
-        return 0
-
-    rc = run_step("write GalaxCore build info", step_write_build_info)
     if rc != 0:
         return rc
 
@@ -995,15 +964,7 @@ def run_attempt(task: Dict[str, Any]) -> int:
     if rc != 0:
         return rc
 
-    rc = run_step(
-        "run task command",
-        lambda: run_task_command(
-            cmd,
-            build_revision=int(rev_zip["rev"]),
-            zip_path=str(rev_zip["zip_path"]),
-            build_info_path=build_info_path_holder["path"],
-        ),
-    )
+    rc = run_step("run task command", lambda: run_task_command(cmd))
     if rc != 0:
         return rc
 
@@ -1047,29 +1008,6 @@ def execute_task(task: Dict[str, Any]) -> int:
     report_task(task, "failed", exit_code=final_rc, message="task failed at step [{}]: {}".format(FAILED_STEP, FAILED_REASON))
     return final_rc
 
-def write_galaxcore_build_info(task_id: str, build_revision: int, zip_path: str) -> str:
-    """Write selected GalaxCore build metadata for vivado_runner scripts.
-
-    This file is intentionally key-value text instead of JSON so bash/csh/awk
-    scripts can read it easily.
-    """
-    info_path = os.path.join(TEST_DIR, ".galaxcore_build_info")
-
-    lines = [
-        "GALAXCORE_BUILD_REVISION {}\n".format(build_revision),
-        "GALAXCORE_REVISION {}\n".format(build_revision),
-        "GALAXCORE_BUILD_ZIP {}\n".format(zip_path),
-        "DTS_TASK_ID {}\n".format(task_id),
-        "DTS_WORKER {}\n".format(WORKER_NAME),
-        "CREATED_AT {}\n".format(now_ts()),
-    ]
-
-    with open(info_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    log("[INFO] GalaxCore build info written: {}".format(info_path))
-    log("[INFO] GALAXCORE_BUILD_REVISION={}".format(build_revision))
-    return info_path
 
 # ============================================================
 # Main worker loop

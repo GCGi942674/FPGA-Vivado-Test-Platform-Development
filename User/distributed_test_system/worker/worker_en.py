@@ -49,7 +49,7 @@ from typing import Callable, Dict, Optional, Tuple, Any
 PROJECT_NAME = "galaxcore"
 
 # Scheduler configuration
-SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "http://0.0.0.0:9000").rstrip("/")
+SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "http://192.168.10.11:9000").rstrip("/")
 PULL_API = os.environ.get("PULL_API", "/api/task/pull")
 REPORT_API = os.environ.get("REPORT_API", "/api/task/report")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
@@ -63,7 +63,7 @@ TEST_DIR = os.environ.get("TEST_DIR", os.path.join(WORKSPACE_DIR, "test2"))
 FLOW_CONFIG_FILE = os.environ.get("FLOW_CONFIG_FILE", os.path.join(TEST_DIR, "flow_config"))
 
 # GalaxCore zip shared directory
-SHARE_ZIP_DIR = os.environ.get("SHARE_ZIP_DIR", "/home/xiaonan/Share/zw_cache/GalaxCore_bin/zip")
+SHARE_ZIP_DIR = os.environ.get("SHARE_ZIP_DIR", "/home/xiaonan/Share/zw_cache/distributed_test_system/GalaxCore_bin/zip")
 
 # Local GalaxCore binary location
 BIN_DIR = os.environ.get("BIN_DIR", os.path.join(WORKSPACE_DIR, "bin/Linux_64"))

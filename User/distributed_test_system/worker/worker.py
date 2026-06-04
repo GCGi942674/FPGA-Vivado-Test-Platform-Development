@@ -11,18 +11,19 @@ Workflow:
 2. Analyze the task:
    2.1 If the task specifies a revision, use the designated GalaxCore_xxx.zip;
        otherwise use the latest GalaxCore_xxx.zip from the shared directory.
-       Then update the workspace source code to the latest SVN revision, unzip
-       the selected zip, replace the local bin/Linux_64/GalaxCore, and pass the
-       selected GalaxCore build revision to vivado_runner.
+       The source workspace is updated to the latest SVN revision only.
+       The selected GalaxCore zip revision is passed to vivado_runner through
+       environment variables and .galaxcore_build_info.
    2.2 Read the flow_config field from the task JSON and bulk-update the
        corresponding fields in the local test2/flow_config.
-3. Execute the task command, e.g. cd ~/workspace/galaxcore/test2 && ./run.sh .
+3. Execute the original task cmd, e.g. cd ~/workspace/galaxcore/test2 && ./run.sh .
 4. Report success / failure back to the scheduler.
 
 Notes:
 - enable_copy is just an ordinary field in flow_config, consumed by vivado_runner.
 - revision controls the selected GalaxCore binary zip version, not the source workspace revision.
 - flow_config controls which stages vivado_runner executes.
+- If the scheduler is unavailable, the worker waits and retries without flooding traceback logs.
 """
 
 import fcntl
@@ -53,6 +54,9 @@ SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "http://0.0.0.0:9000").rstrip("/
 PULL_API = os.environ.get("PULL_API", "/api/task/pull")
 REPORT_API = os.environ.get("REPORT_API", "/api/task/report")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
+SCHEDULER_HEALTH_API = os.environ.get("SCHEDULER_HEALTH_API", "/api/health")
+SCHEDULER_CHECK_INTERVAL = int(os.environ.get("SCHEDULER_CHECK_INTERVAL", "10"))
+SCHEDULER_WARN_INTERVAL = int(os.environ.get("SCHEDULER_WARN_INTERVAL", "60"))
 
 # Worker name – recommended to set WORKER_NAME explicitly before starting the worker on each machine
 WORKER_NAME = os.environ.get("WORKER_NAME", socket.gethostname().split(".")[0])
@@ -87,8 +91,10 @@ IGNORE_RUN_SH_RC = os.environ.get("GALAXCORE_IGNORE_RUN_RC", "1") != "0"
 MAX_ATTEMPTS = int(os.environ.get("GALAXCORE_WORKER_MAX_ATTEMPTS", "1"))
 RETRY_INTERVAL = int(os.environ.get("GALAXCORE_WORKER_RETRY_INTERVAL", "1800"))
 
-# Log location: ~/logs/galaxcore/YYYY-MM-DD/
-LOG_ROOT = os.path.expanduser(os.environ.get("LOG_ROOT", "~/logs/galaxcore"))
+# Log location: /home/user3/distributed_test_system/logs/YYYY-MM-DD/
+LOG_ROOT = os.path.expanduser(
+    os.environ.get("LOG_ROOT", "/home/user3/distributed_test_system/logs")
+)
 DATE_TAG = datetime.now().strftime("%Y-%m-%d")
 LOG_DIR = os.path.join(LOG_ROOT, DATE_TAG)
 SUMMARY_FILE = os.path.join(LOG_ROOT, "worker_summary.tsv")
@@ -294,8 +300,73 @@ def run_step(step_name: str, func: Callable[[], int]) -> int:
 # HTTP helpers
 # ============================================================
 
+class SchedulerConnectionError(RuntimeError):
+    """Raised when the scheduler cannot be reached."""
+
+
+def build_scheduler_url(api_path: str) -> str:
+    """Build a scheduler API URL from a relative API path."""
+    if api_path.startswith("http://") or api_path.startswith("https://"):
+        return api_path
+    return SCHEDULER_URL + api_path
+
+
+def get_json(api_path: str, timeout: int = 10) -> Dict[str, Any]:
+    """Send a GET request to the scheduler and parse the JSON response."""
+    url = build_scheduler_url(api_path)
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace").strip()
+            if not body:
+                return {}
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("HTTP {} from {}: {}".format(exc.code, url, body))
+    except urllib.error.URLError as exc:
+        raise SchedulerConnectionError("cannot connect to scheduler {}: {}".format(url, exc))
+
+
+def check_scheduler_health() -> Tuple[bool, str]:
+    """Check whether the scheduler health API is reachable."""
+    try:
+        resp = get_json(SCHEDULER_HEALTH_API, timeout=5)
+    except Exception as exc:
+        return False, str(exc)
+
+    if resp.get("ok"):
+        return True, "ok"
+
+    return False, "unexpected health response: {}".format(resp)
+
+
+def wait_for_scheduler() -> None:
+    """Wait until the scheduler is reachable before polling tasks."""
+    last_log_time = 0
+
+    while True:
+        ok, message = check_scheduler_health()
+        if ok:
+            log("[INFO] Scheduler is available: {}".format(SCHEDULER_URL))
+            return
+
+        now = time.time()
+        if now - last_log_time >= SCHEDULER_WARN_INTERVAL:
+            log("[WARN] Scheduler is not available yet: {}".format(message))
+            log("[INFO] Waiting for scheduler, retry every {}s".format(SCHEDULER_CHECK_INTERVAL))
+            last_log_time = now
+
+        time.sleep(SCHEDULER_CHECK_INTERVAL)
+
+
 def post_json(api_path: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
-    url = SCHEDULER_URL + api_path
+    url = build_scheduler_url(api_path)
     data = json.dumps(payload).encode("utf-8")
 
     req = urllib.request.Request(
@@ -315,7 +386,7 @@ def post_json(api_path: str, payload: Dict[str, Any], timeout: int = 30) -> Dict
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError("HTTP {} from {}: {}".format(exc.code, url, body))
     except urllib.error.URLError as exc:
-        raise RuntimeError("cannot connect to scheduler {}: {}".format(url, exc))
+        raise SchedulerConnectionError("cannot connect to scheduler {}: {}".format(url, exc))
 
 
 def pull_task() -> Optional[Dict[str, Any]]:
@@ -559,13 +630,44 @@ def select_zip_for_task(task: Dict[str, Any]) -> Tuple[Optional[int], Optional[s
     return rev, zip_path, mode
 
 
-def svn_update_to_revision(rev: int) -> int:
+def svn_update_latest() -> int:
+    """Update workspace source code to latest revision.
+
+    The GalaxCore binary version is controlled by the selected GalaxCore_xxx.zip,
+    not by the source workspace revision. Avoid svn update -r <old_rev> here to
+    prevent conflicts when the local workspace has newer files.
+    """
     script = """
 {prefix}
 cd "{workspace}"
-svn update -r {rev}
-""".format(prefix=csh_runtime_prefix(), workspace=WORKSPACE_DIR, rev=rev)
+svn update
+""".format(prefix=csh_runtime_prefix(), workspace=WORKSPACE_DIR)
     return run_csh(script)
+
+
+def write_galaxcore_build_info(task_id: str, build_revision: int, zip_path: str) -> str:
+    """Write selected GalaxCore build metadata for vivado_runner scripts.
+
+    This file is intentionally key-value text instead of JSON so bash/csh/awk
+    scripts can read it easily.
+    """
+    info_path = os.path.join(TEST_DIR, ".galaxcore_build_info")
+
+    lines = [
+        "GALAXCORE_BUILD_REVISION {}\n".format(build_revision),
+        "GALAXCORE_REVISION {}\n".format(build_revision),
+        "GALAXCORE_BUILD_ZIP {}\n".format(zip_path),
+        "DTS_TASK_ID {}\n".format(task_id),
+        "DTS_WORKER {}\n".format(WORKER_NAME),
+        "CREATED_AT {}\n".format(now_ts()),
+    ]
+
+    with open(info_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    log("[INFO] GalaxCore build info written: {}".format(info_path))
+    log("[INFO] GALAXCORE_BUILD_REVISION={}".format(build_revision))
+    return info_path
 
 
 def check_galaxcore_binary_not_in_use() -> int:
@@ -830,17 +932,29 @@ ldd "{target_binary}" | grep 'not found' || true
     return run_csh(script)
 
 
-def run_task_command(cmd: str) -> int:
+def run_task_command(cmd: str, build_revision: int, zip_path: str, build_info_path: str) -> int:
     ignore_flag = "1" if IGNORE_RUN_SH_RC else "0"
 
     script = """
 {prefix}
+setenv GALAXCORE_RUN_MODE "distributed"
+setenv DTS_RUN_MODE "distributed"
+setenv GALAXCORE_BUILD_REVISION "{build_revision}"
+setenv GALAXCORE_REVISION "{build_revision}"
+setenv GALAXCORE_BUILD_ZIP "{zip_path}"
+setenv GALAXCORE_BUILD_INFO "{build_info_path}"
 setenv GALAXCORE_WORKER_NAME "{worker}"
 setenv GALAXCORE_TASK_ID "{task_id}"
 setenv GALAXCORE_FLOW_CONFIG "{flow_config}"
 setenv DTS_WORKER "{worker}"
 setenv DTS_TASK_ID "{task_id}"
 setenv DTS_FLOW_CONFIG "{flow_config}"
+
+echo "[INFO] GALAXCORE_RUN_MODE: $GALAXCORE_RUN_MODE"
+echo "[INFO] GALAXCORE_BUILD_REVISION: $GALAXCORE_BUILD_REVISION"
+echo "[INFO] GALAXCORE_BUILD_ZIP: $GALAXCORE_BUILD_ZIP"
+echo "[INFO] GALAXCORE_BUILD_INFO: $GALAXCORE_BUILD_INFO"
+
 {cmd}
 set run_rc = $status
 echo "[INFO] task command finished with exit code $run_rc"
@@ -852,6 +966,9 @@ else
 endif
 """.format(
         prefix=csh_runtime_prefix(),
+        build_revision=build_revision,
+        zip_path=zip_path,
+        build_info_path=build_info_path,
         worker=WORKER_NAME,
         task_id=CURRENT_TASK_ID,
         flow_config=FLOW_CONFIG_FILE,
@@ -936,7 +1053,7 @@ def run_attempt(task: Dict[str, Any]) -> int:
     if rc != 0:
         return rc
 
-    rc = run_step("svn update", lambda: svn_update_to_revision(int(rev_zip["rev"])))
+    rc = run_step("svn update latest", svn_update_latest)
     if rc != 0:
         return rc
 
@@ -952,6 +1069,20 @@ def run_attempt(task: Dict[str, Any]) -> int:
     if rc != 0:
         return rc
 
+    build_info_path_holder = {"path": ""}
+
+    def step_write_build_info() -> int:
+        build_info_path_holder["path"] = write_galaxcore_build_info(
+            task_id=str(task_id),
+            build_revision=int(rev_zip["rev"]),
+            zip_path=str(rev_zip["zip_path"]),
+        )
+        return 0
+
+    rc = run_step("write GalaxCore build info", step_write_build_info)
+    if rc != 0:
+        return rc
+
     rc = run_step("update flow_config from task", lambda: update_local_flow_config(flow_config_updates))
     if rc != 0:
         return rc
@@ -964,7 +1095,15 @@ def run_attempt(task: Dict[str, Any]) -> int:
     if rc != 0:
         return rc
 
-    rc = run_step("run task command", lambda: run_task_command(cmd))
+    rc = run_step(
+        "run task command",
+        lambda: run_task_command(
+            cmd,
+            build_revision=int(rev_zip["rev"]),
+            zip_path=str(rev_zip["zip_path"]),
+            build_info_path=build_info_path_holder["path"],
+        ),
+    )
     if rc != 0:
         return rc
 
@@ -1038,7 +1177,10 @@ def main() -> int:
         log("Log file   : {}".format(LOG_FILE))
         log("============================================================")
 
+        wait_for_scheduler()
+
         last_idle_log_time = 0
+        last_scheduler_error_log_time = 0
 
         while True:
             try:
@@ -1058,6 +1200,14 @@ def main() -> int:
             except KeyboardInterrupt:
                 log("Worker stopped by user")
                 return 0
+
+            except SchedulerConnectionError as exc:
+                now = time.time()
+                if now - last_scheduler_error_log_time >= SCHEDULER_WARN_INTERVAL:
+                    log("[WARN] Scheduler communication failed: {}".format(exc))
+                    log("[INFO] Worker will keep waiting and retry polling tasks")
+                    last_scheduler_error_log_time = now
+                time.sleep(POLL_INTERVAL)
 
             except Exception as exc:
                 log("[ERROR] worker loop exception: {}".format(exc))

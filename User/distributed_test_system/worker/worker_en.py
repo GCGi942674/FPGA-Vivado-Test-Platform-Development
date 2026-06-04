@@ -996,14 +996,14 @@ def run_attempt(task: Dict[str, Any]) -> int:
         return rc
 
     rc = run_step(
-    "run task command",
-    lambda: run_task_command(
-        cmd,
-        build_revision=int(rev_zip["rev"]),
-        zip_path=str(rev_zip["zip_path"]),
-        build_info_path=build_info_path_holder["path"],
-    ),
-)
+        "run task command",
+        lambda: run_task_command(
+            cmd,
+            build_revision=int(rev_zip["rev"]),
+            zip_path=str(rev_zip["zip_path"]),
+            build_info_path=build_info_path_holder["path"],
+        ),
+    )
     if rc != 0:
         return rc
 

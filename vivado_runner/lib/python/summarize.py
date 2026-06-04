@@ -2,8 +2,8 @@
 import argparse
 import os
 from collections import Counter
-from statistics import mean
 from datetime import datetime
+from statistics import mean
 from utils import parse_env_file, write_json, write_text
 
 
@@ -28,9 +28,11 @@ def ts_to_str(ts):
         return ''
     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 
+
 def count_case_list(path):
     if not path or not os.path.isfile(path):
         return 0
+
     count = 0
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
@@ -39,18 +41,54 @@ def count_case_list(path):
                 count += 1
     return count
 
+
+def format_run_tcl_path(path, workspace_root):
+    if not path:
+        return ''
+
+    workspace_root = os.path.realpath(workspace_root) if workspace_root else ''
+    abs_path = os.path.realpath(path)
+
+    if workspace_root:
+        try:
+            rel_path = os.path.relpath(abs_path, workspace_root)
+            if not rel_path.startswith('..') and not os.path.isabs(rel_path):
+                return '/' + rel_path.replace(os.sep, '/')
+        except Exception:
+            pass
+
+    return abs_path.replace(os.sep, '/')
+
+
+def build_timeout_lines(records, workspace_root):
+    timeout_lines = []
+    seen_paths = set()
+
+    for rec in records:
+        if rec.get('STATUS', 'UNKNOWN') != 'TIMEOUT':
+            continue
+
+        run_tcl = rec.get('RUN_TCL') or os.path.join(rec.get('CASE_DIR', ''), 'run.tcl')
+        timeout_path = format_run_tcl_path(run_tcl, workspace_root)
+
+        if timeout_path and timeout_path not in seen_paths:
+            timeout_lines.append(timeout_path)
+            seen_paths.add(timeout_path)
+
+    return '\n'.join(timeout_lines) + ('\n' if timeout_lines else '')
+
+
 def build_reports(records, meta):
     status_counter = Counter()
     reason_counter = Counter()
     runtime_values = []
-    failed_rows = []
-
     start_ts_values = []
     end_ts_values = []
 
     for rec in records:
         status = rec.get('STATUS', 'UNKNOWN')
         reason = rec.get('REASON', 'UNKNOWN')
+
         status_counter[status] += 1
         reason_counter[reason] += 1
 
@@ -59,25 +97,20 @@ def build_reports(records, meta):
 
         start_ts = safe_int(rec.get('START_TS', '0'))
         end_ts = safe_int(rec.get('END_TS', '0'))
+
         if start_ts > 0:
             start_ts_values.append(start_ts)
         if end_ts > 0:
             end_ts_values.append(end_ts)
 
-        if status != 'PASS':
-            failed_rows.append(rec)
-
     runnable_cases = len(records)
-
     total_from_case_list = count_case_list(meta.get('case_list', ''))
     total = total_from_case_list if total_from_case_list > 0 else runnable_cases
-
     skipped_cases = max(0, total - runnable_cases)
 
     avg_runtime = round(mean(runtime_values), 2) if runtime_values else 0
     pass_count = status_counter.get('PASS', 0)
     timeout_count = status_counter.get('TIMEOUT', 0)
-
     failed_cases = runnable_cases - pass_count
     fail_count = failed_cases + skipped_cases
 
@@ -87,8 +120,7 @@ def build_reports(records, meta):
 
     run_start_time = ts_to_str(run_start_ts)
     run_end_time = ts_to_str(run_end_ts)
-
-    overall_status = 'PASS' if fail_count == 0 and timeout_count == 0 else 'FAIL'
+    overall_status = 'PASS' if fail_count == 0 else 'FAIL'
 
     report_lines = [
         'Execution Report',
@@ -112,7 +144,7 @@ def build_reports(records, meta):
         f'Average runtime (sec): {avg_runtime}',
         f'Status: {overall_status}',
         '',
-        'Top failure reasons:'
+        'Top failure reasons:',
     ]
 
     if reason_counter:
@@ -124,15 +156,15 @@ def build_reports(records, meta):
     summary_lines = []
     for rec in records:
         if rec.get('STATUS', 'UNKNOWN') == 'PASS':
-            summary_lines.append(
-                f"{rec.get('CASE_DIR', '')}"
-            )
+            summary_lines.append(f"{rec.get('CASE_DIR', '')}")
 
     failed_lines = []
     for rec in records:
         if rec.get('STATUS', 'UNKNOWN') != 'PASS':
             failed_lines.append(
-                f"[{rec.get('STATUS', 'UNKNOWN')}] {rec.get('CASE_DIR', '')} | {rec.get('REASON', 'UNKNOWN')}"
+                f"[{rec.get('STATUS', 'UNKNOWN')}] "
+                f"{rec.get('CASE_DIR', '')} | "
+                f"{rec.get('REASON', 'UNKNOWN')}"
             )
 
     stat_lines = [
@@ -199,6 +231,8 @@ def main():
     parser.add_argument('--stat', required=True)
     parser.add_argument('--text-report', required=True)
     parser.add_argument('--json-report', required=True)
+    parser.add_argument('--timeout-list', required=True)
+    parser.add_argument('--workspace-root', required=True)
     parser.add_argument('--enabled-modules', required=True)
     parser.add_argument('--time-limit', required=True)
     parser.add_argument('--bg-max', required=True)
@@ -210,6 +244,7 @@ def main():
     records = [parse_env_file(path) for path in collect_status_files(args.status_root)]
     meta = {
         'case_list': args.case_list,
+        'workspace_root': args.workspace_root,
         'enabled_modules': args.enabled_modules,
         'time_limit': args.time_limit,
         'bg_max': args.bg_max,
@@ -219,10 +254,13 @@ def main():
     }
 
     summary_text, failed_text, stat_text, report_text, payload = build_reports(records, meta)
+    timeout_text = build_timeout_lines(records, args.workspace_root)
+
     write_text(args.summary, summary_text)
     write_text(args.failed, failed_text)
     write_text(args.stat, stat_text)
     write_text(args.text_report, report_text)
+    write_text(args.timeout_list, timeout_text)
     write_json(args.json_report, payload)
 
 

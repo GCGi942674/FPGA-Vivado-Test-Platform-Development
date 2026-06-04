@@ -3,6 +3,23 @@
 PID_MAP_FILE="$TMP_DIR/pid_map.txt"
 INTERRUPTED=0
 
+is_pid_running() {
+    local pid="$1"
+    local stat
+
+    kill -0 "$pid" 2>/dev/null || return 1
+
+    stat=$(ps -p "$pid" -o stat= 2>/dev/null | awk '{print $1}')
+    [ -n "$stat" ] || return 1
+
+    # A zombie PID already finished and only needs wait/reap.
+    case "$stat" in
+        Z*) return 1 ;;
+    esac
+
+    return 0
+}
+
 handle_interrupt() {
     INTERRUPTED=1
     trap '' INT TERM
@@ -16,7 +33,7 @@ handle_interrupt() {
         while IFS='|' read -r pid run_tcl case_dir start_ts status_out; do
             [ -n "$pid" ] || continue
 
-            if kill -0 "$pid" 2>/dev/null; then
+            if is_pid_running "$pid"; then
                 kill -TERM -- "-$pid" 2>/dev/null || true
                 sleep 1
                 kill -KILL -- "-$pid" 2>/dev/null || true
@@ -51,6 +68,7 @@ handle_interrupt() {
         : > "$PID_MAP_FILE"
     fi
 
+    # Save the latest partial reports before exiting.
     finalize_reports || true
     log_warn "Exit by Ctrl+C"
     exit 130
@@ -107,7 +125,7 @@ reap_finished_jobs() {
     while IFS='|' read -r pid map_run_tcl map_case_dir start_ts status_out; do
         [ -n "$pid" ] || continue
 
-        if kill -0 "$pid" 2>/dev/null; then
+        if is_pid_running "$pid"; then
             printf '%s|%s|%s|%s|%s\n' "$pid" "$map_run_tcl" "$map_case_dir" "$start_ts" "$status_out" >> "$new_map"
             continue
         fi
@@ -119,6 +137,9 @@ reap_finished_jobs() {
         else
             printf 'FAIL|%s|MISSING_STATUS_OUTPUT\n' "$map_case_dir" >> "$TMP_DIR/case_results.raw"
         fi
+
+        # Refresh reports immediately after one case finishes.
+        refresh_reports || true
     done < "$PID_MAP_FILE"
 
     mv "$new_map" "$PID_MAP_FILE"
@@ -137,7 +158,7 @@ kill_timeout_jobs() {
     while IFS='|' read -r pid map_run_tcl map_case_dir start_ts status_out; do
         [ -n "$pid" ] || continue
 
-        if ! kill -0 "$pid" 2>/dev/null; then
+        if ! is_pid_running "$pid"; then
             # Do not drop finished jobs here.
             # Let reap_finished_jobs consume status_out and append case_results.raw.
             printf '%s|%s|%s|%s|%s\n' "$pid" "$map_run_tcl" "$map_case_dir" "$start_ts" "$status_out" >> "$new_map"
@@ -181,6 +202,9 @@ kill_timeout_jobs() {
             echo "124" > "$map_case_dir/.run_ret"
 
             printf 'TIMEOUT|%s|TIME_LIMIT_REACHED\n' "$map_case_dir" >> "$TMP_DIR/case_results.raw"
+
+            # Refresh reports immediately after one case times out.
+            refresh_reports || true
         else
             printf '%s|%s|%s|%s|%s\n' "$pid" "$map_run_tcl" "$map_case_dir" "$start_ts" "$status_out" >> "$new_map"
         fi
@@ -224,6 +248,7 @@ dispatch_cases() {
 
         while [ "$(count_running_jobs)" -ge "$BG_MAX" ]; do
             sleep 1
+            reap_finished_jobs
             kill_timeout_jobs
             reap_finished_jobs
         done
@@ -234,6 +259,7 @@ dispatch_cases() {
 
     while [ "$(count_running_jobs)" -gt 0 ]; do
         sleep 1
+        reap_finished_jobs
         kill_timeout_jobs
         reap_finished_jobs
     done

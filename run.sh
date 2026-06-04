@@ -46,6 +46,10 @@ main() {
 
     log_info "Discovered $case_count case(s)"
 
+    if [ "$ENABLE_COPY_REPORTS" -eq 1 ]; then
+        init_live_report_dir
+    fi
+
     dispatch_cases
     finalize_reports
 

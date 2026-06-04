@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 Initialize or migrate the SQLite database for the distributed GalaxCore test system.
 
-Schema notes:
-- revision is nullable. If it is NULL, the worker should use the latest GalaxCore zip.
-- cmd is stored exactly as provided by taskctl/templates and executed by worker unchanged.
-- target_arg and target_type are derived from cmd for display/query only.
+This script runs only on the central server, usually pudong.
+The SQLite database is central-only. Workers should never access it directly.
+
+Time policy:
+    - SQLite CURRENT_TIMESTAMP is UTC.
+    - Runtime scripts explicitly write datetime('now','localtime') when creating
+      or updating records.
+    - Table defaults are kept mostly for compatibility, but scheduler/taskctl
+      should not rely on them.
+
+Revision policy:
+    - revision_policy = 'fixed': use the task revision as-is.
+    - revision_policy = 'latest': scheduler resolves the latest compiled
+      GalaxCore zip revision at pull time.
 """
 
 import sqlite3
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 
 DB_PATH = Path("/home/user3/distributed_test_system/data/task_queue.db")
@@ -22,6 +31,7 @@ TASK_COLUMNS = [
     "id",
     "task_id",
     "revision",
+    "revision_policy",
     "suite",
     "cmd",
     "target_arg",
@@ -33,6 +43,10 @@ TASK_COLUMNS = [
     "priority",
     "retry_count",
     "max_retry",
+    "repeat_enabled",
+    "repeat_group",
+    "repeat_index",
+    "parent_task_id",
     "created_at",
     "started_at",
     "finished_at",
@@ -55,7 +69,7 @@ def table_exists(cur, table_name):
 
 
 def get_columns(cur, table_name):
-    cur.execute(f"PRAGMA table_info({table_name})")
+    cur.execute("PRAGMA table_info(%s)" % table_name)
     return cur.fetchall()
 
 
@@ -72,7 +86,7 @@ def create_builds_table(cur):
             status TEXT NOT NULL DEFAULT 'success',
             build_time TEXT DEFAULT CURRENT_TIMESTAMP,
             error_message TEXT
-        );
+        )
         """
     )
 
@@ -85,6 +99,7 @@ def create_tasks_table(cur):
             task_id TEXT UNIQUE NOT NULL,
 
             revision INTEGER,
+            revision_policy TEXT DEFAULT 'fixed',
             suite TEXT NOT NULL,
 
             cmd TEXT,
@@ -102,13 +117,18 @@ def create_tasks_table(cur):
             retry_count INTEGER DEFAULT 0,
             max_retry INTEGER DEFAULT 1,
 
+            repeat_enabled INTEGER DEFAULT 0,
+            repeat_group TEXT,
+            repeat_index INTEGER DEFAULT 1,
+            parent_task_id TEXT,
+
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             started_at TEXT,
             finished_at TEXT,
 
             result_path TEXT,
             error_message TEXT
-        );
+        )
         """
     )
 
@@ -125,7 +145,7 @@ def create_workers_table(cur):
 
             last_heartbeat TEXT,
             registered_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+        )
         """
     )
 
@@ -140,7 +160,21 @@ def create_task_events_table(cur):
             event TEXT NOT NULL,
             message TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+        )
+        """
+    )
+
+
+def create_repeat_groups_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS repeat_groups (
+            repeat_group TEXT PRIMARY KEY,
+            enabled INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            disabled_at TEXT,
+            note TEXT
+        )
         """
     )
 
@@ -149,48 +183,69 @@ def create_indexes(cur):
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
-        ON tasks(status, priority, created_at);
+        ON tasks(status, priority, created_at)
         """
     )
 
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_tasks_assigned_worker
-        ON tasks(assigned_worker);
+        ON tasks(assigned_worker)
         """
     )
 
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_tasks_target_type
-        ON tasks(target_type);
+        ON tasks(target_type)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tasks_repeat_group
+        ON tasks(repeat_group, status)
         """
     )
 
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_task_events_task_id
-        ON task_events(task_id);
+        ON task_events(task_id)
         """
     )
 
 
-def add_missing_task_columns(conn):
-    """Add columns required by the current scheduler/taskctl without dropping data."""
+def add_missing_columns(conn, table_name, column_defs):
     cur = conn.cursor()
-    existing_columns = set(get_column_names(cur, "tasks"))
+    existing_columns = set(get_column_names(cur, table_name))
 
-    column_sql = {
-        "cmd": "ALTER TABLE tasks ADD COLUMN cmd TEXT",
-        "target_arg": "ALTER TABLE tasks ADD COLUMN target_arg TEXT",
-        "target_type": "ALTER TABLE tasks ADD COLUMN target_type TEXT",
-    }
-
-    for column_name, sql in column_sql.items():
+    for column_name, column_def in column_defs.items():
         if column_name not in existing_columns:
-            cur.execute(sql)
+            cur.execute(
+                "ALTER TABLE %s ADD COLUMN %s %s"
+                % (table_name, column_name, column_def)
+            )
+            print("Column added: %s.%s" % (table_name, column_name))
 
     conn.commit()
+
+
+def add_missing_task_columns(conn):
+    add_missing_columns(
+        conn,
+        "tasks",
+        {
+            "revision_policy": "TEXT DEFAULT 'fixed'",
+            "cmd": "TEXT",
+            "target_arg": "TEXT",
+            "target_type": "TEXT",
+            "repeat_enabled": "INTEGER DEFAULT 0",
+            "repeat_group": "TEXT",
+            "repeat_index": "INTEGER DEFAULT 1",
+            "parent_task_id": "TEXT",
+        },
+    )
 
 
 def revision_column_is_notnull(cur):
@@ -205,10 +260,10 @@ def revision_column_is_notnull(cur):
 
 def migrate_tasks_revision_nullable(conn):
     """
-    Rebuild the tasks table if revision was created as NOT NULL.
+    Rebuild tasks table if revision was created as NOT NULL.
 
-    SQLite cannot remove a NOT NULL constraint with ALTER TABLE, so we rename the
-    old table, create the new schema, and copy common columns back.
+    SQLite cannot remove a NOT NULL constraint with ALTER TABLE, so the table
+    is renamed, recreated, and copied back.
     """
     cur = conn.cursor()
 
@@ -219,9 +274,9 @@ def migrate_tasks_revision_nullable(conn):
         return
 
     backup_table = "tasks_backup_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"Migrating tasks.revision to nullable. Backup table: {backup_table}")
+    print("Migrating tasks.revision to nullable. Backup table: %s" % backup_table)
 
-    cur.execute(f"ALTER TABLE tasks RENAME TO {backup_table}")
+    cur.execute("ALTER TABLE tasks RENAME TO %s" % backup_table)
     create_tasks_table(cur)
 
     old_columns = set(get_column_names(cur, backup_table))
@@ -230,11 +285,11 @@ def migrate_tasks_revision_nullable(conn):
 
     column_list = ", ".join(common_columns)
     cur.execute(
-        f"""
-        INSERT INTO tasks ({column_list})
-        SELECT {column_list}
-        FROM {backup_table}
         """
+        INSERT INTO tasks (%s)
+        SELECT %s
+        FROM %s
+        """ % (column_list, column_list, backup_table)
     )
 
     conn.commit()
@@ -244,8 +299,8 @@ def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
 
     cur = conn.cursor()
 
@@ -253,7 +308,7 @@ def init_db():
     create_tasks_table(cur)
     create_workers_table(cur)
     create_task_events_table(cur)
-
+    create_repeat_groups_table(cur)
     conn.commit()
 
     add_missing_task_columns(conn)
@@ -264,7 +319,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-    print(f"SQLite database initialized: {DB_PATH}")
+    print("SQLite database initialized: %s" % DB_PATH)
 
 
 if __name__ == "__main__":

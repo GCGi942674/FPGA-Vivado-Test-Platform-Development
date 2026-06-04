@@ -10,16 +10,33 @@ They should communicate with this scheduler through HTTP APIs.
 Main responsibilities:
     1. Register workers and receive worker heartbeat messages.
     2. Assign pending tasks to idle workers safely.
-    3. Update task status after worker execution.
-    4. Keep every execution record immutable after completion.
-    5. Support repeat tasks by creating a new pending task after each run.
-    6. Support stopping a repeat group without killing an already running task.
+    3. Resolve latest compiled GalaxCore zip revision for latest-policy tasks.
+    4. Update task status after worker execution.
+    5. Keep every execution record immutable after completion.
+    6. Support repeat tasks by creating a new pending task after each run.
+    7. Support stopping a repeat group without killing an already running task.
 
 Repeat task policy:
     - A finished task stays success / failed / timeout.
     - The scheduler creates a new pending task with a new task_id.
     - If the repeat group is disabled, no next task is generated.
-    - If a same repeat group already has pending/running task, no duplicate is generated.
+    - If the same repeat group already has a pending/running task, no duplicate is generated.
+
+Revision policy:
+    - fixed: use the task revision as-is.
+    - latest: scan compiled GalaxCore zip packages and use the largest revision.
+      The source of truth is compiled zip files, not SVN HEAD.
+
+Latest zip source:
+    - Default scan paths:
+        /home/xiaonan/Share/zw_cache/Galaxcore_bin/zip
+        /home/xiaonan/Share/zw_cache/GalaxCore_bin/zip
+    - Override with environment variable:
+        GALAXCORE_ZIP_DIR=/path/to/zip
+
+Time policy:
+    - This scheduler explicitly writes datetime('now','localtime').
+    - This avoids SQLite CURRENT_TIMESTAMP showing UTC time in taskctl output.
 
 Compatibility notes:
     - Python 3.6 compatible.
@@ -29,6 +46,7 @@ Compatibility notes:
 import argparse
 import json
 import os
+import re
 import shlex
 import socketserver
 import sys
@@ -45,7 +63,13 @@ sys.path.insert(0, str(BASE_DIR))
 from common.db import get_conn
 
 
+LOCAL_TIME_SQL = "datetime('now','localtime')"
 DEFAULT_TEST_DIR = "/home/user3/workspace/galaxcore/test2"
+DEFAULT_ZIP_DIRS = [
+    Path("/home/xiaonan/Share/zw_cache/Galaxcore_bin/zip"),
+    Path("/home/xiaonan/Share/zw_cache/GalaxCore_bin/zip"),
+]
+ZIP_RE = re.compile(r"^Galax[Cc]ore_(\d+)\.zip$")
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -86,13 +110,14 @@ def ensure_columns(cur, table_name, column_defs):
 
 
 def ensure_task_runtime_columns(conn):
-    """Ensure old databases have runtime, command, and repeat-task columns."""
+    """Ensure old databases have runtime, command, repeat, and revision-policy columns."""
     cur = conn.cursor()
 
     ensure_columns(
         cur,
         "tasks",
         {
+            "revision_policy": "TEXT DEFAULT 'fixed'",
             "cmd": "TEXT",
             "target_arg": "TEXT",
             "target_type": "TEXT",
@@ -216,6 +241,69 @@ def make_task_id():
     return "task_" + uuid.uuid4().hex[:12]
 
 
+def get_zip_dirs():
+    """Return zip directories used to resolve latest compiled GalaxCore revision."""
+    override = os.environ.get("GALAXCORE_ZIP_DIR")
+
+    if override:
+        return [Path(override)]
+
+    return list(DEFAULT_ZIP_DIRS)
+
+
+def find_latest_compiled_zip():
+    """
+    Find the latest compiled GalaxCore zip.
+
+    The latest revision means the largest number in a compiled zip file name:
+        Galaxcore_14873.zip
+        GalaxCore_14873.zip
+    """
+    best = None
+
+    for zip_dir in get_zip_dirs():
+        if not zip_dir.is_dir():
+            continue
+
+        for item in zip_dir.iterdir():
+            if not item.is_file():
+                continue
+
+            match = ZIP_RE.match(item.name)
+            if not match:
+                continue
+
+            revision = int(match.group(1))
+
+            if best is None or revision > best[0]:
+                best = (revision, str(item))
+
+    return best
+
+
+def resolve_task_revision(row):
+    """
+    Resolve the actual revision used by a task.
+
+    Returns:
+        (revision, zip_path)
+
+    For fixed tasks, zip_path is None.
+    For latest tasks, zip_path points to the compiled zip used as source of truth.
+    """
+    revision_policy = row["revision_policy"] or "fixed"
+
+    if revision_policy == "latest":
+        latest = find_latest_compiled_zip()
+
+        if not latest:
+            return None, None
+
+        return latest
+
+    return row["revision"], None
+
+
 def upsert_worker(cur, worker, host="", status="idle", current_task_id=None):
     """Upsert worker data without using new SQLite ON CONFLICT syntax."""
     cur.execute(
@@ -237,7 +325,7 @@ def upsert_worker(cur, worker, host="", status="idle", current_task_id=None):
                 SET host = ?,
                     status = ?,
                     current_task_id = ?,
-                    last_heartbeat = CURRENT_TIMESTAMP
+                    last_heartbeat = datetime('now','localtime')
                 WHERE worker_name = ?
                 """,
                 (host, status, current_task_id, worker),
@@ -248,7 +336,7 @@ def upsert_worker(cur, worker, host="", status="idle", current_task_id=None):
                 UPDATE workers
                 SET status = ?,
                     current_task_id = ?,
-                    last_heartbeat = CURRENT_TIMESTAMP
+                    last_heartbeat = datetime('now','localtime')
                 WHERE worker_name = ?
                 """,
                 (status, current_task_id, worker),
@@ -261,9 +349,10 @@ def upsert_worker(cur, worker, host="", status="idle", current_task_id=None):
                 host,
                 status,
                 current_task_id,
-                last_heartbeat
+                last_heartbeat,
+                registered_at
             )
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))
             """,
             (worker, host, status, current_task_id),
         )
@@ -317,6 +406,8 @@ def create_next_repeat_task(cur, old_task):
     Create next pending task for a repeat task.
 
     The old task is never reused. It keeps its final status and result record.
+    latest-policy tasks keep revision NULL until the next worker pull resolves
+    the latest compiled zip revision.
     """
     repeat_group = old_task["repeat_group"]
 
@@ -329,6 +420,9 @@ def create_next_repeat_task(cur, old_task):
     if has_active_repeat_task(cur, repeat_group):
         return None
 
+    revision_policy = old_task["revision_policy"] or "fixed"
+    new_revision = None if revision_policy == "latest" else old_task["revision"]
+
     old_index = old_task["repeat_index"] or 1
     new_index = int(old_index) + 1
     new_task_id = make_task_id()
@@ -338,6 +432,7 @@ def create_next_repeat_task(cur, old_task):
         INSERT INTO tasks (
             task_id,
             revision,
+            revision_policy,
             suite,
             flow_config_json,
             target_worker,
@@ -359,12 +454,13 @@ def create_next_repeat_task(cur, old_task):
             result_path,
             error_message
         )
-        VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?, 0, ?, ?, ?, ?,
-                1, ?, ?, ?, CURRENT_TIMESTAMP, NULL, NULL, NULL, NULL)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, 0, ?, ?, ?, ?,
+                1, ?, ?, ?, datetime('now','localtime'), NULL, NULL, NULL, NULL)
         """,
         (
             new_task_id,
-            old_task["revision"],
+            new_revision,
+            revision_policy,
             old_task["suite"],
             old_task["flow_config_json"],
             old_task["target_worker"],
@@ -385,9 +481,10 @@ def create_next_repeat_task(cur, old_task):
             task_id,
             worker_name,
             event,
-            message
+            message,
+            created_at
         )
-        VALUES (?, NULL, 'created', ?)
+        VALUES (?, NULL, 'created', ?, datetime('now','localtime'))
         """,
         (
             new_task_id,
@@ -399,7 +496,7 @@ def create_next_repeat_task(cur, old_task):
 
 
 class SchedulerHandler(BaseHTTPRequestHandler):
-    server_version = "GalaxCoreScheduler/0.3"
+    server_version = "GalaxCoreScheduler/0.4"
 
     def log_message(self, fmt, *args):
         sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -429,6 +526,10 @@ class SchedulerHandler(BaseHTTPRequestHandler):
 
             if path == "/api/workers":
                 self.handle_list_workers()
+                return
+
+            if path == "/api/build/latest":
+                self.handle_latest_build()
                 return
 
             self.send_json({"ok": False, "error": "not found"}, status=404)
@@ -465,6 +566,28 @@ class SchedulerHandler(BaseHTTPRequestHandler):
     def handle_error(self, e):
         traceback.print_exc()
         self.send_json({"ok": False, "error": str(e)}, status=500)
+
+    def handle_latest_build(self):
+        latest = find_latest_compiled_zip()
+
+        if not latest:
+            self.send_json(
+                {
+                    "ok": False,
+                    "error": "no compiled GalaxCore zip found",
+                    "zip_dirs": [str(p) for p in get_zip_dirs()],
+                },
+                status=404,
+            )
+            return
+
+        self.send_json(
+            {
+                "ok": True,
+                "revision": latest[0],
+                "zip_path": latest[1],
+            }
+        )
 
     def handle_worker_register(self):
         data = read_json(self)
@@ -569,6 +692,46 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "task": None})
                 return
 
+            resolved_revision, resolved_zip_path = resolve_task_revision(row)
+
+            if resolved_revision is None:
+                upsert_worker(
+                    cur,
+                    worker=worker,
+                    status="idle",
+                    current_task_id=None,
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO task_events (
+                        task_id,
+                        worker_name,
+                        event,
+                        message,
+                        created_at
+                    )
+                    VALUES (?, ?, 'pull_skipped', ?, datetime('now','localtime'))
+                    """,
+                    (
+                        row["task_id"],
+                        worker,
+                        "No compiled GalaxCore zip found for latest revision policy",
+                    ),
+                )
+
+                conn.commit()
+                conn.close()
+
+                self.send_json(
+                    {
+                        "ok": True,
+                        "task": None,
+                        "message": "no compiled GalaxCore zip found for latest revision policy",
+                    }
+                )
+                return
+
             task_id = row["task_id"]
 
             cur.execute(
@@ -576,11 +739,12 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 UPDATE tasks
                 SET status = 'running',
                     assigned_worker = ?,
-                    started_at = CURRENT_TIMESTAMP
+                    revision = ?,
+                    started_at = datetime('now','localtime')
                 WHERE task_id = ?
                   AND status = 'pending'
                 """,
-                (worker, task_id),
+                (worker, resolved_revision, task_id),
             )
 
             if cur.rowcount != 1:
@@ -589,17 +753,22 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "failed to lock task"}, status=409)
                 return
 
+            pulled_message = "Task pulled by worker %s" % worker
+            if row["revision_policy"] == "latest":
+                pulled_message += ", resolved latest revision=%s" % resolved_revision
+
             cur.execute(
                 """
                 INSERT INTO task_events (
                     task_id,
                     worker_name,
                     event,
-                    message
+                    message,
+                    created_at
                 )
-                VALUES (?, ?, 'pulled', ?)
+                VALUES (?, ?, 'pulled', ?, datetime('now','localtime'))
                 """,
-                (task_id, worker, "Task pulled by worker %s" % worker),
+                (task_id, worker, pulled_message),
             )
 
             upsert_worker(
@@ -621,7 +790,9 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             task = {
                 "task_id": row["task_id"],
                 "id": row["task_id"],
-                "revision": row["revision"],
+                "revision": resolved_revision,
+                "revision_policy": row["revision_policy"] or "fixed",
+                "galaxcore_zip_path": resolved_zip_path,
                 "suite": row["suite"],
                 "cmd": cmd,
                 "target_arg": target_arg,
@@ -725,7 +896,7 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 """
                 UPDATE tasks
                 SET status = ?,
-                    finished_at = CURRENT_TIMESTAMP,
+                    finished_at = datetime('now','localtime'),
                     result_path = ?,
                     error_message = ?
                 WHERE task_id = ?
@@ -739,9 +910,10 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                     task_id,
                     worker_name,
                     event,
-                    message
+                    message,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, datetime('now','localtime'))
                 """,
                 (task_id, worker, status, error_message or result_path or ""),
             )
@@ -758,9 +930,10 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                             task_id,
                             worker_name,
                             event,
-                            message
+                            message,
+                            created_at
                         )
-                        VALUES (?, ?, 'repeat_next_created', ?)
+                        VALUES (?, ?, 'repeat_next_created', ?, datetime('now','localtime'))
                         """,
                         (
                             task_id,
@@ -775,9 +948,10 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                             task_id,
                             worker_name,
                             event,
-                            message
+                            message,
+                            created_at
                         )
-                        VALUES (?, ?, 'repeat_next_skipped', ?)
+                        VALUES (?, ?, 'repeat_next_skipped', ?, datetime('now','localtime'))
                         """,
                         (
                             task_id,
@@ -837,7 +1011,7 @@ class SchedulerHandler(BaseHTTPRequestHandler):
         if status:
             cur.execute(
                 """
-                SELECT task_id, revision, suite, target_worker, assigned_worker,
+                SELECT task_id, revision, revision_policy, suite, target_worker, assigned_worker,
                        status, priority, retry_count, max_retry, created_at,
                        started_at, finished_at, result_path, error_message,
                        cmd, target_arg, target_type,
@@ -852,7 +1026,7 @@ class SchedulerHandler(BaseHTTPRequestHandler):
         else:
             cur.execute(
                 """
-                SELECT task_id, revision, suite, target_worker, assigned_worker,
+                SELECT task_id, revision, revision_policy, suite, target_worker, assigned_worker,
                        status, priority, retry_count, max_retry, created_at,
                        started_at, finished_at, result_path, error_message,
                        cmd, target_arg, target_type,
@@ -874,6 +1048,7 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 {
                     "task_id": row["task_id"],
                     "revision": row["revision"],
+                    "revision_policy": row["revision_policy"] or "fixed",
                     "suite": row["suite"],
                     "target_worker": row["target_worker"],
                     "assigned_worker": row["assigned_worker"],
@@ -943,6 +1118,7 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), SchedulerHandler)
 
     print("Scheduler started: http://%s:%s" % (args.host, args.port))
+    print("Latest zip dirs: %s" % ", ".join(str(p) for p in get_zip_dirs()))
     print("Press Ctrl+C to stop.")
 
     try:

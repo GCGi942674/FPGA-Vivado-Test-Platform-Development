@@ -16,7 +16,6 @@ source "$INTERNAL_ROOT/lib/bash/report.sh"
 source "$INTERNAL_ROOT/lib/bash/copy.sh"
 
 main() {
-    init_runtime_dirs
     trap 'handle_interrupt' INT TERM
 
     parse_args "$@"
@@ -25,9 +24,18 @@ main() {
         FLOW_CONFIG_PATH="$DEFAULT_FLOW_CONFIG"
     fi
 
+    init_runtime_dirs
+
     load_default_config
     apply_cli_overrides
     load_flow_config
+
+    # Merge copy switches from CLI and flow_config.
+    # After this point, all copy logic only checks ENABLE_COPY_REPORTS.
+    if [ "${ENABLE_COPY_FROM_FLOW:-0}" -eq 1 ]; then
+        ENABLE_COPY_REPORTS=1
+    fi
+
     validate_runtime_config
 
     log_info "Workspace root: $SCRIPT_DIR"
@@ -46,17 +54,22 @@ main() {
 
     log_info "Discovered $case_count case(s)"
 
-    if [ "$ENABLE_COPY_REPORTS" -eq 1 ]; then
+    # Create the Share report directory before the first case starts.
+    if [ "${ENABLE_COPY_REPORTS:-0}" -eq 1 ]; then
         init_live_report_dir
     fi
+
+    # Generate the first version of reports immediately.
+    # Later scheduler.sh should call refresh_reports after each finished case.
+    refresh_reports || true
 
     dispatch_cases
     finalize_reports
 
-    if [ "$ENABLE_COPY_REPORTS" -eq 1 ]; then
+    if [ "${ENABLE_COPY_REPORTS:-0}" -eq 1 ]; then
         copy_summary_reports
     else
-        log_info "Skip copying reports. Use --copy to export final summary."
+        log_info "Skip copying reports. Enable --copy or set 'enable_copy 1' in flow_config to export summaries."
     fi
 
     print_final_summary

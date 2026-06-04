@@ -10,9 +10,10 @@ Workers should not run this tool and should not access SQLite directly.
 Main responsibilities:
     1. Add one-shot test tasks.
     2. Add repeat test tasks.
-    3. List, show, cancel, and delete tasks.
-    4. List, stop, and start repeat groups.
-    5. Preserve every execution record by never reusing a finished task_id.
+    3. Add latest-revision repeat tasks.
+    4. List, show, cancel, and delete tasks.
+    5. List, stop, and start repeat groups.
+    6. Preserve every execution record by never reusing a finished task_id.
 
 Repeat task policy:
     - Use --repeat to create a repeat task.
@@ -20,6 +21,15 @@ Repeat task policy:
     - After a worker finishes it, scheduler.py creates the next pending task.
     - stop-repeat disables the group and cancels pending tasks only.
     - Running tasks are not killed by stop-repeat.
+
+Revision policy:
+    - fixed: use the task revision as-is.
+    - latest: scheduler resolves the latest compiled GalaxCore zip revision
+      when a worker pulls the task.
+
+Time policy:
+    - This tool explicitly writes datetime('now','localtime') for new records.
+    - This avoids SQLite CURRENT_TIMESTAMP showing UTC time in taskctl output.
 
 Compatibility notes:
     - Python 3.6 compatible.
@@ -42,6 +52,10 @@ sys.path.insert(0, str(BASE_DIR))
 from common.db import get_conn
 
 
+LOCAL_TIME_SQL = "datetime('now','localtime')"
+DEFAULT_TEST_DIR = "/home/user3/workspace/galaxcore/test2"
+TEMPLATE_DIR = BASE_DIR / "templates"
+
 DEFAULT_FLOW_CONFIG = {
     "report_timing_summary": 0,
     "opt_design": 0,
@@ -60,17 +74,16 @@ DEFAULT_FLOW_CONFIG = {
     "enable_copy": 1,
 }
 
-TEMPLATE_DIR = BASE_DIR / "templates"
-DEFAULT_TEST_DIR = "/home/user3/workspace/galaxcore/test2"
-
 
 def make_task_id():
     """Create a short unique task id."""
     return "task_" + uuid.uuid4().hex[:12]
 
 
-def make_default_repeat_group(suite, revision):
+def make_default_repeat_group(suite, revision, revision_policy):
     """Build a stable default repeat group name."""
+    if revision_policy == "latest":
+        return "%s_latest_loop" % suite
     return "%s_r%s_loop" % (suite, revision)
 
 
@@ -88,13 +101,14 @@ def ensure_columns(cur, table_name, column_defs):
 
 
 def ensure_task_runtime_columns(conn):
-    """Ensure old databases have command, target, and repeat-task columns."""
+    """Ensure old databases have command, target, repeat, and revision-policy columns."""
     cur = conn.cursor()
 
     ensure_columns(
         cur,
         "tasks",
         {
+            "revision_policy": "TEXT DEFAULT 'fixed'",
             "cmd": "TEXT",
             "target_arg": "TEXT",
             "target_type": "TEXT",
@@ -160,9 +174,10 @@ def ensure_repeat_group(cur, repeat_group, note=""):
             INSERT INTO repeat_groups (
                 repeat_group,
                 enabled,
+                created_at,
                 note
             )
-            VALUES (?, 1, ?)
+            VALUES (?, 1, datetime('now','localtime'), ?)
             """,
             (repeat_group, note),
         )
@@ -227,14 +242,30 @@ def pick_value(cli_value, template_value, default_value):
 
 
 def normalize_revision(value):
-    """Normalize revision to int."""
+    """Normalize revision to int or None."""
     if value is None:
+        return None
+
+    if isinstance(value, str) and value.strip().lower() in ("", "none", "null", "latest"):
         return None
 
     try:
         return int(value)
     except ValueError:
-        raise ValueError("revision must be an integer, got: %s" % value)
+        raise ValueError("revision must be an integer or latest/null, got: %s" % value)
+
+
+def normalize_revision_policy(value):
+    """Normalize revision policy."""
+    if value is None:
+        return "fixed"
+
+    value = str(value).strip().lower()
+
+    if value not in ("fixed", "latest"):
+        raise ValueError("revision_policy must be fixed or latest, got: %s" % value)
+
+    return value
 
 
 def normalize_target_arg(target):
@@ -337,6 +368,9 @@ def add_task(args):
         if args.revision is not None:
             variables["REVISION"] = str(args.revision)
 
+        if args.revision_policy is not None:
+            variables["REVISION_POLICY"] = args.revision_policy
+
         if args.suite is not None:
             variables["SUITE"] = args.suite
 
@@ -361,12 +395,24 @@ def add_task(args):
             "CMD",
             build_default_cmd(default_template_test_dir, default_template_target),
         )
+        variables.setdefault("REVISION_POLICY", "fixed")
 
         template_task = load_template(args.template, variables)
+
+    revision_policy = normalize_revision_policy(
+        pick_value(args.revision_policy, template_task.get("revision_policy"), "fixed")
+    )
 
     revision = normalize_revision(
         pick_value(args.revision, template_task.get("revision"), None)
     )
+
+    if revision_policy == "fixed" and revision is None:
+        raise ValueError(
+            "missing revision for fixed revision policy. Use --revision 14820, "
+            "or use --revision-policy latest."
+        )
+
     suite = pick_value(args.suite, template_task.get("suite"), None)
     target_worker = pick_value(args.target_worker, template_task.get("target_worker"), "any")
     priority = int(pick_value(args.priority, template_task.get("priority"), 100))
@@ -423,11 +469,6 @@ def add_task(args):
         if value is not None:
             flow_config[key] = value
 
-    if revision is None:
-        raise ValueError(
-            "missing revision. Use --revision 14820, or put revision in the template."
-        )
-
     if not suite:
         raise ValueError(
             "missing suite. Use --suite night_build, or put suite in the template."
@@ -446,7 +487,7 @@ def add_task(args):
         repeat_enabled = 1
 
     if repeat_enabled and not repeat_group:
-        repeat_group = make_default_repeat_group(suite, revision)
+        repeat_group = make_default_repeat_group(suite, revision, revision_policy)
 
     repeat_index = 1
     parent_task_id = None
@@ -456,17 +497,14 @@ def add_task(args):
     cur = conn.cursor()
 
     if repeat_enabled:
-        ensure_repeat_group(
-            cur,
-            repeat_group,
-            note="Created by taskctl.py",
-        )
+        ensure_repeat_group(cur, repeat_group, note="Created by taskctl.py")
 
     cur.execute(
         """
         INSERT INTO tasks (
             task_id,
             revision,
+            revision_policy,
             suite,
             flow_config_json,
             target_worker,
@@ -479,13 +517,15 @@ def add_task(args):
             repeat_enabled,
             repeat_group,
             repeat_index,
-            parent_task_id
+            parent_task_id,
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
         """,
         (
             task_id,
             revision,
+            revision_policy,
             suite,
             json.dumps(flow_config, ensure_ascii=False),
             target_worker,
@@ -502,10 +542,12 @@ def add_task(args):
     )
 
     message = (
-        "Task created. revision=%s, suite=%s, target_worker=%s, "
-        "target_type=%s, target_arg=%s, repeat_enabled=%s, repeat_group=%s"
+        "Task created. revision=%s, revision_policy=%s, suite=%s, "
+        "target_worker=%s, target_type=%s, target_arg=%s, "
+        "repeat_enabled=%s, repeat_group=%s"
         % (
-            revision,
+            revision if revision is not None else "latest",
+            revision_policy,
             suite,
             target_worker,
             target_type,
@@ -521,9 +563,10 @@ def add_task(args):
             task_id,
             worker_name,
             event,
-            message
+            message,
+            created_at
         )
-        VALUES (?, NULL, 'created', ?)
+        VALUES (?, NULL, 'created', ?, datetime('now','localtime'))
         """,
         (task_id, message),
     )
@@ -532,7 +575,8 @@ def add_task(args):
     conn.close()
 
     print("Task added: %s" % task_id)
-    print("revision: %s" % revision)
+    print("revision: %s" % (revision if revision is not None else "latest"))
+    print("revision_policy: %s" % revision_policy)
     print("suite: %s" % suite)
     print("target_worker: %s" % target_worker)
     print("priority: %s" % priority)
@@ -552,7 +596,7 @@ def list_tasks(args):
     cur = conn.cursor()
 
     select_sql = """
-        SELECT task_id, revision, suite, target_worker, assigned_worker,
+        SELECT task_id, revision, revision_policy, suite, target_worker, assigned_worker,
                status, priority, retry_count, max_retry, created_at,
                target_arg, target_type, cmd,
                repeat_enabled, repeat_group, repeat_index
@@ -585,10 +629,11 @@ def list_tasks(args):
         return
 
     print(
-        "%-20s %-8s %-16s %-10s %-10s %-10s %-8s %-11s %-30s %-20s %s"
+        "%-20s %-8s %-7s %-16s %-10s %-10s %-10s %-8s %-11s %-30s %-20s %s"
         % (
             "TASK_ID",
             "REV",
+            "POLICY",
             "SUITE",
             "T_WORKER",
             "WORKER",
@@ -600,10 +645,11 @@ def list_tasks(args):
             "CREATED_AT",
         )
     )
-    print("-" * 165)
+    print("-" * 175)
 
     for row in rows:
         retry = "%s/%s" % (row["retry_count"], row["max_retry"])
+        revision_text = str(row["revision"] if row["revision"] is not None else "latest")
         target_arg = str(row["target_arg"] or "-")
         repeat_text = "-"
 
@@ -617,10 +663,11 @@ def list_tasks(args):
             repeat_text = repeat_text[:16] + "..."
 
         print(
-            "%-20s %-8s %-16s %-10s %-10s %-10s %-8s %-11s %-30s %-20s %s"
+            "%-20s %-8s %-7s %-16s %-10s %-10s %-10s %-8s %-11s %-30s %-20s %s"
             % (
                 row["task_id"],
-                row["revision"],
+                revision_text,
+                row["revision_policy"] or "fixed",
                 row["suite"],
                 row["target_worker"],
                 row["assigned_worker"] or "-",
@@ -696,7 +743,7 @@ def cancel_task(args):
         """
         UPDATE tasks
         SET status = 'canceled',
-            finished_at = CURRENT_TIMESTAMP,
+            finished_at = datetime('now','localtime'),
             error_message = ?
         WHERE task_id = ?
           AND status IN ('pending', 'running')
@@ -713,9 +760,10 @@ def cancel_task(args):
                 task_id,
                 worker_name,
                 event,
-                message
+                message,
+                created_at
             )
-            VALUES (?, NULL, 'canceled', ?)
+            VALUES (?, NULL, 'canceled', ?, datetime('now','localtime'))
             """,
             (args.task_id, args.reason),
         )
@@ -796,13 +844,10 @@ def list_repeat_groups(args):
         print("No repeat groups found.")
         return
 
-    print("%-32s %-8s %-20s %-20s %s" % (
-        "REPEAT_GROUP",
-        "ENABLED",
-        "CREATED_AT",
-        "DISABLED_AT",
-        "NOTE",
-    ))
+    print(
+        "%-32s %-8s %-20s %-20s %s"
+        % ("REPEAT_GROUP", "ENABLED", "CREATED_AT", "DISABLED_AT", "NOTE")
+    )
     print("-" * 110)
 
     for row in rows:
@@ -843,7 +888,7 @@ def stop_repeat_group(args):
         """
         UPDATE repeat_groups
         SET enabled = 0,
-            disabled_at = CURRENT_TIMESTAMP,
+            disabled_at = datetime('now','localtime'),
             note = ?
         WHERE repeat_group = ?
         """,
@@ -867,7 +912,7 @@ def stop_repeat_group(args):
         """
         UPDATE tasks
         SET status = 'canceled',
-            finished_at = CURRENT_TIMESTAMP,
+            finished_at = datetime('now','localtime'),
             error_message = ?
         WHERE repeat_group = ?
           AND repeat_enabled = 1
@@ -885,9 +930,10 @@ def stop_repeat_group(args):
                 task_id,
                 worker_name,
                 event,
-                message
+                message,
+                created_at
             )
-            VALUES (?, NULL, 'canceled', ?)
+            VALUES (?, NULL, 'canceled', ?, datetime('now','localtime'))
             """,
             (
                 task["task_id"],
@@ -929,7 +975,8 @@ def build_parser():
     add.add_argument("--template", default="default", help="template name under templates/, default: default")
     add.add_argument("--no-template", action="store_true", help="do not load template, use CLI arguments only")
     add.add_argument("--set", action="append", default=[], help="template variable, for example: --set REVISION=14820")
-    add.add_argument("--revision", type=int, default=None)
+    add.add_argument("--revision", default=None, help="fixed revision number, or latest/null with --revision-policy latest")
+    add.add_argument("--revision-policy", choices=["fixed", "latest"], default=None, help="fixed or latest")
     add.add_argument("--suite", default=None)
     add.add_argument("--target-worker", default=None)
     add.add_argument("--priority", type=int, default=None)
@@ -938,7 +985,7 @@ def build_parser():
     add.add_argument("--target", default=None, help="run.sh target used only when --cmd/template cmd is not provided; 'any' becomes '.'")
     add.add_argument("--test-dir", default=None, help="test2 directory used to build default cmd")
     add.add_argument("--repeat", action="store_true", help="make this task a repeat task")
-    add.add_argument("--repeat-group", default=None, help="repeat group name")
+    add.add_argument("--repeat-group", "--repeat_group", dest="repeat_group", default=None, help="repeat group name")
 
     add.add_argument("--report-timing-summary", type=int, default=None)
     add.add_argument("--opt-design", type=int, default=None)

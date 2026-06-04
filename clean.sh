@@ -29,7 +29,6 @@ find "$SCRIPT_DIR" -type f \( \
 \) -delete
 
 rm -rf "$RUNTIME_DIR/logs" "$RUNTIME_DIR/status" "$RUNTIME_DIR/tmp" "$RUNTIME_DIR/reports/latest" "$RUNTIME_DIR/reports/archive"/* "$RUNTIME_DIR/cache"
-rm -rf 
 mkdir -p "$RUNTIME_DIR/logs" "$RUNTIME_DIR/status" "$RUNTIME_DIR/tmp" "$RUNTIME_DIR/reports/latest" "$RUNTIME_DIR/reports/archive" "$RUNTIME_DIR/cache"
 
 echo "Cleaned runtime and case artifacts under: $SCRIPT_DIR"

@@ -860,14 +860,6 @@ def append_flow_line(key: str, value: str) -> str:
     return "{} {}\n".format(key, value)
 
 
-def backup_flow_config() -> Optional[str]:
-    if not os.path.exists(FLOW_CONFIG_FILE):
-        return None
-
-    backup_path = "{}.bak.{}".format(FLOW_CONFIG_FILE, datetime.now().strftime("%Y%m%d_%H%M%S"))
-    shutil.copy2(FLOW_CONFIG_FILE, backup_path)
-    return backup_path
-
 
 def update_local_flow_config(flow_config_updates: Dict[str, Any]) -> int:
     """
@@ -885,10 +877,7 @@ def update_local_flow_config(flow_config_updates: Dict[str, Any]) -> int:
     if not os.path.exists(FLOW_CONFIG_FILE):
         return fail("update flow_config", "flow_config file not found: {}".format(FLOW_CONFIG_FILE))
 
-    backup_path = backup_flow_config()
-    if backup_path:
-        log("[INFO] flow_config backup created: {}".format(backup_path))
-
+    # Overwrite flow_config in place. Do not create per-task backup files.
     updates = {}
     for k, v in flow_config_updates.items():
         key = str(k).strip()

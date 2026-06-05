@@ -362,14 +362,33 @@ def print_cmd_target(cmd, target_arg, target_type):
 def add_task(args):
     template_task = {}
 
+    requested_revision = str(args.revision).strip() if args.revision is not None else None
+    requested_revision_policy = args.revision_policy
+
+    if requested_revision_policy is None:
+        if requested_revision is None:
+            requested_revision_policy = "latest"
+        elif requested_revision.strip().lower() in ("", "none", "null", "latest"):
+            requested_revision_policy = "latest"
+        else:
+            requested_revision_policy = "fixed"
+
+    requested_revision_policy = normalize_revision_policy(requested_revision_policy)
+
+    if requested_revision is None and requested_revision_policy == "latest":
+        requested_revision = "latest"
+
+    if requested_revision_policy == "latest" and requested_revision:
+        if requested_revision.strip().lower() in ("", "none", "null"):
+            requested_revision = "latest"
+
     if args.template and not args.no_template:
         variables = parse_set_args(args.set)
 
-        if args.revision is not None:
-            variables["REVISION"] = str(args.revision)
+        if requested_revision is not None:
+            variables["REVISION"] = str(requested_revision)
 
-        if args.revision_policy is not None:
-            variables["REVISION_POLICY"] = args.revision_policy
+        variables["REVISION_POLICY"] = requested_revision_policy
 
         if args.suite is not None:
             variables["SUITE"] = args.suite
@@ -395,16 +414,17 @@ def add_task(args):
             "CMD",
             build_default_cmd(default_template_test_dir, default_template_target),
         )
-        variables.setdefault("REVISION_POLICY", "fixed")
+        variables.setdefault("REVISION", "latest")
+        variables.setdefault("REVISION_POLICY", requested_revision_policy)
 
         template_task = load_template(args.template, variables)
 
     revision_policy = normalize_revision_policy(
-        pick_value(args.revision_policy, template_task.get("revision_policy"), "fixed")
+        pick_value(requested_revision_policy, template_task.get("revision_policy"), "latest")
     )
 
     revision = normalize_revision(
-        pick_value(args.revision, template_task.get("revision"), None)
+        pick_value(requested_revision, template_task.get("revision"), None)
     )
 
     if revision_policy == "fixed" and revision is None:

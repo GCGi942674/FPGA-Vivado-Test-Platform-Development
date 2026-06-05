@@ -11,8 +11,8 @@ Main responsibilities:
     1. Add one-shot test tasks.
     2. Add repeat test tasks.
     3. Add latest-revision repeat tasks.
-    4. List, show, cancel, and delete tasks.
-    5. List, stop, and start repeat groups.
+    4. List, show, cancel, and delete tasks or repeat groups.
+    5. List, stop, start, and delete repeat groups.
     6. Preserve every execution record by never reusing a finished task_id.
 
 Repeat task policy:
@@ -781,47 +781,63 @@ def cancel_task(args):
 
 
 def delete_task(args):
-    """Delete one task and its events from database."""
+    """Delete one or more tasks and their events from database."""
     conn = get_conn()
+    ensure_task_runtime_columns(conn)
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT task_id, status, assigned_worker
-        FROM tasks
-        WHERE task_id = ?
-        """,
-        (args.task_id,),
-    )
+    total_deleted_tasks = 0
+    total_deleted_events = 0
+    skipped_running = 0
+    not_found = 0
 
-    row = cur.fetchone()
+    for task_id in args.task_ids:
+        cur.execute(
+            """
+            SELECT task_id, status, assigned_worker
+            FROM tasks
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        )
 
-    if not row:
-        conn.close()
-        print("Task not found: %s" % args.task_id)
-        return
+        row = cur.fetchone()
 
-    if row["status"] == "running" and not args.force:
-        conn.close()
-        print("Task is running, not deleted: %s" % args.task_id)
-        print("assigned_worker: %s" % row["assigned_worker"])
-        print("Use --force if you really want to delete it.")
-        return
+        if not row:
+            print("Task not found: %s" % task_id)
+            not_found += 1
+            continue
 
-    cur.execute("DELETE FROM task_events WHERE task_id = ?", (args.task_id,))
-    deleted_events = cur.rowcount
+        if row["status"] == "running" and not args.force:
+            print("Task is running, not deleted: %s" % task_id)
+            print("assigned_worker: %s" % row["assigned_worker"])
+            print("Use --force if you really want to delete it.")
+            skipped_running += 1
+            continue
 
-    cur.execute("DELETE FROM tasks WHERE task_id = ?", (args.task_id,))
-    deleted_tasks = cur.rowcount
+        cur.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        deleted_events = cur.rowcount
+
+        cur.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+        deleted_tasks = cur.rowcount
+
+        total_deleted_events += deleted_events
+        total_deleted_tasks += deleted_tasks
+
+        if deleted_tasks:
+            print("Task deleted: %s" % task_id)
+            print("deleted task_events: %s" % deleted_events)
+        else:
+            print("Task not deleted: %s" % task_id)
 
     conn.commit()
     conn.close()
 
-    if deleted_tasks:
-        print("Task deleted: %s" % args.task_id)
-        print("deleted task_events: %s" % deleted_events)
-    else:
-        print("Task not deleted: %s" % args.task_id)
+    print("Summary:")
+    print("  deleted tasks: %s" % total_deleted_tasks)
+    print("  deleted task_events: %s" % total_deleted_events)
+    print("  skipped running tasks: %s" % skipped_running)
+    print("  not found: %s" % not_found)
 
 
 def list_repeat_groups(args):
@@ -861,6 +877,112 @@ def list_repeat_groups(args):
                 row["note"] or "-",
             )
         )
+
+
+def delete_repeat_group(args):
+    """Delete one or more repeat groups, their tasks, and their events."""
+    conn = get_conn()
+    ensure_task_runtime_columns(conn)
+    cur = conn.cursor()
+
+    total_deleted_groups = 0
+    total_deleted_tasks = 0
+    total_deleted_events = 0
+    skipped_running_groups = 0
+    not_found_groups = 0
+
+    for repeat_group in args.repeat_groups:
+        cur.execute(
+            """
+            SELECT repeat_group
+            FROM repeat_groups
+            WHERE repeat_group = ?
+            """,
+            (repeat_group,),
+        )
+        group_row = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT task_id, status, assigned_worker
+            FROM tasks
+            WHERE repeat_group = ?
+              AND repeat_enabled = 1
+            ORDER BY id ASC
+            """,
+            (repeat_group,),
+        )
+        task_rows = cur.fetchall()
+
+        if not group_row and not task_rows:
+            print("Repeat group not found: %s" % repeat_group)
+            not_found_groups += 1
+            continue
+
+        running_rows = [row for row in task_rows if row["status"] == "running"]
+        if running_rows and not args.force:
+            print("Repeat group has running task(s), not deleted: %s" % repeat_group)
+            for row in running_rows:
+                print(
+                    "  running task: %s assigned_worker=%s"
+                    % (row["task_id"], row["assigned_worker"] or "-")
+                )
+            print("Use --force if you really want to delete database records.")
+            print("Note: --force does not kill worker-side run.sh processes.")
+            skipped_running_groups += 1
+            continue
+
+        cur.execute(
+            """
+            DELETE FROM task_events
+            WHERE task_id IN (
+                SELECT task_id
+                FROM tasks
+                WHERE repeat_group = ?
+                  AND repeat_enabled = 1
+            )
+            """,
+            (repeat_group,),
+        )
+        deleted_events = cur.rowcount
+
+        cur.execute(
+            """
+            DELETE FROM tasks
+            WHERE repeat_group = ?
+              AND repeat_enabled = 1
+            """,
+            (repeat_group,),
+        )
+        deleted_tasks = cur.rowcount
+
+        cur.execute(
+            """
+            DELETE FROM repeat_groups
+            WHERE repeat_group = ?
+            """,
+            (repeat_group,),
+        )
+        deleted_groups = cur.rowcount
+
+        total_deleted_events += deleted_events
+        total_deleted_tasks += deleted_tasks
+        total_deleted_groups += deleted_groups
+
+        print("Repeat group deleted: %s" % repeat_group)
+        print("  deleted repeat_groups: %s" % deleted_groups)
+        print("  deleted tasks: %s" % deleted_tasks)
+        print("  deleted task_events: %s" % deleted_events)
+
+    conn.commit()
+    conn.close()
+
+    print("Summary:")
+    print("  deleted repeat_groups: %s" % total_deleted_groups)
+    print("  deleted tasks: %s" % total_deleted_tasks)
+    print("  deleted task_events: %s" % total_deleted_events)
+    print("  skipped running repeat groups: %s" % skipped_running_groups)
+    print("  not found repeat groups: %s" % not_found_groups)
 
 
 def stop_repeat_group(args):
@@ -949,6 +1071,116 @@ def stop_repeat_group(args):
     print("Running tasks will not be killed, but no next task will be generated.")
 
 
+def has_active_repeat_task(cur, repeat_group):
+    """Return True when a repeat group already has a pending or running task."""
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM tasks
+        WHERE repeat_group = ?
+          AND repeat_enabled = 1
+          AND status IN ('pending', 'running')
+        """,
+        (repeat_group,),
+    )
+
+    row = cur.fetchone()
+    return int(row["cnt"] or 0) > 0
+
+
+def get_last_repeat_task(cur, repeat_group):
+    """Get the newest historical task in one repeat group."""
+    cur.execute(
+        """
+        SELECT *
+        FROM tasks
+        WHERE repeat_group = ?
+          AND repeat_enabled = 1
+        ORDER BY repeat_index DESC, id DESC
+        LIMIT 1
+        """,
+        (repeat_group,),
+    )
+
+    return cur.fetchone()
+
+
+def create_repeat_task_from_last(cur, last_task):
+    """Create a new pending repeat task by copying the last historical task."""
+    revision_policy = last_task["revision_policy"] or "fixed"
+    new_revision = None if revision_policy == "latest" else last_task["revision"]
+    old_index = last_task["repeat_index"] or 1
+    new_index = int(old_index) + 1
+    new_task_id = make_task_id()
+
+    cur.execute(
+        """
+        INSERT INTO tasks (
+            task_id,
+            revision,
+            revision_policy,
+            suite,
+            flow_config_json,
+            target_worker,
+            assigned_worker,
+            status,
+            priority,
+            retry_count,
+            max_retry,
+            cmd,
+            target_arg,
+            target_type,
+            repeat_enabled,
+            repeat_group,
+            repeat_index,
+            parent_task_id,
+            created_at,
+            started_at,
+            finished_at,
+            result_path,
+            error_message
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, 0, ?, ?, ?, ?,
+                1, ?, ?, ?, datetime('now','localtime'), NULL, NULL, NULL, NULL)
+        """,
+        (
+            new_task_id,
+            new_revision,
+            revision_policy,
+            last_task["suite"],
+            last_task["flow_config_json"],
+            last_task["target_worker"],
+            last_task["priority"],
+            last_task["max_retry"],
+            last_task["cmd"],
+            last_task["target_arg"],
+            last_task["target_type"],
+            last_task["repeat_group"],
+            new_index,
+            last_task["task_id"],
+        ),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO task_events (
+            task_id,
+            worker_name,
+            event,
+            message,
+            created_at
+        )
+        VALUES (?, NULL, 'created', ?, datetime('now','localtime'))
+        """,
+        (
+            new_task_id,
+            "Repeat task recreated by start-repeat from %s" % last_task["task_id"],
+        ),
+    )
+
+    return new_task_id, new_index
+
+
 def start_repeat_group(args):
     conn = get_conn()
     ensure_task_runtime_columns(conn)
@@ -956,11 +1188,30 @@ def start_repeat_group(args):
 
     ensure_repeat_group(cur, args.repeat_group, note=args.note)
 
+    if has_active_repeat_task(cur, args.repeat_group):
+        conn.commit()
+        conn.close()
+        print("Repeat group enabled: %s" % args.repeat_group)
+        print("Active pending/running repeat task already exists. No new task created.")
+        return
+
+    last_task = get_last_repeat_task(cur, args.repeat_group)
+
+    if not last_task:
+        conn.commit()
+        conn.close()
+        print("Repeat group enabled: %s" % args.repeat_group)
+        print("No historical repeat task found. Use add --repeat to create the first task.")
+        return
+
+    new_task_id, new_index = create_repeat_task_from_last(cur, last_task)
+
     conn.commit()
     conn.close()
 
     print("Repeat group enabled: %s" % args.repeat_group)
-    print("No new task is created automatically by this command.")
+    print("New pending repeat task created: %s" % new_task_id)
+    print("repeat_index: %s" % new_index)
 
 
 def build_parser():
@@ -1018,9 +1269,9 @@ def build_parser():
     cancel.add_argument("--reason", default="manual canceled")
     cancel.set_defaults(func=cancel_task)
 
-    delete = sub.add_parser("delete", help="delete one task from database")
-    delete.add_argument("task_id")
-    delete.add_argument("--force", action="store_true", help="force delete even if the task is running")
+    delete = sub.add_parser("delete", help="delete one or more tasks from database")
+    delete.add_argument("task_ids", nargs="+")
+    delete.add_argument("--force", action="store_true", help="force delete even if a task is running")
     delete.set_defaults(func=delete_task)
 
     list_repeat = sub.add_parser("list-repeat", help="list repeat groups")
@@ -1030,6 +1281,11 @@ def build_parser():
     stop_repeat.add_argument("repeat_group")
     stop_repeat.add_argument("--reason", default="manual stop repeat group")
     stop_repeat.set_defaults(func=stop_repeat_group)
+
+    delete_repeat = sub.add_parser("delete-repeat", help="delete one or more repeat groups and their task records")
+    delete_repeat.add_argument("repeat_groups", nargs="+")
+    delete_repeat.add_argument("--force", action="store_true", help="force delete database records even if a repeat task is running")
+    delete_repeat.set_defaults(func=delete_repeat_group)
 
     start_repeat = sub.add_parser("start-repeat", help="enable one repeat group")
     start_repeat.add_argument("repeat_group")

@@ -837,7 +837,7 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "missing worker"}, status=400)
             return
 
-        if status not in ("success", "failed", "timeout"):
+        if status not in ("success", "failed", "timeout", "requeue", "pending"):
             self.send_json({"ok": False, "error": "invalid status"}, status=400)
             return
 
@@ -888,6 +888,57 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                         "task_id": task_id,
                         "status": row["status"],
                         "message": "task already finished or not running",
+                    }
+                )
+                return
+
+            if status in ("requeue", "pending"):
+                requeue_message = error_message or "worker requested requeue"
+
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'pending',
+                        assigned_worker = NULL,
+                        started_at = NULL,
+                        finished_at = NULL,
+                        result_path = NULL,
+                        error_message = ?
+                    WHERE task_id = ?
+                    """,
+                    (requeue_message, task_id),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO task_events (
+                        task_id,
+                        worker_name,
+                        event,
+                        message,
+                        created_at
+                    )
+                    VALUES (?, ?, 'requeued', ?, datetime('now','localtime'))
+                    """,
+                    (task_id, worker, requeue_message),
+                )
+
+                upsert_worker(
+                    cur,
+                    worker=worker,
+                    status="idle",
+                    current_task_id=None,
+                )
+
+                conn.commit()
+                conn.close()
+
+                self.send_json(
+                    {
+                        "ok": True,
+                        "task_id": task_id,
+                        "status": "pending",
+                        "message": "task requeued",
                     }
                 )
                 return

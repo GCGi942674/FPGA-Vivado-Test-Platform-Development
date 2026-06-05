@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# Prevent the same Linux user from running multiple run.sh jobs at the same time.
+# This does not block other users on the same machine.
+RUN_SH_LOCK_FILE="${RUN_SH_LOCK_FILE:-/tmp/galaxcore_run_${USER}.lock}"
+exec 200>"$RUN_SH_LOCK_FILE"
+
+if ! flock -n 200; then
+    echo "[ERROR] Current user already has a run.sh task running: $RUN_SH_LOCK_FILE"
+    exit 75
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTERNAL_ROOT="$SCRIPT_DIR/vivado_runner"
 DEFAULT_FLOW_CONFIG="$SCRIPT_DIR/flow_config"

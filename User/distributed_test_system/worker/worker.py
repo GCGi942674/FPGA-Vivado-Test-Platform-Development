@@ -27,6 +27,7 @@ Notes:
 """
 
 import fcntl
+import getpass
 import json
 import os
 import re
@@ -50,7 +51,7 @@ from typing import Callable, Dict, Optional, Tuple, Any
 PROJECT_NAME = "galaxcore"
 
 # Scheduler configuration
-SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "http://0.0.0.0:9000").rstrip("/")
+SCHEDULER_URL = os.environ.get("SCHEDULER_URL", "http://192.168.10.11:9000").rstrip("/")
 PULL_API = os.environ.get("PULL_API", "/api/task/pull")
 REPORT_API = os.environ.get("REPORT_API", "/api/task/report")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
@@ -67,7 +68,7 @@ TEST_DIR = os.environ.get("TEST_DIR", os.path.join(WORKSPACE_DIR, "test2"))
 FLOW_CONFIG_FILE = os.environ.get("FLOW_CONFIG_FILE", os.path.join(TEST_DIR, "flow_config"))
 
 # GalaxCore zip shared directory
-SHARE_ZIP_DIR = os.environ.get("SHARE_ZIP_DIR", "/home/xiaonan/Share/zw_cache/GalaxCore_bin/zip")
+SHARE_ZIP_DIR = os.environ.get("SHARE_ZIP_DIR", "/home/xiaonan/Share/zw_cache/distributed_test_system/GalaxCore_bin/zip")
 
 # Local GalaxCore binary location
 BIN_DIR = os.environ.get("BIN_DIR", os.path.join(WORKSPACE_DIR, "bin/Linux_64"))
@@ -93,7 +94,7 @@ RETRY_INTERVAL = int(os.environ.get("GALAXCORE_WORKER_RETRY_INTERVAL", "1800"))
 
 # Log location: /home/user3/distributed_test_system/logs/YYYY-MM-DD/
 LOG_ROOT = os.path.expanduser(
-    os.environ.get("LOG_ROOT", "/home/user3/distributed_test_system/logs")
+    os.environ.get("LOG_ROOT", "~/distributed_test_system/logs")
 )
 DATE_TAG = datetime.now().strftime("%Y-%m-%d")
 LOG_DIR = os.path.join(LOG_ROOT, DATE_TAG)
@@ -101,6 +102,23 @@ SUMMARY_FILE = os.path.join(LOG_ROOT, "worker_summary.tsv")
 
 # Worker lock to prevent multiple workers from replacing GalaxCore concurrently on the same host
 LOCK_FILE = os.environ.get("LOCK_FILE", "/tmp/galaxcore_worker.lock")
+
+# Current-user run.sh guard.
+# The worker only checks run.sh owned by the same Linux user, so it will not block
+# other users on the same machine.
+RUN_SH_BUSY_CHECK_ENABLED = os.environ.get("RUN_SH_BUSY_CHECK_ENABLED", "1") != "0"
+RUN_SH_BUSY_SLEEP = int(os.environ.get("RUN_SH_BUSY_SLEEP", "60"))
+RUN_SH_BUSY_LOG_INTERVAL = int(os.environ.get("RUN_SH_BUSY_LOG_INTERVAL", "60"))
+RUN_SH_PATTERN = re.compile(r"(^|[\s/])run\.sh(\s|$)")
+
+# Worker busy return code. The scheduler will requeue the task instead of marking it failed.
+WORKER_BUSY_RC = int(os.environ.get("WORKER_BUSY_RC", "75"))
+
+# GalaxCore binary guard. This prevents the worker from pulling a task while
+# the local GalaxCore binary is still used by an existing manual or worker run.
+GALAXCORE_BUSY_CHECK_ENABLED = os.environ.get("GALAXCORE_BUSY_CHECK_ENABLED", "1") != "0"
+GALAXCORE_BUSY_SLEEP = int(os.environ.get("GALAXCORE_BUSY_SLEEP", str(RUN_SH_BUSY_SLEEP)))
+GALAXCORE_BUSY_LOG_INTERVAL = int(os.environ.get("GALAXCORE_BUSY_LOG_INTERVAL", str(RUN_SH_BUSY_LOG_INTERVAL)))
 
 # Temporary directory for zip extraction
 TMP_DIR = os.environ.get("TMP_DIR", "/tmp/galaxcore_worker")
@@ -285,6 +303,11 @@ def run_step(step_name: str, func: Callable[[], int]) -> int:
     duration = int(time.time()) - step_start_epoch
     append_step_summary(step_name, step_start_ts, step_end_ts, duration, rc)
 
+    if rc == WORKER_BUSY_RC:
+        log("[STEP BUSY ] {} (cost {}s)".format(step_name, duration))
+        CURRENT_STEP = ""
+        return rc
+
     if rc != 0:
         log("[STEP FAIL ] {} (cost {}s)".format(step_name, duration))
         CURRENT_STEP = ""
@@ -431,6 +454,12 @@ def report_task(task: Dict[str, Any], status: str, exit_code: Optional[int] = No
             log("[WARN] report task failed: {}".format(resp))
     except Exception as exc:
         log("[WARN] report task exception: {}".format(exc))
+
+
+def requeue_task(task: Dict[str, Any], message: str) -> None:
+    """Return a pulled task to pending because this worker is locally busy."""
+    log("[INFO] Requeue task without failure: {}".format(message))
+    report_task(task, "requeue", exit_code=WORKER_BUSY_RC, message=message)
 
 
 # ============================================================
@@ -670,6 +699,54 @@ def write_galaxcore_build_info(task_id: str, build_revision: int, zip_path: str)
     return info_path
 
 
+def get_galaxcore_binary_busy_details() -> list:
+    """Return fuser details when the target GalaxCore binary is in use."""
+    if not GALAXCORE_BUSY_CHECK_ENABLED:
+        return []
+
+    if not os.path.exists(TARGET_BINARY):
+        return []
+
+    if not shutil.which("fuser"):
+        log("[WARN] fuser not found in PATH, skip pre-pull GalaxCore busy check")
+        return []
+
+    try:
+        p = subprocess.Popen(
+            ["fuser", TARGET_BINARY],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        stdout, stderr = p.communicate()
+    except Exception as exc:
+        log("[WARN] Failed to run fuser for GalaxCore busy check: {}".format(exc))
+        return []
+
+    stdout = stdout.strip()
+    stderr = stderr.strip()
+
+    if p.returncode == 0:
+        details = []
+        if stdout:
+            details.append("fuser stdout: {}".format(stdout))
+        if stderr:
+            details.append("fuser stderr: {}".format(stderr))
+        if not details:
+            details.append("fuser reports target GalaxCore binary is in use")
+        return details
+
+    if p.returncode == 1:
+        return []
+
+    if stdout:
+        log("[WARN] fuser stdout: {}".format(stdout))
+    if stderr:
+        log("[WARN] fuser stderr: {}".format(stderr))
+    log("[WARN] fuser returned unexpected rc={}, skip pre-pull busy decision".format(p.returncode))
+    return []
+
+
 def check_galaxcore_binary_not_in_use() -> int:
     if not os.path.exists(TARGET_BINARY):
         log("[WARN] target binary does not exist yet: {}".format(TARGET_BINARY))
@@ -679,35 +756,16 @@ def check_galaxcore_binary_not_in_use() -> int:
         return fail("check binary in use", "fuser not found in PATH")
 
     log("[INFO] Checking whether target GalaxCore binary is in use: {}".format(TARGET_BINARY))
-    p = subprocess.Popen(
-        ["fuser", TARGET_BINARY],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    stdout, stderr = p.communicate()
-    stdout = stdout.strip()
-    stderr = stderr.strip()
+    busy_details = get_galaxcore_binary_busy_details()
 
-    if p.returncode == 0:
-        if stdout:
-            log("fuser stdout: {}".format(stdout))
-        if stderr:
-            log("fuser stderr: {}".format(stderr))
-        return fail("check binary in use", "target GalaxCore binary is in use: {}".format(TARGET_BINARY))
+    if busy_details:
+        for detail in busy_details:
+            log(detail)
+        log("[INFO] Target GalaxCore binary is in use. Treat worker as busy and requeue task.")
+        return WORKER_BUSY_RC
 
-    if p.returncode == 1:
-        if stderr:
-            log("[WARN] fuser warning ignored: {}".format(stderr))
-        log("[INFO] Target GalaxCore binary is not in use")
-        return 0
-
-    if stdout:
-        log("fuser stdout: {}".format(stdout))
-    if stderr:
-        log("fuser stderr: {}".format(stderr))
-    return fail("check binary in use", "fuser returned unexpected rc={}".format(p.returncode))
-
+    log("[INFO] Target GalaxCore binary is not in use")
+    return 0
 
 def extract_zip(zip_path: str) -> int:
     if os.path.exists(TMP_DIR):
@@ -867,6 +925,144 @@ def update_local_flow_config(flow_config_updates: Dict[str, Any]) -> int:
         f.writelines(new_lines)
 
     log("[INFO] flow_config updated: {}".format(FLOW_CONFIG_FILE))
+    return 0
+
+
+
+# ============================================================
+# Current-user run.sh guard
+# ============================================================
+
+def get_current_user_run_sh_processes() -> list:
+    """Return run.sh processes owned by the current Linux user."""
+    if not RUN_SH_BUSY_CHECK_ENABLED:
+        return []
+
+    current_pid = os.getpid()
+    current_user = getpass.getuser()
+    matched_processes = []
+
+    try:
+        result = subprocess.run(
+            ["ps", "-elf"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=False,
+        )
+    except Exception as exc:
+        log("[WARN] Failed to check current-user run.sh processes: {}".format(exc))
+        return []
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        columns = line.split(None, 14)
+        if len(columns) < 15:
+            continue
+
+        process_user = columns[2]
+        pid_text = columns[3]
+        cmdline = columns[14]
+
+        if process_user != current_user:
+            continue
+
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+
+        if pid == current_pid:
+            continue
+
+        if "worker.py" in cmdline or "worker_run_test.py" in cmdline:
+            continue
+
+        if RUN_SH_PATTERN.search(cmdline):
+            matched_processes.append((pid, cmdline))
+
+    return matched_processes
+
+
+def log_run_sh_busy(processes: list, reason: str) -> None:
+    """Log current-user run.sh processes that block worker polling or execution."""
+    log("[INFO] {}".format(reason))
+    for pid, cmdline in processes:
+        log("[INFO] Existing run.sh: pid={}, cmd={}".format(pid, cmdline))
+
+
+def wait_until_current_user_run_sh_free(reason: str) -> None:
+    """Wait until the current user no longer has a run.sh process."""
+    last_log_time = 0
+
+    while True:
+        processes = get_current_user_run_sh_processes()
+        if not processes:
+            return
+
+        now = time.time()
+        if now - last_log_time >= RUN_SH_BUSY_LOG_INTERVAL:
+            log_run_sh_busy(processes, reason)
+            log("[INFO] Worker will wait {}s before checking run.sh again".format(RUN_SH_BUSY_SLEEP))
+            last_log_time = now
+
+        time.sleep(RUN_SH_BUSY_SLEEP)
+
+
+def clean_test_dir_before_cmd() -> int:
+    """Run test2/clean.sh before executing the task command."""
+    clean_script = os.path.join(TEST_DIR, "clean.sh")
+
+    if not os.path.isfile(clean_script):
+        log("[WARN] clean.sh not found, skip pre-command cleanup: {}".format(clean_script))
+        return 0
+
+    log("[INFO] Run pre-command cleanup: {}".format(clean_script))
+    script = """
+set -e
+cd {test_dir}
+if [ -x ./clean.sh ]; then
+    ./clean.sh
+else
+    /bin/bash ./clean.sh
+fi
+""".format(test_dir=shell_quote(TEST_DIR))
+    return run_bash(script)
+
+
+def get_worker_busy_state() -> Dict[str, Any]:
+    """Collect local busy state before pulling or executing a task."""
+    return {
+        "run_sh_processes": get_current_user_run_sh_processes(),
+        "galaxcore_busy_details": get_galaxcore_binary_busy_details(),
+    }
+
+
+def is_worker_busy_state(state: Dict[str, Any]) -> bool:
+    """Return True if this worker should not pull or run a task now."""
+    return bool(state.get("run_sh_processes") or state.get("galaxcore_busy_details"))
+
+
+def log_worker_busy_state(state: Dict[str, Any], reason: str) -> None:
+    """Log why this worker is busy."""
+    log("[INFO] {}".format(reason))
+
+    for pid, cmdline in state.get("run_sh_processes", []):
+        log("[INFO] Existing run.sh: pid={}, cmd={}".format(pid, cmdline))
+
+    for detail in state.get("galaxcore_busy_details", []):
+        log("[INFO] Existing GalaxCore use: {}".format(detail))
+
+
+def check_worker_not_busy_for_task() -> int:
+    """Return WORKER_BUSY_RC if run.sh or GalaxCore becomes busy during a task."""
+    state = get_worker_busy_state()
+    if is_worker_busy_state(state):
+        log_worker_busy_state(state, "Worker became busy before running task command. Requeue task.")
+        return WORKER_BUSY_RC
     return 0
 
 
@@ -1095,6 +1291,14 @@ def run_attempt(task: Dict[str, Any]) -> int:
     if rc != 0:
         return rc
 
+    rc = run_step("pre-command clean.sh", clean_test_dir_before_cmd)
+    if rc != 0:
+        return rc
+
+    rc = run_step("pre-command worker busy check", check_worker_not_busy_for_task)
+    if rc != 0:
+        return rc
+
     rc = run_step(
         "run task command",
         lambda: run_task_command(
@@ -1131,6 +1335,12 @@ def execute_task(task: Dict[str, Any]) -> int:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         CURRENT_ATTEMPT = attempt
         final_rc = run_attempt(task)
+
+        if final_rc == WORKER_BUSY_RC:
+            message = "worker local busy detected during task execution; requeue without failure"
+            append_daily_summary(task_id, task_revision or "latest", "BUSY_REQUEUED")
+            requeue_task(task, message)
+            return 0
 
         if final_rc == 0:
             append_daily_summary(task_id, task_revision or "latest", "SUCCESS")
@@ -1181,9 +1391,22 @@ def main() -> int:
 
         last_idle_log_time = 0
         last_scheduler_error_log_time = 0
+        last_worker_busy_log_time = 0
 
         while True:
             try:
+                busy_state = get_worker_busy_state()
+                if is_worker_busy_state(busy_state):
+                    now = time.time()
+                    if now - last_worker_busy_log_time >= max(RUN_SH_BUSY_LOG_INTERVAL, GALAXCORE_BUSY_LOG_INTERVAL):
+                        log_worker_busy_state(
+                            busy_state,
+                            "Worker is busy. It will not pull a task."
+                        )
+                        last_worker_busy_log_time = now
+                    time.sleep(max(RUN_SH_BUSY_SLEEP, GALAXCORE_BUSY_SLEEP))
+                    continue
+
                 task = pull_task()
 
                 if not task:
@@ -1192,6 +1415,16 @@ def main() -> int:
                         log("Idle | no task")
                         last_idle_log_time = now
                     time.sleep(POLL_INTERVAL)
+                    continue
+
+                busy_state = get_worker_busy_state()
+                if is_worker_busy_state(busy_state):
+                    log_worker_busy_state(
+                        busy_state,
+                        "Worker became busy immediately after pulling task. Requeue without failure."
+                    )
+                    requeue_task(task, "worker became busy immediately after pulling task")
+                    time.sleep(max(RUN_SH_BUSY_SLEEP, GALAXCORE_BUSY_SLEEP))
                     continue
 
                 execute_task(task)

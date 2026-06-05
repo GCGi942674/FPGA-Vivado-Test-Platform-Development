@@ -2,6 +2,26 @@
 
 PID_MAP_FILE="$TMP_DIR/pid_map.txt"
 INTERRUPTED=0
+DISPATCHED_CASE_COUNT=0
+TOTAL_CASE_COUNT=0
+
+
+count_finished_cases() {
+    [ -f "$TMP_DIR/case_results.raw" ] || {
+        echo 0
+        return 0
+    }
+
+    awk -F'|' 'NF >= 2 && $1 != "" { count++ } END { print count + 0 }' "$TMP_DIR/case_results.raw"
+}
+
+log_dispatch_progress() {
+    local current_index="$1"
+    local total_cases="$2"
+    local current_case="$3"
+
+    log_info "Progress: [${current_index}/${total_cases}] current=$current_case"
+}
 
 is_pid_running() {
     local pid="$1"
@@ -219,6 +239,9 @@ dispatch_cases() {
     : > "$PID_MAP_FILE"
     : > "$TMP_DIR/case_results.raw"
 
+    TOTAL_CASE_COUNT=$(count_cases)
+    DISPATCHED_CASE_COUNT=0
+
     while IFS= read -r case_run_tcl || [ -n "$case_run_tcl" ]; do
         reap_finished_jobs
         kill_timeout_jobs
@@ -252,6 +275,9 @@ dispatch_cases() {
             kill_timeout_jobs
             reap_finished_jobs
         done
+
+        DISPATCHED_CASE_COUNT=$((DISPATCHED_CASE_COUNT + 1))
+        log_dispatch_progress "$DISPATCHED_CASE_COUNT" "$TOTAL_CASE_COUNT" "$case_run_tcl"
 
         log_info "Dispatching: $case_run_tcl"
         launch_case_job "$case_run_tcl"

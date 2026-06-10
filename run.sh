@@ -1,13 +1,25 @@
 #!/bin/bash
 set -euo pipefail
 
-# Prevent the same Linux user from running multiple run.sh jobs at the same time.
-# This does not block other users on the same machine.
-RUN_SH_LOCK_FILE="${RUN_SH_LOCK_FILE:-/tmp/galaxcore_run_${USER}.lock}"
+# Prevent duplicated run.sh jobs in the same execution slot.
+#
+# Manual run:
+#   no PJTest/DTS slot variables exist, so the lock still falls back to USER.
+#
+# Distributed run:
+#   worker slots use different DTS_WORKER / DTS_SLOT_WORKER values, so each
+#   slot gets its own lock file and can run independently.
+LOCK_DIR="${RUN_SH_LOCK_DIR:-${HOME}/PJTest/tmp}"
+mkdir -p "$LOCK_DIR"
+
+LOCK_TAG="${DTS_SLOT_WORKER:-${PJTEST_SLOT_WORKER:-${DTS_WORKER:-${GALAXCORE_WORKER_NAME:-${USER}}}}}"
+LOCK_TAG="$(echo "$LOCK_TAG" | sed 's#[^A-Za-z0-9_.-]#_#g')"
+
+RUN_SH_LOCK_FILE="${RUN_SH_LOCK_FILE:-${LOCK_DIR}/galaxcore_run_${LOCK_TAG}.lock}"
 exec 200>"$RUN_SH_LOCK_FILE"
 
 if ! flock -n 200; then
-    echo "[ERROR] Current user already has a run.sh task running: $RUN_SH_LOCK_FILE"
+    echo "[ERROR] Current slot already has a run.sh task running: $RUN_SH_LOCK_FILE"
     exit 75
 fi
 

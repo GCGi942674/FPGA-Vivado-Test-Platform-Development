@@ -85,6 +85,21 @@ IDLE_SLEEP = int(os.environ.get("GALAXCORE_IDLE_SLEEP", "1"))
 QUIET_CMD_OUTPUT = os.environ.get("GALAXCORE_QUIET", "1") != "0"
 VERBOSE_OUTPUT = os.environ.get("GALAXCORE_VERBOSE", "0") == "1"
 
+SUBMIT_TEST_DIR = Path(os.environ.get(
+    "GALAXCORE_SUBMIT_TEST_DIR",
+    str(WORK_DIR / "test2"),
+)).expanduser()
+
+SUBMIT_TEST_SCRIPT = os.environ.get(
+    "GALAXCORE_SUBMIT_TEST_SCRIPT",
+    "./submit_test.sh",
+)
+
+SUBMIT_SUCCESS_MARKER = os.environ.get(
+    "GALAXCORE_SUBMIT_SUCCESS_MARKER",
+    "No Case Fail, You can submit your code now~",
+)
+
 running = True
 
 
@@ -171,6 +186,29 @@ def run_cmd(
 def run_in_workdir(cmd, shell=False):
     ok, _ = run_cmd(cmd, cwd=WORK_DIR, shell=shell)
     return ok
+
+
+def strip_ansi(text):
+    """Remove terminal color/control sequences from command output."""
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text or "")
+
+
+def run_cmd_capture(cmd, cwd=None, shell=False):
+    """Run command and return (ok, return_code, output)."""
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            shell=shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            check=False,
+        )
+        output = strip_ansi(p.stdout or "")
+        return p.returncode == 0, p.returncode, output
+    except Exception as e:
+        return False, -1, str(e)
 
 
 def read_cmd_output(cmd):
@@ -274,6 +312,49 @@ def make_clean():
     run_in_workdir(["make", "clean"])
 
 
+def run_submit_test():
+    """Run test2/submit_test.sh and verify its success marker."""
+    if not SUBMIT_TEST_DIR.exists():
+        return False, "submit_test_dir_missing", f"missing: {SUBMIT_TEST_DIR}"
+
+    ok, return_code, output = run_cmd_capture(
+        ["csh", "-c", f"{SUBMIT_TEST_SCRIPT}; exit $status"],
+        cwd=SUBMIT_TEST_DIR,
+    )
+
+    if SUBMIT_SUCCESS_MARKER in output:
+        return True, "submit_success", output
+
+    if ok:
+        reason = "submit_output_check_failed"
+    else:
+        reason = f"submit_exit_{return_code}"
+
+    return False, reason, output
+
+
+def summarize_submit_output(output):
+    """Keep the most useful submit_test.sh failure lines for mk_fail."""
+    lines = []
+    for raw_line in strip_ansi(output).splitlines():
+        line = raw_line.strip()
+        if line:
+            lines.append(line)
+
+    if not lines:
+        return "no submit output"
+
+    interesting = []
+    patterns = ["fail", "error", "elapsed time", "case"]
+    for line in lines:
+        lower = line.lower()
+        if any(pattern in lower for pattern in patterns):
+            interesting.append(line)
+
+    selected = interesting[-3:] if interesting else lines[-3:]
+    return " | ".join(selected)[:240]
+
+
 # ================= ZIP =================
 
 def zip_name_for_rev(rev):
@@ -336,13 +417,14 @@ def clean_old_zips():
 # ================= MK_FAIL STATE FILE =================
 
 # mk_fail display format, newest records at the top:
-# Success  r14773  author_name     [2026-06-01 16:00:57]
-# FAIL     r14775  author_name     [2026-06-01 17:20:57]
-# FAIL     r14774  author_name     [2026-06-01 16:20:57]
+# Success  r14773  author_name     ok                    [2026-06-01 16:00:57]
+# FAIL     r14775  author_name     mk_failed             [2026-06-01 17:20:57]
+# FAIL     r14774  author_name     submit_failed: ...    [2026-06-01 16:20:57]
 
 STATUS_WIDTH = 7
 REV_WIDTH = 8
 AUTHOR_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_AUTHOR_WIDTH", "16"))
+REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "28"))
 
 
 def make_record(
@@ -362,12 +444,11 @@ def make_record(
     Notes:
     - `zip_name` is kept in the function argument for compatibility with the
       previous workflow, but it is not printed in mk_fail now.
-    - `reason` is also kept for compatibility, but mk_fail stays concise.
     """
     del zip_name
-    del reason
 
     safe_author = str(author).strip() or "unknown"
+    safe_reason = str(reason).strip() or "ok"
 
     # User-facing status text: Success on success, FAIL on failure.
     if status.upper() == "SUCCESS":
@@ -377,14 +458,16 @@ def make_record(
 
     rev_text = "r{}".format(rev)
 
-    return "{:<{sw}}  {:<{rw}}  {:<{aw}}  [{}]".format(
+    return "{:<{sw}}  {:<{rw}}  {:<{aw}}  {:<{mw}}  [{}]".format(
         status_text,
         rev_text,
         safe_author,
+        safe_reason,
         now(),
         sw=STATUS_WIDTH,
         rw=REV_WIDTH,
         aw=AUTHOR_WIDTH,
+        mw=REASON_WIDTH,
     ).rstrip()
 
 
@@ -431,7 +514,7 @@ def update_mk_fail_success(rev, author, zip_name):
         if line_status(line) == "FAIL" and line_revision(line) != rev:
             fail_lines.append(line)
 
-    success_line = make_record("SUCCESS", rev, author, zip_name)
+    success_line = make_record("SUCCESS", rev, author, zip_name, "ok")
     write_lines(MK_FAIL_FILE, [success_line] + fail_lines)
 
 
@@ -494,39 +577,39 @@ def build_revision(rev):
         record_failure(rev, author, "svn_update_failed")
         return False
 
-    # 2. first build attempt
-    if build():
-        if not compress_to_zip(rev):
-            ci_log(f"FAIL r{rev}")
-            ci_debug(f"compress failed for r{rev}")
-            record_failure(rev, author, "compress_failed")
-            return False
+    # 2. first build attempt. If mk fails, retry once after make clean.
+    mk_ok = build()
+    if not mk_ok:
+        ci_debug(f"r{rev} first mk failed, retry after make clean")
+        make_clean()
+        mk_ok = build()
 
-        clean_old_zips()
-        record_success(rev, author)
-        ci_log(f"Success r{rev}")
-        return True
+    if not mk_ok:
+        ci_log(f"FAIL r{rev} mk_failed")
+        record_failure(rev, author, "mk_failed_after_retry")
+        return False
 
-    # 3. retry after make clean
-    ci_debug(f"r{rev} first build failed, retry after make clean")
-    make_clean()
+    # 3. submit gate. Only generate zip when submit_test.sh really passes.
+    ci_log(f"submit_test r{rev}")
+    submit_ok, submit_reason, submit_output = run_submit_test()
+    if not submit_ok:
+        detail = summarize_submit_output(submit_output)
+        ci_log(f"FAIL r{rev} submit_failed")
+        ci_debug(f"submit failed for r{rev}: {submit_reason}: {detail}")
+        record_failure(rev, author, f"submit_failed:{submit_reason}:{detail}")
+        return False
 
-    if build():
-        if not compress_to_zip(rev):
-            ci_log(f"FAIL r{rev}")
-            ci_debug(f"compress failed for r{rev}")
-            record_failure(rev, author, "compress_failed_after_retry")
-            return False
+    # 4. zip only after mk + submit both succeed.
+    if not compress_to_zip(rev):
+        ci_log(f"FAIL r{rev} compress_failed")
+        ci_debug(f"compress failed for r{rev}")
+        record_failure(rev, author, "compress_failed")
+        return False
 
-        clean_old_zips()
-        record_success(rev, author)
-        ci_log(f"Success r{rev}")
-        return True
-
-    # 4. failed after retry
-    ci_log(f"FAIL r{rev}")
-    record_failure(rev, author, "build_failed_after_retry")
-    return False
+    clean_old_zips()
+    record_success(rev, author)
+    ci_log(f"Success r{rev}")
+    return True
 
 
 # ================= MAIN LOOP =================
@@ -537,6 +620,8 @@ def print_startup():
     ci_debug(f"BIN_SRC={BIN_SRC}")
     ci_debug(f"BIN_DST={BIN_DST}")
     ci_debug(f"ZIP_DIR={ZIP_DIR}")
+    ci_debug(f"SUBMIT_TEST_DIR={SUBMIT_TEST_DIR}")
+    ci_debug(f"SUBMIT_TEST_SCRIPT={SUBMIT_TEST_SCRIPT}")
     ci_debug(f"MK_FAIL_FILE={MK_FAIL_FILE}")
     ci_debug(f"LAST_VERSION_FILE={LAST_VERSION_FILE}")
     ci_debug(f"Starting version: r{load_last_version()}")

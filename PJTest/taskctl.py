@@ -82,16 +82,17 @@ DEFAULT_FLOW_CONFIG = {
 
 
 TERMINAL_EXAMPLE_STATUSES = set(["success", "failed", "timeout", "canceled"])
+TERMINAL_TASK_STATUSES = set(["success", "failed", "canceled"])
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("PJTEST_SQLITE_BUSY_TIMEOUT_MS", "60000"))
 
 
 def get_conn():
     """Create a SQLite connection with runtime pragmas."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn = sqlite3.connect(str(DB_PATH), timeout=60)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=%d" % SQLITE_BUSY_TIMEOUT_MS)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -555,69 +556,6 @@ def format_short(text, width):
     return str(text)
 
 
-
-
-def table_text(value):
-    """Return safe one-line text for table display."""
-    if value is None:
-        return "-"
-
-    text = str(value)
-    text = text.replace("\t", " ")
-    text = text.replace("\r", " ")
-    text = text.replace("\n", " ")
-    return text
-
-
-def table_cell(value, width, align="left"):
-    """Format one fixed-width table cell."""
-    text = table_text(value)
-
-    if align == "right":
-        return text.rjust(width)
-
-    return text.ljust(width)
-
-
-def print_example_table_header():
-    """Print the common example table header."""
-    columns = [
-        ("EXAMPLE_ID", 18, "left"),
-        ("IDX",         5, "right"),
-        ("STATUS",     10, "left"),
-        ("WORKER",     18, "left"),
-        ("RETRY",       7, "left"),
-        ("RET",         6, "right"),
-        ("TARGET",     70, "left"),
-    ]
-
-    header = "  ".join(
-        table_cell(title, width, align)
-        for title, width, align in columns
-    )
-
-    print(header)
-    print("-" * len(header))
-
-
-def print_example_table_row(row):
-    """Print one task example row."""
-    worker = row["assigned_worker"] or "-"
-    retry = "%d/%d" % (row["retry_count"], row["max_retry"])
-    exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
-
-    print(
-        "  ".join([
-            table_cell(row["example_id"], 18, "left"),
-            table_cell(row["seq"],         5, "right"),
-            table_cell(row["status"],     10, "left"),
-            table_cell(worker,             18, "left"),
-            table_cell(retry,               7, "left"),
-            table_cell(exit_code,           6, "right"),
-            table_cell(row["target_arg"], 70, "left"),
-        ])
-    )
-
 def format_revision(row):
     """Format revision policy and resolved revision for display."""
     policy = row["revision_policy"] or "fixed"
@@ -636,6 +574,17 @@ def cmd_list(args):
     conn = get_conn()
     cur = conn.cursor()
 
+    active_predicate = """
+        EXISTS (
+            SELECT 1
+            FROM workers w
+            WHERE w.status IN ('running', 'reporting')
+              AND w.current_task_id = e.task_id
+              AND w.current_example_id = e.example_id
+              AND w.current_attempt_id = e.current_attempt_id
+        )
+    """
+
     query = """
         SELECT
             t.id,
@@ -652,14 +601,16 @@ def cmd_list(args):
             t.total_examples,
             COUNT(e.example_id) AS real_total,
             SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
-            SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
+            SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS db_running_count,
+            SUM(CASE WHEN e.status = 'running' AND %s THEN 1 ELSE 0 END) AS active_running_count,
+            SUM(CASE WHEN e.status = 'running' AND NOT (%s) THEN 1 ELSE 0 END) AS stale_running_count,
             SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
             SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
             SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
         FROM tasks t
         LEFT JOIN task_examples e
             ON t.task_id = e.task_id
-    """
+    """ % (active_predicate, active_predicate)
 
     conditions = []
     params = []
@@ -687,7 +638,7 @@ def cmd_list(args):
         return
 
     header = (
-        "%-18s %-10s %-12s %-12s %-22s %5s %5s %7s %6s %7s %7s %-13s %-8s %s"
+        "%-18s %-10s %-12s %-12s %-22s %5s %5s %7s %6s %7s %5s %7s %-13s %-8s %s"
         % (
             "TASK_ID",
             "TEMPLATE",
@@ -699,6 +650,7 @@ def cmd_list(args):
             "SUCCESS",
             "FAILED",
             "RUNNING",
+            "STALE",
             "PENDING",
             "PROGRESS",
             "PRI",
@@ -713,7 +665,8 @@ def cmd_list(args):
         done = row["done_count"] or 0
         success = row["success_count"] or 0
         failed = row["failed_count"] or 0
-        running = row["running_count"] or 0
+        running = row["active_running_count"] or 0
+        stale = row["stale_running_count"] or 0
         pending = row["pending_count"] or 0
 
         if total > 0:
@@ -722,7 +675,7 @@ def cmd_list(args):
             progress = "-"
 
         print(
-            "%-18s %-10s %-12s %-12s %-22s %5d %5d %7d %6d %7d %7d %-13s %-8s %s"
+            "%-18s %-10s %-12s %-12s %-22s %5d %5d %7d %6d %7d %5d %7d %-13s %-8s %s"
             % (
                 format_short(row["task_id"], 18),
                 format_short(row["template_name"], 10),
@@ -734,13 +687,13 @@ def cmd_list(args):
                 success,
                 failed,
                 running,
+                stale,
                 pending,
                 progress,
                 row["priority"],
                 row["created_at"],
             )
         )
-
 
 def cmd_examples(args):
     """List examples for a parent task."""
@@ -797,10 +750,35 @@ def cmd_examples(args):
         print("No examples found.")
         return
 
-    print_example_table_header()
+    header = "%-18s %4s %-10s %-10s %-7s %-6s %-45s" % (
+        "EXAMPLE_ID",
+        "SEQ",
+        "STATUS",
+        "WORKER",
+        "RETRY",
+        "EXIT",
+        "TARGET_ARG",
+    )
+    print(header)
+    print("-" * len(header))
 
     for row in rows:
-        print_example_table_row(row)
+        worker = row["assigned_worker"] or "-"
+        retry = "%d/%d" % (row["retry_count"], row["max_retry"])
+        exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
+
+        print(
+            "%-18s %4d %-10s %-10s %-7s %-6s %-45s"
+            % (
+                format_short(row["example_id"], 18),
+                row["seq"],
+                format_short(row["status"], 10),
+                format_short(worker, 10),
+                retry,
+                exit_code,
+                format_short(row["target_arg"], 45),
+            )
+        )
 
         if args.verbose:
             print("    run_tcl_path       : %s" % row["run_tcl_path"])
@@ -1132,10 +1110,35 @@ def print_examples_rows(rows, verbose=False, names_only=False):
         print("No examples found.")
         return
 
-    print_example_table_header()
+    header = "%-18s %4s %-10s %-10s %-7s %-6s %-45s" % (
+        "EXAMPLE_ID",
+        "SEQ",
+        "STATUS",
+        "WORKER",
+        "RETRY",
+        "EXIT",
+        "TARGET_ARG",
+    )
+    print(header)
+    print("-" * len(header))
 
     for row in rows:
-        print_example_table_row(row)
+        worker = row["assigned_worker"] or "-"
+        retry = "%d/%d" % (row["retry_count"], row["max_retry"])
+        exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
+
+        print(
+            "%-18s %4d %-10s %-10s %-7s %-6s %-45s"
+            % (
+                format_short(row["example_id"], 18),
+                row["seq"],
+                format_short(row["status"], 10),
+                format_short(worker, 10),
+                retry,
+                exit_code,
+                format_short(row["target_arg"], 45),
+            )
+        )
 
         if verbose:
             print("    run_tcl_path       : %s" % row["run_tcl_path"])
@@ -1349,6 +1352,7 @@ def write_task_report(task_id, out_dir=None):
 
     files = {
         "stat_summary": build_stat_summary(task, counts, workers),
+        "status_summary": build_status_summary(rows),
         "list_pass_to_run": build_list_file(rows, "success"),
         "list_fail_to_run": build_list_file(rows, "failed"),
         "timeout_list": build_list_file(rows, "timeout"),
@@ -1685,8 +1689,319 @@ def get_task_cancel_counts(cur, task_id):
     return result
 
 
+def fetch_stale_examples(cur, task_id=None):
+    """Return running examples that are not matched by the current worker table."""
+    sql = """
+        SELECT
+            e.example_id,
+            e.task_id,
+            e.seq,
+            e.target_arg,
+            e.status,
+            e.assigned_worker,
+            e.current_attempt_id,
+            e.retry_count,
+            e.max_retry,
+            e.started_at,
+            e.updated_at,
+            e.message,
+            w.status AS worker_status,
+            w.current_task_id AS worker_task_id,
+            w.current_example_id AS worker_example_id,
+            w.current_attempt_id AS worker_attempt_id,
+            w.last_seen_at AS worker_last_seen_at,
+            w.message AS worker_message
+        FROM task_examples e
+        LEFT JOIN workers w
+            ON w.worker_name = e.assigned_worker
+        WHERE e.status = 'running'
+          AND NOT (
+              w.status IN ('running', 'reporting')
+              AND w.current_task_id = e.task_id
+              AND w.current_example_id = e.example_id
+              AND w.current_attempt_id = e.current_attempt_id
+          )
+    """
+    params = []
+    if task_id:
+        sql += " AND e.task_id = ?"
+        params.append(task_id)
+    sql += " ORDER BY e.task_id, e.seq"
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def print_stale_rows(rows, verbose=False):
+    """Print stale running rows."""
+    if not rows:
+        print("No stale running examples found.")
+        return
+
+    header = "%-18s %5s %-18s %-18s %-10s %-19s %s" % (
+        "EXAMPLE_ID",
+        "SEQ",
+        "TASK_ID",
+        "WORKER",
+        "W_STATUS",
+        "W_LAST_SEEN",
+        "TARGET",
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in rows:
+        print("%-18s %5s %-18s %-18s %-10s %-19s %s" % (
+            row["example_id"],
+            row["seq"],
+            row["task_id"],
+            row["assigned_worker"] or "-",
+            row["worker_status"] or "-",
+            row["worker_last_seen_at"] or "-",
+            row["target_arg"] or "-",
+        ))
+        if verbose:
+            print("    current_attempt_id : %s" % (row["current_attempt_id"] or "-"))
+            print("    worker_task_id     : %s" % (row["worker_task_id"] or "-"))
+            print("    worker_example_id  : %s" % (row["worker_example_id"] or "-"))
+            print("    worker_attempt_id  : %s" % (row["worker_attempt_id"] or "-"))
+            if row["message"]:
+                print("    example_message    : %s" % row["message"])
+            if row["worker_message"]:
+                print("    worker_message     : %s" % row["worker_message"])
+
+
+def cmd_stale(args):
+    """List stale running examples."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        task_id = None
+        if getattr(args, "task_id", None):
+            task_id = resolve_task_id(conn, args.task_id)
+        rows = fetch_stale_examples(cur, task_id)
+    finally:
+        conn.close()
+
+    print_stale_rows(rows, verbose=args.verbose)
+
+
+def count_one(cur, sql, params=None):
+    """Return the first COUNT(*) result."""
+    cur.execute(sql, params or [])
+    row = cur.fetchone()
+    return int(row[0] or 0)
+
+
+def cmd_diagnose(args):
+    """Diagnose common scheduler/database consistency problems."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        task_id = None
+        if getattr(args, "task_id", None):
+            task_id = resolve_task_id(conn, args.task_id)
+
+        task_filter = ""
+        params = []
+        if task_id:
+            task_filter = " AND task_id = ?"
+            params = [task_id]
+
+        active_workers = count_one(
+            cur,
+            """
+            SELECT COUNT(*)
+            FROM workers
+            WHERE status IN ('running', 'reporting')
+              AND current_example_id IS NOT NULL
+            """,
+        )
+        db_running = count_one(
+            cur,
+            "SELECT COUNT(*) FROM task_examples WHERE status = 'running'" + task_filter,
+            params,
+        )
+        stale_rows = fetch_stale_examples(cur, task_id)
+
+        orphan_params = []
+        orphan_filter = ""
+        if task_id:
+            orphan_filter = " AND a.task_id = ?"
+            orphan_params.append(task_id)
+        orphan_attempts = count_one(
+            cur,
+            """
+            SELECT COUNT(*)
+            FROM task_attempts a
+            LEFT JOIN task_examples e
+                ON e.current_attempt_id = a.attempt_id
+            WHERE a.status = 'running'
+              AND (e.example_id IS NULL OR e.status != 'running')
+            """ + orphan_filter,
+            orphan_params,
+        )
+
+        cur.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM workers
+            GROUP BY status
+            ORDER BY status
+            """
+        )
+        worker_status_rows = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    print("PJTest diagnose")
+    print("=" * 80)
+    print("Task filter          : %s" % (task_id or "all"))
+    print("Active workers       : %d" % active_workers)
+    print("DB running examples  : %d" % db_running)
+    print("Stale running        : %d" % len(stale_rows))
+    print("Orphan attempts      : %d" % orphan_attempts)
+    print("Worker statuses      : %s" % ", ".join(
+        "%s=%s" % (row["status"] or "-", row["count"]) for row in worker_status_rows
+    ))
+    print("=" * 80)
+
+    if stale_rows:
+        print("Stale examples:")
+        print_stale_rows(stale_rows[:50], verbose=False)
+        if len(stale_rows) > 50:
+            print("... %d more" % (len(stale_rows) - 50))
+
+    if len(stale_rows) or orphan_attempts:
+        sys.exit(2)
+
+
+def default_exit_code_for_status(status):
+    """Return a conservative default exit code for manual repair."""
+    if status == "success":
+        return 0
+    if status == "timeout":
+        return 124
+    if status == "canceled":
+        return None
+    return 1
+
+
+def cmd_repair_example(args):
+    """Manually repair one example and its current attempt."""
+    status = args.status
+    exit_code = args.exit_code
+    if exit_code is None:
+        exit_code = default_exit_code_for_status(status)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    now = local_now()
+
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT * FROM task_examples WHERE example_id = ?", (args.example_id,))
+        example = cur.fetchone()
+        if not example:
+            conn.rollback()
+            print("Example not found: %s" % args.example_id)
+            return
+
+        if example["status"] in TERMINAL_EXAMPLE_STATUSES and not args.force:
+            conn.rollback()
+            print("Example is already terminal: %s status=%s" % (args.example_id, example["status"]))
+            print("Use --force to overwrite it.")
+            return
+
+        timed_out = 1 if status == "timeout" else 0
+        failed_step = None
+        failed_reason = None
+        if status == "timeout":
+            failed_step = "timeout"
+            failed_reason = "manual repair timeout"
+        elif status == "failed":
+            failed_step = "manual_repair"
+            failed_reason = "manual repair failed exit_code_%s" % exit_code
+        elif status == "canceled":
+            failed_step = None
+            failed_reason = "manual repair canceled"
+
+        message = args.message or "manual repair by taskctl: status=%s exit_code=%s" % (
+            status,
+            exit_code if exit_code is not None else "-",
+        )
+
+        attempt_id = example["current_attempt_id"]
+        if attempt_id:
+            cur.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?,
+                    exit_code = ?,
+                    timed_out = ?,
+                    finished_at = ?,
+                    message = ?
+                WHERE attempt_id = ?
+                """,
+                (status, exit_code, timed_out, now, message, attempt_id),
+            )
+
+        cur.execute(
+            """
+            UPDATE task_examples
+            SET status = ?,
+                exit_code = ?,
+                updated_at = ?,
+                finished_at = ?,
+                failed_step = ?,
+                failed_reason = ?,
+                message = ?
+            WHERE example_id = ?
+            """,
+            (
+                status,
+                exit_code,
+                now,
+                now,
+                failed_step,
+                failed_reason,
+                message,
+                args.example_id,
+            ),
+        )
+
+        insert_event(
+            cur,
+            example["task_id"],
+            args.example_id,
+            attempt_id,
+            example["assigned_worker"],
+            "example_manual_repair",
+            message,
+        )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    print("Example repaired: %s status=%s exit_code=%s" % (
+        args.example_id,
+        status,
+        exit_code if exit_code is not None else "-",
+    ))
+
+
 def cmd_cancel(args):
-    """Cancel a task by marking its remaining examples as canceled."""
+    """Cancel a task safely.
+
+    Default mode cancels only pending examples and moves the task to canceling
+    if there are still running examples.  Running examples are allowed to
+    finish and report naturally.  --force cancels both pending and running DB
+    rows immediately.
+    """
     conn = get_conn()
     cur = conn.cursor()
     now = local_now()
@@ -1704,13 +2019,6 @@ def cmd_cancel(args):
             conn.rollback()
             print("Task is already terminal: %s status=%s" % (task_id, task["status"]))
             print("Use --force only if you really want to mark it canceled.")
-            return
-
-        if running_count > 0 and not args.force:
-            conn.rollback()
-            print("Task has %d running examples." % running_count)
-            print("Cancel is blocked to avoid hiding still-running worker output.")
-            print("Use --force to mark running attempts/examples as canceled in DB.")
             return
 
         cancel_statuses = ["pending"]
@@ -1754,22 +2062,37 @@ def cmd_cancel(args):
                 ),
             )
             canceled_attempts = cur.rowcount
+            new_task_status = "canceled"
+            finished_at = now
+            task_message = "Task force-canceled by taskctl. canceled_examples=%d" % canceled_examples
         else:
             canceled_attempts = 0
+            if running_count > 0:
+                new_task_status = "canceling"
+                finished_at = None
+                task_message = "Task canceling by taskctl. pending_canceled=%d waiting_running=%d" % (
+                    canceled_examples,
+                    running_count,
+                )
+            else:
+                new_task_status = "canceled"
+                finished_at = now
+                task_message = "Task canceled by taskctl. canceled_examples=%d" % canceled_examples
 
         cur.execute(
             """
             UPDATE tasks
-            SET status = 'canceled',
+            SET status = ?,
                 updated_at = ?,
                 finished_at = ?,
                 message = ?
             WHERE task_id = ?
             """,
             (
+                new_task_status,
                 now,
-                now,
-                "Task canceled by taskctl. canceled_examples=%d" % canceled_examples,
+                finished_at,
+                task_message,
                 task_id,
             ),
         )
@@ -1780,9 +2103,12 @@ def cmd_cancel(args):
             None,
             None,
             None,
-            "task_canceled",
-            "Task canceled by taskctl. canceled_examples=%d canceled_attempts=%d"
-            % (canceled_examples, canceled_attempts),
+            "task_canceled" if new_task_status == "canceled" else "task_canceling",
+            "%s canceled_examples=%d canceled_attempts=%d" % (
+                task_message,
+                canceled_examples,
+                canceled_attempts,
+            ),
         )
 
         conn.commit()
@@ -1794,13 +2120,13 @@ def cmd_cancel(args):
     finally:
         conn.close()
 
-    print("Task canceled : %s" % task_id)
+    print("Task status   : %s" % new_task_status)
+    print("Task ID       : %s" % task_id)
     print("Pending before: %d" % pending_count)
     print("Running before: %d" % running_count)
     print("Examples marked canceled : %d" % canceled_examples)
     if args.force:
         print("Running attempts canceled: %d" % canceled_attempts)
-
 
 def build_parser():
     """Build CLI parser."""
@@ -1877,6 +2203,24 @@ def build_parser():
     p_workers = sub.add_parser("workers", help="list worker status")
     p_workers.add_argument("--status", help="filter workers by status")
     p_workers.set_defaults(func=cmd_workers)
+
+
+    p_stale = sub.add_parser("stale", help="list stale running examples")
+    p_stale.add_argument("task_id", nargs="?", default=None, help="task id, default: all")
+    p_stale.add_argument("-v", "--verbose", action="store_true")
+    p_stale.set_defaults(func=cmd_stale)
+
+    p_diagnose = sub.add_parser("diagnose", help="diagnose database/worker consistency")
+    p_diagnose.add_argument("task_id", nargs="?", default=None, help="task id, default: all")
+    p_diagnose.set_defaults(func=cmd_diagnose)
+
+    p_repair = sub.add_parser("repair-example", help="manually repair one example status")
+    p_repair.add_argument("example_id", help="example id")
+    p_repair.add_argument("--status", required=True, choices=["success", "failed", "timeout", "canceled"])
+    p_repair.add_argument("--exit-code", type=int, default=None)
+    p_repair.add_argument("--message", default=None)
+    p_repair.add_argument("--force", action="store_true")
+    p_repair.set_defaults(func=cmd_repair_example)
 
     p_check = sub.add_parser("check", help="check PJTest environment")
     p_check.add_argument(

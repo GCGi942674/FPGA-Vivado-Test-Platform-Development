@@ -50,6 +50,11 @@ LOG_ROOT = Path(os.environ.get(
     "/home/user3/PJTest/logs",
 ))
 
+PENDING_REPORT_ROOT = Path(os.environ.get(
+    "PJTEST_PENDING_REPORT_ROOT",
+    "/home/user3/PJTest/pending_reports",
+))
+
 DEFAULT_WORKER_JOBS = int(os.environ.get("PJTEST_WORKER_JOBS", "8"))
 WORKER_SLOT_ROOT = Path(os.environ.get(
     "PJTEST_WORKER_SLOT_ROOT",
@@ -432,6 +437,83 @@ def report_result_with_retry(scheduler_url, payload, state, args, worker_name):
             wait_seconds = max(1, interval)
             wait_or_shutdown(args, wait_seconds)
 
+
+
+def pending_report_dir(worker_name):
+    """Return pending report directory for one worker slot."""
+    return PENDING_REPORT_ROOT / str(worker_name)
+
+
+def pending_report_path(worker_name, payload):
+    """Return stable pending report file path for one payload."""
+    example_id = str(payload.get("example_id") or "unknown_example")
+    attempt_id = str(payload.get("attempt_id") or "unknown_attempt")
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_%s.json" % (example_id, attempt_id))
+    return pending_report_dir(worker_name) / safe_name
+
+
+def atomic_write_json(path, data):
+    """Write JSON atomically."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(".%s.%s.tmp" % (path.name, os.getpid()))
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(str(tmp_path), str(path))
+
+
+def save_pending_report(worker_name, payload):
+    """Save a report payload before sending it to scheduler."""
+    path = pending_report_path(worker_name, payload)
+    atomic_write_json(path, payload)
+    return path
+
+
+def delete_pending_report(path):
+    """Delete a pending report after scheduler accepted it."""
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        console_error(None, "pending report delete failed %s: %s" % (path, exc))
+
+
+def load_pending_report(path):
+    """Load one pending report JSON file."""
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def flush_pending_reports(scheduler_url, worker_name, state, args):
+    """Send pending reports before pulling new work."""
+    root = pending_report_dir(worker_name)
+    if not root.is_dir():
+        return
+
+    files = sorted(root.glob("*.json"))
+    for path in files:
+        if is_shutdown_requested(args):
+            return
+        try:
+            payload = load_pending_report(path)
+        except Exception as exc:
+            bad_path = path.with_suffix(path.suffix + ".bad")
+            console_error(worker_name, "PENDING_REPORT_BAD file=%s err=%s" % (path, exc))
+            try:
+                os.replace(str(path), str(bad_path))
+            except Exception:
+                pass
+            continue
+
+        console_line(worker_name, "PENDING_REPORT_FLUSH ex=%s file=%s" % (
+            short_task_id(payload.get("example_id")),
+            path,
+        ))
+        report_result_with_retry(scheduler_url, payload, state, args, worker_name)
+        delete_pending_report(path)
+        console_line(worker_name, "PENDING_REPORT_DONE ex=%s" % short_task_id(payload.get("example_id")))
 
 def shlex_quote(value):
     """Quote a shell argument."""
@@ -1453,7 +1535,9 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
         "report_dir": None,
     }
 
+    pending_path = save_pending_report(worker_name, report)
     report_result_with_retry(scheduler_url, report, state, args, worker_name)
+    delete_pending_report(pending_path)
 
     elapsed = time.time() - start_time
     console_line(worker_name, "DONE status=%s rc=%s timeout=%s sec=%.1f %s log=%s" % (
@@ -1500,10 +1584,12 @@ def worker_loop(args):
     heartbeat_thread.start()
 
     console_line(worker_name, "READY scheduler=%s" % args.scheduler)
+    flush_pending_reports(args.scheduler, worker_name, state, args)
 
     try:
         while not is_shutdown_requested(args):
             state.set("idle", None, None, None, "requesting task")
+            flush_pending_reports(args.scheduler, worker_name, state, args)
 
             try:
                 response = pull_task(args.scheduler, worker_name, capabilities, dump_json=args.dump_json)

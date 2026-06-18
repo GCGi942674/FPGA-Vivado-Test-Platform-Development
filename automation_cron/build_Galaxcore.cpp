@@ -77,21 +77,21 @@ bool run_in_workdir(const std::string &cmd)
 
 // ================= SVN =================
 
-int get_head()
-{
-    std::string cmd =
-        "svn info " + SVN_URL +
-        " --show-item revision";
+def get_head():
+    output = read_cmd_output([
+        "svn", "info", "-r", "HEAD", SVN_URL,
+    ])
+    if not output:
+        return -1
 
-    FILE *fp = popen(cmd.c_str(), "r");
-    if (!fp) return -1;
+    for line in output.splitlines():
+        if line.startswith("Revision:"):
+            try:
+                return int(line.split()[-1])
+            except ValueError:
+                return -1
 
-    char buf[64] = {0};
-    fgets(buf, sizeof(buf), fp);
-    pclose(fp);
-
-    return atoi(buf);
-}
+    return -1
 
 std::string get_author(int rev)
 {

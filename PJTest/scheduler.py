@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socketserver
 import sqlite3
 import sys
@@ -55,6 +56,12 @@ TERMINAL_EXAMPLE_STATUSES = set(["success", "failed", "timeout", "canceled"])
 REPORT_ROOT = Path(os.environ.get(
     "PJTEST_SHARE_REPORT_DIR",
     "/home/xshare/zw_cache/distributed_test_system/reports",
+))
+
+# 公共日志目录（用于存放已完成任务的报告副本）
+RUN_LOG_DIR = Path(os.environ.get(
+    "PJTEST_RUN_LOG_DIR",
+    os.path.expanduser("~xiaonan/Share/zw_cache/run_log"),
 ))
 
 # The share root is intentionally kept clean.  Scheduler-generated task
@@ -563,7 +570,7 @@ def refresh_one_task_status(cur, task_id):
             "task_status_changed",
             "%s -> %s" % (old_status, new_status),
         )
-        return True
+        return True  # 状态发生了变化
 
     return False
 
@@ -911,6 +918,7 @@ def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None
             task_id=row["task_id"],
         )
         conn.commit()
+        # 任务拉取时刷新报告（可能任务状态变为 running）
         write_share_reports_for_task(report_task_id)
         return payload, None
 
@@ -1179,6 +1187,7 @@ def _finish_attempt_once(data):
 
         refresh_one_task_status(cur, task_id)
         conn.commit()
+        # 每次报告后刷新共享报告
         write_share_reports_for_task(task_id)
 
         log_scheduler(
@@ -1714,6 +1723,89 @@ def write_task_share_reports(task_id):
 
     return True
 
+
+def copy_task_reports_to_run_log(task_id, report=None):
+    """
+    只有当 task 同时满足“终态”和“统计强一致”时，才执行拷贝。
+    作用层级：动作层（defensive gate），不影响状态机层。
+    """
+    # 1. 如果没有传入 report，从数据库重新读取（确保获取最新快照）
+    if report is None:
+        report = get_task_report_data(task_id)
+        if not report:
+            log_scheduler("WARN", "report data not found for task %s" % task_id, task_id=task_id)
+            return False
+
+    task_status = report["task"]["status"]
+    summary = report["summary"]
+
+    # 2. 终态检查（状态机层已经保证，但这里作为第一道门）
+    if task_status not in TERMINAL_TASK_STATUSES:
+        log_scheduler("DEBUG", "task not terminal, skip run_log copy: %s" % task_status, task_id=task_id)
+        return False
+
+    # 3. 强一致性校验（分布式防御层，关键新增）
+    if not (summary["done"] == summary["total"] and
+            summary["running"] == 0 and
+            summary["pending"] == 0):
+        log_scheduler(
+            "WARN",
+            "task terminal but stats inconsistent (done=%d total=%d running=%d pending=%d), skip copy" % (
+                summary["done"], summary["total"], summary["running"], summary["pending"]
+            ),
+            task_id=task_id
+        )
+        return False
+
+    # 4. 获取源目录和目标目录
+    paths = get_task_report_paths(report)
+    src_dir = paths["task_dir"]
+    if not src_dir.exists():
+        log_scheduler("WARN", "source report dir not found for run_log copy: %s" % src_dir, task_id=task_id)
+        return False
+
+    revision_dir = get_report_revision_dir(report)
+    dst_dir = RUN_LOG_DIR / revision_dir / str(task_id)
+
+    # 5. 如果目标已存在，跳过（幂等性）
+    if dst_dir.exists():
+        log_scheduler("INFO", "run_log already exists, skip: %s" % dst_dir, task_id=task_id)
+        return True
+
+    # 6. 执行拷贝
+    try:
+        RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src_dir, dst_dir, symlinks=True)
+        log_scheduler("INFO", "copied task reports to run_log: %s" % dst_dir, task_id=task_id)
+        return True
+    except Exception as exc:
+        log_scheduler("ERROR", "failed to copy run_log: %s" % exc, task_id=task_id)
+        return False
+
+
+REPORT_WRITE_LOCK = threading.Lock()
+
+
+def write_share_reports_for_task(task_id):
+    """Write task-specific shared reports safely."""
+    try:
+        with REPORT_WRITE_LOCK:
+            ok = write_task_share_reports(task_id)
+        log_scheduler(
+            "INFO",
+            "share reports refreshed task=%s report_root=%s"
+            % (task_id, REPORT_ROOT),
+            task_id=task_id,
+            also_stdout=False,
+        )
+        # 调用带防御校验的拷贝函数
+        copy_task_reports_to_run_log(task_id)
+        return ok
+    except Exception as exc:
+        log_exception("failed to write share reports for %s" % task_id, exc, task_id=task_id)
+        return False
+
+
 def get_tasks_summary_data(limit=200):
     """Build a global summary for all recent tasks."""
     conn = get_conn()
@@ -1853,25 +1945,6 @@ def write_global_share_reports():
     """Global flat reports are intentionally disabled."""
     return True
 
-REPORT_WRITE_LOCK = threading.Lock()
-
-
-def write_share_reports_for_task(task_id):
-    """Write task-specific shared reports safely."""
-    try:
-        with REPORT_WRITE_LOCK:
-            write_task_share_reports(task_id)
-        log_scheduler(
-            "INFO",
-            "share reports refreshed task=%s report_root=%s"
-            % (task_id, REPORT_ROOT),
-            task_id=task_id,
-            also_stdout=False,
-        )
-        return True
-    except Exception as exc:
-        log_exception("failed to write share reports for %s" % task_id, exc, task_id=task_id)
-        return False
 
 def _reconcile_once_without_retry(worker_timeout):
     """Mark stale workers offline and refresh task aggregates without retry."""
@@ -2354,6 +2427,7 @@ def main():
     log_scheduler("INFO", "latest_zip_dirs=%s" % ", ".join(str(path) for path in get_zip_dirs()))
     log_scheduler("INFO", "report_root=%s" % REPORT_ROOT)
     log_scheduler("INFO", "scheduler_log_root=%s" % SCHEDULER_LOG_ROOT)
+    log_scheduler("INFO", "run_log_dir=%s" % RUN_LOG_DIR)
     print("Press Ctrl+C to stop.")
 
     try:

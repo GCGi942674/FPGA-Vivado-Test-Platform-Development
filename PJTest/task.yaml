@@ -1,0 +1,9 @@
+tasks:
+  - template: place 
+    target: .
+
+  - template: route
+    target: .
+
+  - template: checksum
+    target: .

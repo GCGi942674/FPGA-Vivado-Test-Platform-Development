@@ -19,6 +19,7 @@ Main APIs:
 
 Usage:
     ./scheduler.py --host 0.0.0.0 --port 9000
+    ./scheduler.py --check   # check configuration and exit
 """
 
 import argparse
@@ -87,6 +88,119 @@ DB_LOCK_RETRY_BASE_SEC = float(os.environ.get("PJTEST_DB_LOCK_RETRY_BASE_SEC", "
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("PJTEST_SQLITE_BUSY_TIMEOUT_MS", "60000"))
 REQUEUE_STALE_RUNNING = os.environ.get("PJTEST_REQUEUE_STALE_RUNNING", "0") != "0"
 
+
+# ======================== 新增 check 功能 ========================
+def check_configuration():
+    """Check and display scheduler configuration and environment."""
+    print("PJTest Scheduler Configuration Check")
+    print("=" * 60)
+
+    # 1. Database
+    db_path = DB_PATH
+    print(f"Database Path: {db_path}")
+    if db_path.exists():
+        print("  [OK] Database file exists.")
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            conn.close()
+            print("  [OK] Database is accessible.")
+        except Exception as e:
+            print(f"  [ERROR] Cannot connect to database: {e}")
+    else:
+        print("  [WARN] Database file does not exist. It will be created on first use.")
+        parent = db_path.parent
+        if parent.exists():
+            if os.access(parent, os.W_OK):
+                print(f"  [OK] Parent directory {parent} is writable.")
+            else:
+                print(f"  [ERROR] Parent directory {parent} is NOT writable.")
+        else:
+            print(f"  [WARN] Parent directory {parent} does not exist.")
+
+    # 2. REPORT_ROOT
+    print(f"\nREPORT_ROOT: {REPORT_ROOT}")
+    if REPORT_ROOT.exists():
+        print("  [OK] Report root exists.")
+    else:
+        print("  [WARN] Report root does not exist. It will be created as needed.")
+        parent = REPORT_ROOT.parent
+        if parent.exists() and os.access(parent, os.W_OK):
+            print(f"  [OK] Parent directory {parent} is writable.")
+        else:
+            print(f"  [ERROR] Parent directory {parent} is NOT writable or does not exist.")
+
+    # 3. RUN_LOG_DIR
+    print(f"\nRUN_LOG_DIR: {RUN_LOG_DIR}")
+    if RUN_LOG_DIR.exists():
+        print("  [OK] Run log directory exists.")
+        if os.access(RUN_LOG_DIR, os.W_OK):
+            print("  [OK] Run log directory is writable.")
+        else:
+            print("  [ERROR] Run log directory is NOT writable.")
+    else:
+        print("  [WARN] Run log directory does not exist. It will be created as needed.")
+        parent = RUN_LOG_DIR.parent
+        if parent.exists() and os.access(parent, os.W_OK):
+            print(f"  [OK] Parent directory {parent} is writable.")
+        else:
+            print(f"  [ERROR] Parent directory {parent} is NOT writable or does not exist.")
+
+    # 4. SCHEDULER_LOG_ROOT
+    print(f"\nSCHEDULER_LOG_ROOT: {SCHEDULER_LOG_ROOT}")
+    if SCHEDULER_LOG_ROOT.exists():
+        print("  [OK] Scheduler log root exists.")
+        if os.access(SCHEDULER_LOG_ROOT, os.W_OK):
+            print("  [OK] Scheduler log root is writable.")
+        else:
+            print("  [ERROR] Scheduler log root is NOT writable.")
+    else:
+        print("  [WARN] Scheduler log root does not exist. It will be created as needed.")
+        parent = SCHEDULER_LOG_ROOT.parent
+        if parent.exists() and os.access(parent, os.W_OK):
+            print(f"  [OK] Parent directory {parent} is writable.")
+        else:
+            print(f"  [ERROR] Parent directory {parent} is NOT writable or does not exist.")
+
+    # 5. Zip directories
+    print("\nZip Directories (GALAXCORE_ZIP_DIR):")
+    zip_dirs = get_zip_dirs()
+    for zd in zip_dirs:
+        if zd.exists():
+            print(f"  [OK] {zd}")
+        else:
+            print(f"  [WARN] {zd} does not exist.")
+
+    # 6. Find latest zip
+    print("\nLooking for latest GalaxCore zip...")
+    latest = find_latest_compiled_zip()
+    if latest:
+        print(f"  [OK] Latest revision: {latest[0]} at {latest[1]}")
+    else:
+        print("  [ERROR] No GalaxCore zip found in configured directories.")
+
+    # 7. Environment variables (optional)
+    print("\nEnvironment variables (overrides):")
+    env_vars = [
+        "PJTEST_DB_PATH",
+        "PJTEST_SHARE_REPORT_DIR",
+        "PJTEST_RUN_LOG_DIR",
+        "PJTEST_SCHEDULER_LOG_ROOT",
+        "PJTEST_SCHEDULER_DEBUG",
+        "PJTEST_DB_LOCK_RETRIES",
+        "PJTEST_DB_LOCK_RETRY_BASE_SEC",
+        "PJTEST_SQLITE_BUSY_TIMEOUT_MS",
+        "PJTEST_REQUEUE_STALE_RUNNING",
+        "GALAXCORE_ZIP_DIR",
+    ]
+    for var in env_vars:
+        val = os.environ.get(var)
+        if val is not None:
+            print(f"  {var}={val}")
+
+    print("\nCheck complete.")
+# ======================== 结束新增部分 ========================
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -1316,7 +1430,6 @@ def requeue_or_fail_stale_example(cur, worker_name, example):
     )
 
 
-
 def atomic_write_text(path, text):
     """Write a text file atomically using a unique temporary file."""
     path = Path(path)
@@ -2405,12 +2518,22 @@ def build_parser():
         default=300,
         help="mark worker offline after this many heartbeat seconds",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="check configuration and environment, then exit",
+    )
     return parser
 
 
 def main():
     """Program entry."""
     args = build_parser().parse_args()
+
+    # 如果指定 --check，仅执行检查并退出
+    if args.check:
+        check_configuration()
+        return 0
 
     init_database_pragmas()
     server = ThreadingHTTPServer((args.host, args.port), SchedulerHandler)

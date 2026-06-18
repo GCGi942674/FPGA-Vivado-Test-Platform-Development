@@ -10,6 +10,7 @@ access the SQLite database directly.
 Usage:
     ./taskctl.py add <template_name> [target_dir] [--revision REV]
     ./taskctl.py list [--status STATUS] [--limit N]
+    ./taskctl.py show [task_id]
     ./taskctl.py examples <task_id> [-v]
     ./taskctl.py attempts <example_id>
     ./taskctl.py workers
@@ -18,6 +19,7 @@ Usage:
     ./taskctl.py delete <task_id> [--force]
 """
 
+import yaml  # 新增
 import argparse
 import json
 import os
@@ -1068,6 +1070,340 @@ def cmd_stat(args):
 
     print_task_stat(task, counts, workers)
 
+def json_loads_dict(value):
+    """Load a JSON object safely."""
+    if not value:
+        return {}
+
+    try:
+        data = json.loads(value)
+    except Exception:
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def print_key_value(title, rows):
+    """Print aligned key/value rows."""
+    print(title)
+    print("=" * 100)
+
+    for key, value in rows:
+        if value is None or value == "":
+            value = "-"
+        print("%-18s: %s" % (key, value))
+
+    print("")
+
+
+def fetch_task_recent_examples(cur, task_id, statuses, limit):
+    """Fetch recent examples by status list."""
+    placeholders = ",".join("?" for _ in statuses)
+    params = [task_id] + list(statuses) + [limit]
+
+    cur.execute(
+        """
+        SELECT example_id, seq, target_arg, status, assigned_worker,
+               current_attempt_id, retry_count, max_retry, exit_code,
+               failed_step, failed_reason, started_at, finished_at,
+               log_file, run_log_dir, report_dir, message
+        FROM task_examples
+        WHERE task_id = ?
+          AND status IN (%s)
+        ORDER BY updated_at DESC, seq ASC
+        LIMIT ?
+        """ % placeholders,
+        params,
+    )
+
+    return cur.fetchall()
+
+
+def fetch_task_recent_attempts(cur, task_id, limit):
+    """Fetch recent attempts for one task."""
+    cur.execute(
+        """
+        SELECT attempt_id, example_id, attempt_no, worker_name, status,
+               revision, started_at, finished_at, exit_code, timed_out,
+               log_file, run_log_dir, report_dir, message
+        FROM task_attempts
+        WHERE task_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (task_id, limit),
+    )
+
+    return cur.fetchall()
+
+
+def fetch_task_active_workers(cur, task_id):
+    """Fetch currently active workers for one task."""
+    cur.execute(
+        """
+        SELECT worker_name, hostname, status, current_example_id,
+               current_attempt_id, last_seen_at, message
+        FROM workers
+        WHERE current_task_id = ?
+        ORDER BY worker_name
+        """,
+        (task_id,),
+    )
+
+    return cur.fetchall()
+
+
+def print_flow_config(flow_config):
+    """Print flow_config in aligned form."""
+    print("Flow Config")
+    print("=" * 100)
+
+    if not flow_config:
+        print("-")
+        print("")
+        return
+
+    for key in sorted(flow_config.keys()):
+        print("%-28s: %s" % (key, flow_config[key]))
+
+    print("")
+
+
+def print_show_examples(title, rows):
+    """Print compact example rows."""
+    print(title)
+    print("=" * 100)
+
+    if not rows:
+        print("-")
+        print("")
+        return
+
+    header = "%-18s %5s %-10s %-18s %-7s %-6s %s" % (
+        "EXAMPLE_ID",
+        "SEQ",
+        "STATUS",
+        "WORKER",
+        "RETRY",
+        "EXIT",
+        "TARGET",
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in rows:
+        retry = "%s/%s" % (
+            row["retry_count"] if row["retry_count"] is not None else 0,
+            row["max_retry"] if row["max_retry"] is not None else 0,
+        )
+        exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
+        print("%-18s %5s %-10s %-18s %-7s %-6s %s" % (
+            row["example_id"],
+            row["seq"],
+            row["status"],
+            row["assigned_worker"] or "-",
+            retry,
+            exit_code,
+            row["target_arg"] or "-",
+        ))
+
+        if row["failed_step"] or row["failed_reason"]:
+            print("    failed_step   : %s" % (row["failed_step"] or "-"))
+            print("    failed_reason : %s" % (row["failed_reason"] or "-"))
+        if row["message"]:
+            print("    message       : %s" % row["message"])
+        if row["log_file"]:
+            print("    log_file      : %s" % row["log_file"])
+        if row["run_log_dir"]:
+            print("    run_log_dir   : %s" % row["run_log_dir"])
+        if row["report_dir"]:
+            print("    report_dir    : %s" % row["report_dir"])
+
+    print("")
+
+
+def print_show_attempts(rows):
+    """Print recent attempts."""
+    print("Recent Attempts")
+    print("=" * 100)
+
+    if not rows:
+        print("-")
+        print("")
+        return
+
+    header = "%-18s %-18s %4s %-18s %-10s %-8s %-6s %-19s %-19s" % (
+        "ATTEMPT_ID",
+        "EXAMPLE_ID",
+        "NO",
+        "WORKER",
+        "STATUS",
+        "REV",
+        "EXIT",
+        "STARTED_AT",
+        "FINISHED_AT",
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in rows:
+        exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
+        print("%-18s %-18s %4s %-18s %-10s %-8s %-6s %-19s %-19s" % (
+            row["attempt_id"],
+            row["example_id"],
+            row["attempt_no"],
+            row["worker_name"] or "-",
+            row["status"] or "-",
+            row["revision"] or "-",
+            exit_code,
+            row["started_at"] or "-",
+            row["finished_at"] or "-",
+        ))
+
+        if row["message"]:
+            print("    message     : %s" % row["message"])
+        if row["log_file"]:
+            print("    log_file    : %s" % row["log_file"])
+        if row["run_log_dir"]:
+            print("    run_log_dir : %s" % row["run_log_dir"])
+        if row["report_dir"]:
+            print("    report_dir  : %s" % row["report_dir"])
+
+    print("")
+
+
+def print_show_workers(rows):
+    """Print active workers for this task."""
+    print("Active Workers")
+    print("=" * 100)
+
+    if not rows:
+        print("-")
+        print("")
+        return
+
+    header = "%-18s %-18s %-10s %-18s %-18s %-19s %s" % (
+        "WORKER",
+        "HOSTNAME",
+        "STATUS",
+        "EXAMPLE_ID",
+        "ATTEMPT_ID",
+        "LAST_SEEN_AT",
+        "MESSAGE",
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in rows:
+        print("%-18s %-18s %-10s %-18s %-18s %-19s %s" % (
+            row["worker_name"] or "-",
+            row["hostname"] or "-",
+            row["status"] or "-",
+            row["current_example_id"] or "-",
+            row["current_attempt_id"] or "-",
+            row["last_seen_at"] or "-",
+            row["message"] or "-",
+        ))
+
+    print("")
+
+
+def cmd_show(args):
+    """Show full task configuration and useful runtime details."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        task_id = resolve_task_id(conn, getattr(args, "task_id", None))
+        task = get_task_row(cur, task_id)
+        counts = get_task_counts(cur, task_id)
+        workers = get_task_workers(cur, task_id)
+        active_workers = fetch_task_active_workers(cur, task_id)
+        failed_rows = fetch_task_recent_examples(
+            cur,
+            task_id,
+            ["failed", "timeout"],
+            args.limit,
+        )
+        running_rows = fetch_task_recent_examples(
+            cur,
+            task_id,
+            ["running"],
+            args.limit,
+        )
+        recent_attempts = fetch_task_recent_attempts(cur, task_id, args.limit)
+    finally:
+        conn.close()
+
+    total = counts["total"]
+    done = counts["done_count"]
+    flow_config = json_loads_dict(task["flow_config_json"])
+    report_root = SHARE_REPORT_DIR
+    report_dir = report_root / report_revision_dir(task) / task_id
+
+    print_key_value(
+        "Task Detail",
+        [
+            ("Task ID", task["task_id"]),
+            ("Task Name", task["task_name"]),
+            ("Template", task["template_name"]),
+            ("Suite", task["suite"]),
+            ("Status", task["status"]),
+            ("Revision", format_revision(task)),
+            ("Revision Policy", task["revision_policy"]),
+            ("Resolved Zip", task["resolved_zip_path"]),
+            ("Target Worker", task["target_worker"]),
+            ("Priority", task["priority"]),
+            ("Max Retry", task["max_retry"]),
+            ("Max Time", task["max_time"]),
+            ("Work Root", task["work_root"]),
+            ("Target Dir", task["target_dir"]),
+            ("Split Mode", task["split_mode"]),
+            ("Total Examples", task["total_examples"]),
+            ("Repeat Enabled", task["repeat_enabled"]),
+            ("Repeat Group", task["repeat_group"]),
+            ("Repeat Index", task["repeat_index"]),
+            ("Parent Task ID", task["parent_task_id"]),
+            ("Created At", task["created_at"]),
+            ("Updated At", task["updated_at"]),
+            ("Started At", task["started_at"]),
+            ("Finished At", task["finished_at"]),
+            ("Message", task["message"]),
+            ("Report Dir", report_dir),
+        ],
+    )
+
+    print_key_value(
+        "Summary",
+        [
+            ("Total", total),
+            ("Done", done),
+            ("Success", counts["success_count"]),
+            ("Failed", counts["failed_count"]),
+            ("Timeout", counts["timeout_count"]),
+            ("Running", counts["running_count"]),
+            ("Pending", counts["pending_count"]),
+            ("Progress", progress_text(done, total)),
+            ("Workers", workers),
+        ],
+    )
+
+    print_flow_config(flow_config)
+
+    if args.raw_json:
+        print("Raw flow_config_json")
+        print("=" * 100)
+        print(task["flow_config_json"] or "{}")
+        print("")
+
+    print_show_workers(active_workers)
+
+    if not args.no_examples:
+        print_show_examples("Running Examples", running_rows)
+        print_show_examples("Recent Failures / Timeouts", failed_rows)
+
+    if args.attempts:
+        print_show_attempts(recent_attempts)
 
 def status_label_to_db_status(command):
     """Convert shortcut command to database status."""
@@ -1376,6 +1712,68 @@ def cmd_report(args):
     for filename in sorted(files.keys()):
         print("  %s" % filename)
 
+def cmd_apply(args):
+    """Batch create tasks from a YAML suite file."""
+    yaml_path = Path(args.file).expanduser().resolve()
+    if not yaml_path.is_file():
+        print("ERROR: YAML file not found: %s" % yaml_path)
+        sys.exit(1)
+
+    with yaml_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    # 支持两种格式：
+    # 1. 直接是一个列表：[ {template: place, target: .}, ... ]
+    # 2. 包含 tasks 字段的字典：{ tasks: [ ... ] }
+    if isinstance(data, dict) and "tasks" in data:
+        task_list = data["tasks"]
+    elif isinstance(data, list):
+        task_list = data
+    else:
+        print("ERROR: YAML must contain a list or a dict with 'tasks' key.")
+        sys.exit(1)
+
+    total = len(task_list)
+    success = 0
+    failed = 0
+
+    print("Applying %d tasks from %s ..." % (total, yaml_path))
+    print("-" * 60)
+
+    for idx, entry in enumerate(task_list, 1):
+        template = entry.get("template")
+        target = entry.get("target", ".")
+
+        if not template:
+            print("[%d/%d] SKIP: missing 'template' field" % (idx, total))
+            failed += 1
+            continue
+
+        # 构造模拟的 argparse.Namespace 对象，模拟 ./taskctl.py add 的参数
+        class Args:
+            pass
+        task_args = Args()
+        task_args.template_name = template
+        task_args.target_dir = target
+        task_args.revision = entry.get("revision")  # None 表示 latest
+        task_args.name = entry.get("name")
+        task_args.priority = entry.get("priority")
+        task_args.max_retry = entry.get("max_retry")
+        task_args.max_time = entry.get("max_time")
+
+        try:
+            # 复用 cmd_add 的核心逻辑
+            cmd_add(task_args)
+            success += 1
+            print("[%d/%d] OK: %s %s" % (idx, total, template, target))
+        except Exception as exc:
+            failed += 1
+            print("[%d/%d] FAIL: %s %s - %s" % (idx, total, template, target, exc))
+
+    print("-" * 60)
+    print("Summary: SUCCESS=%d FAILED=%d" % (success, failed))
+    if failed > 0:
+        sys.exit(1)
 
 
 # ============================================================
@@ -1389,7 +1787,7 @@ DEFAULT_SCHEDULER_URL = (
 ).rstrip("/")
 
 DEFAULT_ZIP_DIRS = [
-    Path("/home/xshare/zw_cache/distributed_test_system/GalaxCore_bin/zip"),
+    Path("/home/xshare/zhouwei_runcache/GalaxCore/zip"),
 ]
 
 ZIP_RE = re.compile(r"^Galax[Cc]ore_(\d+)\.zip$")
@@ -2156,6 +2554,31 @@ def build_parser():
     p_list.add_argument("--limit", type=int, default=20, help="max rows, default: 20")
     p_list.set_defaults(func=cmd_list)
 
+    p_show = sub.add_parser("show", help="show full task detail and configuration")
+    p_show.add_argument("task_id", nargs="?", default=None, help="task id, default: latest")
+    p_show.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="max recent examples/attempts to show, default: 20",
+    )
+    p_show.add_argument(
+        "--attempts",
+        action="store_true",
+        help="also show recent attempts",
+    )
+    p_show.add_argument(
+        "--raw-json",
+        action="store_true",
+        help="also print raw flow_config_json",
+    )
+    p_show.add_argument(
+        "--no-examples",
+        action="store_true",
+        help="do not print running/failure example sections",
+    )
+    p_show.set_defaults(func=cmd_show)
+    
     p_examples = sub.add_parser("examples", help="list examples of a task")
     p_examples.add_argument("task_id", help="task id")
     p_examples.add_argument("--status", help="filter examples by status")
@@ -2237,6 +2660,10 @@ def build_parser():
         help="also mark running examples/attempts canceled in DB",
     )
     p_cancel.set_defaults(func=cmd_cancel)
+
+    p_apply = sub.add_parser("apply", help="create tasks from a YAML suite file")
+    p_apply.add_argument("file", help="YAML file containing task definitions")
+    p_apply.set_defaults(func=cmd_apply)
 
     return parser
 

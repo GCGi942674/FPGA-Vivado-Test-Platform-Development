@@ -24,13 +24,16 @@ Main workflow:
      Each record includes author/name information.
 """
 
+import argparse
 import os
 import re
+import shutil
 import sys
 import time
 import signal
 import zipfile
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 
@@ -302,14 +305,46 @@ def save_last_version(version):
 
 # ================= BUILD =================
 
+def run_csh_command(command):
+    """Run one command in the configured csh build environment."""
+    return run_cmd(
+        ["csh", "-c", "{}; exit $status".format(command)],
+        cwd=WORK_DIR,
+    )
+
+
 def build():
-    # Preserve original C++ behavior:
-    # csh -c 'mk; exit $status'
-    return run_in_workdir(["csh", "-c", "mk; exit $status"])
+    """Run the normal build command, equivalent to the interactive `mk` alias."""
+    ok, _ = run_csh_command("mk")
+    return ok
 
 
-def make_clean():
-    run_in_workdir(["make", "clean"])
+def rebuild_after_failure():
+    """Run the full recovery flow after the first build failure.
+
+    Recovery flow:
+        make clean
+        cmake .
+        bd
+        mk
+    """
+    steps = [
+        ("make_clean_failed", ["make", "clean"], False),
+        ("cmake_failed", "cmake .", True),
+        ("build_prepare_failed", "bd", True),
+        ("mk_failed_after_retry", "mk", True),
+    ]
+
+    for reason, command, use_csh in steps:
+        if use_csh:
+            ok, return_code = run_csh_command(command)
+        else:
+            ok, return_code = run_cmd(command, cwd=WORK_DIR)
+
+        if not ok:
+            return False, reason, return_code
+
+    return True, "ok", 0
 
 
 def run_submit_test():
@@ -577,29 +612,37 @@ def build_revision(rev):
         record_failure(rev, author, "svn_update_failed")
         return False
 
-    # 2. first build attempt. If mk fails, retry once after make clean.
+    # 2. First build attempt: mk.
     mk_ok = build()
-    if not mk_ok:
-        ci_debug(f"r{rev} first mk failed, retry after make clean")
-        make_clean()
-        mk_ok = build()
 
+    # 3. Recovery after the first build failure:
+    #    make clean -> cmake . -> bd -> mk
     if not mk_ok:
-        ci_log(f"FAIL r{rev} mk_failed")
-        record_failure(rev, author, "mk_failed_after_retry")
-        return False
+        ci_log(
+            f"r{rev} first mk failed; "
+            "run make clean -> cmake . -> bd -> mk"
+        )
+        recovered, failure_reason, failure_code = rebuild_after_failure()
 
-    # 3. submit gate. Only generate zip when submit_test.sh really passes.
+        if not recovered:
+            ci_log(
+                f"FAIL r{rev} {failure_reason} "
+                f"rc={failure_code}"
+            )
+            record_failure(rev, author, failure_reason)
+            return False
+
+    # 4. Submit gate. Only generate zip when submit_test.sh really passes.
     ci_log(f"submit_test r{rev}")
     submit_ok, submit_reason, submit_output = run_submit_test()
     if not submit_ok:
         detail = summarize_submit_output(submit_output)
         ci_log(f"FAIL r{rev} submit_failed")
         ci_debug(f"submit failed for r{rev}: {submit_reason}: {detail}")
-        record_failure(rev, author, f"submit_failed:{submit_reason}:{detail}")
+        record_failure(rev, author, "submit_failed")
         return False
 
-    # 4. zip only after mk + submit both succeed.
+    # 5. Create the zip only after mk and submit both succeed.
     if not compress_to_zip(rev):
         ci_log(f"FAIL r{rev} compress_failed")
         ci_debug(f"compress failed for r{rev}")
@@ -611,6 +654,383 @@ def build_revision(rev):
     ci_log(f"Success r{rev}")
     return True
 
+
+
+# ================= CONFIG CHECK =================
+
+class CheckReporter(object):
+    """Collect and print configuration check results."""
+
+    def __init__(self):
+        self.counts = {
+            "OK": 0,
+            "WARN": 0,
+            "FAIL": 0,
+            "INFO": 0,
+        }
+
+    def emit(self, level, label, detail):
+        """Print one aligned check result."""
+        self.counts[level] += 1
+        print("{:<5} {:<24} {}".format(level, label, detail))
+
+    def ok(self, label, detail):
+        self.emit("OK", label, detail)
+
+    def warn(self, label, detail):
+        self.emit("WARN", label, detail)
+
+    def fail(self, label, detail):
+        self.emit("FAIL", label, detail)
+
+    def info(self, label, detail):
+        self.emit("INFO", label, detail)
+
+    def finish(self):
+        """Print the final summary and return the process exit code."""
+        print()
+        print(
+            "CHECK_SUMMARY ok={OK} warn={WARN} fail={FAIL} info={INFO}".format(
+                **self.counts
+            )
+        )
+        return 1 if self.counts["FAIL"] else 0
+
+
+def normalize_path(path):
+    """Return a normalized absolute path without requiring it to exist."""
+    try:
+        return Path(path).expanduser().resolve()
+    except Exception:
+        return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def nearest_existing_parent(path):
+    """Return the nearest existing parent directory."""
+    current = normalize_path(path)
+
+    while not current.exists() and current != current.parent:
+        current = current.parent
+
+    return current
+
+
+def check_writable_target(reporter, label, path):
+    """Check whether a target path can be created or updated."""
+    path = normalize_path(path)
+
+    if path.exists():
+        parent = path if path.is_dir() else path.parent
+    else:
+        parent = nearest_existing_parent(path)
+
+    if not parent.exists():
+        reporter.fail(label, "no existing parent for {}".format(path))
+        return
+
+    if not parent.is_dir():
+        reporter.fail(label, "parent is not a directory: {}".format(parent))
+        return
+
+    if os.access(str(parent), os.W_OK | os.X_OK):
+        reporter.ok(label, "writable via {}".format(parent))
+    else:
+        reporter.fail(label, "not writable: {}".format(parent))
+
+
+def run_check_command(argv, cwd=None, timeout=20):
+    """Run one read-only check command and return (return_code, output)."""
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=timeout,
+            check=False,
+        )
+        return proc.returncode, strip_ansi(proc.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "command timed out after {} seconds".format(timeout)
+    except Exception as exc:
+        return -1, str(exc)
+
+
+def parse_svn_info_xml(output):
+    """Parse an `svn info --xml` response."""
+    root = ET.fromstring(output)
+    entry = root.find(".//entry")
+
+    if entry is None:
+        raise ValueError("missing SVN entry")
+
+    url_node = entry.find("url")
+    return {
+        "revision": (entry.get("revision") or "").strip(),
+        "url": (url_node.text or "").strip() if url_node is not None else "",
+    }
+
+
+def check_csh_command(reporter, command_name):
+    """Check one command or alias inside csh."""
+    csh_path = shutil.which("csh")
+    if not csh_path:
+        reporter.fail("{} in csh".format(command_name), "csh not found")
+        return
+
+    rc, output = run_check_command(
+        [csh_path, "-c", "which {}".format(command_name)],
+        cwd=WORK_DIR,
+        timeout=10,
+    )
+
+    if rc == 0 and output:
+        reporter.ok("{} in csh".format(command_name), output.replace("\n", " | "))
+    else:
+        reporter.fail(
+            "{} in csh".format(command_name),
+            "not available rc={}: {}".format(rc, output or "no output"),
+        )
+
+
+def check_svn_configuration(reporter):
+    """Check the local working copy and configured remote repository."""
+    svn_path = shutil.which("svn")
+    if not svn_path:
+        reporter.fail("svn command", "svn not found in PATH")
+        return
+
+    reporter.ok("svn command", svn_path)
+
+    rc, output = run_check_command(
+        [svn_path, "info", "--xml", str(WORK_DIR)],
+        timeout=20,
+    )
+    if rc != 0:
+        reporter.fail(
+            "working copy",
+            "svn info failed rc={}: {}".format(rc, output or "no output"),
+        )
+        return
+
+    try:
+        local_info = parse_svn_info_xml(output)
+    except Exception as exc:
+        reporter.fail("working copy", "cannot parse svn info: {}".format(exc))
+        return
+
+    reporter.ok(
+        "working copy",
+        "revision={} url={}".format(
+            local_info["revision"] or "?",
+            local_info["url"] or "?",
+        ),
+    )
+
+    local_url = local_info["url"].rstrip("/")
+    expected_url = str(SVN_URL).rstrip("/")
+
+    if local_url == expected_url:
+        reporter.ok("SVN URL match", expected_url)
+    else:
+        reporter.fail(
+            "SVN URL match",
+            "configured={} working_copy={}".format(expected_url, local_url),
+        )
+
+    rc, output = run_check_command(
+        [svn_path, "info", "--xml", str(SVN_URL)],
+        timeout=20,
+    )
+    if rc != 0:
+        reporter.fail(
+            "remote SVN",
+            "svn info failed rc={}: {}".format(rc, output or "no output"),
+        )
+        return
+
+    try:
+        remote_info = parse_svn_info_xml(output)
+        reporter.ok(
+            "remote SVN",
+            "revision={} url={}".format(
+                remote_info["revision"] or "?",
+                remote_info["url"] or "?",
+            ),
+        )
+    except Exception as exc:
+        reporter.fail("remote SVN", "cannot parse svn info: {}".format(exc))
+
+
+def run_config_check():
+    """Run read-only configuration checks without changing the working copy."""
+    reporter = CheckReporter()
+
+    script_path = normalize_path(__file__)
+    script_dir = script_path.parent
+    current_dir = normalize_path(Path.cwd())
+    work_dir = normalize_path(WORK_DIR)
+    bin_src = normalize_path(BIN_SRC)
+    bin_dst = normalize_path(BIN_DST)
+    zip_dir = normalize_path(ZIP_DIR)
+    submit_dir = normalize_path(SUBMIT_TEST_DIR)
+
+    submit_script_value = Path(SUBMIT_TEST_SCRIPT)
+    if submit_script_value.is_absolute():
+        submit_script = normalize_path(submit_script_value)
+    else:
+        submit_script = normalize_path(submit_dir / submit_script_value)
+
+    reporter.info("script file", str(script_path))
+    reporter.info("script directory", str(script_dir))
+    reporter.info("current directory", str(current_dir))
+    reporter.info("WORK_DIR", str(work_dir))
+    reporter.info(
+        "WORK_DIR source",
+        "environment"
+        if "GALAXCORE_WORK_DIR" in os.environ
+        else "built-in default",
+    )
+    reporter.info("BIN_SRC", str(bin_src))
+    reporter.info("BIN_DST", str(bin_dst))
+    reporter.info("ZIP_DIR", str(zip_dir))
+    reporter.info("SUBMIT_TEST_DIR", str(submit_dir))
+    reporter.info("SVN_URL", str(SVN_URL))
+
+    if work_dir.is_dir():
+        reporter.ok("WORK_DIR exists", str(work_dir))
+    elif work_dir.exists():
+        reporter.fail("WORK_DIR exists", "not a directory: {}".format(work_dir))
+    else:
+        reporter.fail("WORK_DIR exists", "missing: {}".format(work_dir))
+
+    if current_dir == work_dir:
+        reporter.ok("current vs WORK_DIR", "same path")
+    else:
+        reporter.warn(
+            "current vs WORK_DIR",
+            "current={} configured={}".format(current_dir, work_dir),
+        )
+
+    if script_dir == work_dir:
+        reporter.ok("script vs WORK_DIR", "same path")
+    else:
+        reporter.warn(
+            "script vs WORK_DIR",
+            "script={} configured={}".format(script_dir, work_dir),
+        )
+
+    if work_dir.is_dir():
+        if os.access(str(work_dir), os.R_OK | os.W_OK | os.X_OK):
+            reporter.ok("WORK_DIR access", "read/write/execute")
+        else:
+            reporter.fail("WORK_DIR access", "insufficient permissions")
+    else:
+        reporter.fail("WORK_DIR access", "cannot check missing directory")
+
+    svn_dir = work_dir / ".svn"
+    if svn_dir.exists():
+        reporter.ok("WORK_DIR .svn", str(svn_dir))
+    else:
+        reporter.fail("WORK_DIR .svn", "missing: {}".format(svn_dir))
+
+    makefiles = [
+        work_dir / "Makefile",
+        work_dir / "makefile",
+        work_dir / "GNUmakefile",
+    ]
+    existing_makefiles = [path for path in makefiles if path.is_file()]
+
+    if existing_makefiles:
+        reporter.ok(
+            "build Makefile",
+            ", ".join(str(path) for path in existing_makefiles),
+        )
+    else:
+        reporter.fail(
+            "build Makefile",
+            "none found in {}".format(work_dir),
+        )
+
+    for command_name in ("mk", "bd", "cmake"):
+        check_csh_command(reporter, command_name)
+
+    make_path = shutil.which("make")
+    if make_path:
+        reporter.ok("make command", make_path)
+    else:
+        reporter.fail("make command", "make not found in PATH")
+
+    check_svn_configuration(reporter)
+
+    if bin_src.is_file():
+        if os.access(str(bin_src), os.X_OK):
+            reporter.ok("GalaxCore binary", "{} (executable)".format(bin_src))
+        else:
+            reporter.warn(
+                "GalaxCore binary",
+                "{} exists but is not executable".format(bin_src),
+            )
+    else:
+        reporter.warn(
+            "GalaxCore binary",
+            "not present before build: {}".format(bin_src),
+        )
+
+    if bin_src.parent.is_dir():
+        reporter.ok("binary directory", str(bin_src.parent))
+    else:
+        reporter.warn(
+            "binary directory",
+            "missing before build: {}".format(bin_src.parent),
+        )
+
+    if submit_dir.is_dir():
+        reporter.ok("submit test dir", str(submit_dir))
+    else:
+        reporter.fail("submit test dir", "missing: {}".format(submit_dir))
+
+    if submit_script.is_file():
+        if os.access(str(submit_script), os.X_OK):
+            reporter.ok("submit script", "{} (executable)".format(submit_script))
+        else:
+            reporter.fail(
+                "submit script",
+                "not executable: {}".format(submit_script),
+            )
+    else:
+        reporter.fail("submit script", "missing: {}".format(submit_script))
+
+    check_writable_target(reporter, "BIN_DST writable", bin_dst)
+    check_writable_target(reporter, "ZIP_DIR writable", zip_dir)
+    check_writable_target(reporter, "mk_fail writable", MK_FAIL_FILE)
+    check_writable_target(reporter, "last_version writable", LAST_VERSION_FILE)
+
+    last_version = _read_int_file(LAST_VERSION_FILE)
+    if last_version is not None:
+        reporter.ok("last_version", "r{}".format(last_version))
+    elif LAST_VERSION_FILE.exists():
+        reporter.fail(
+            "last_version",
+            "invalid integer: {}".format(LAST_VERSION_FILE),
+        )
+    else:
+        reporter.warn(
+            "last_version",
+            "missing; startup will use legacy file or HEAD - 1",
+        )
+
+    legacy_version = _read_int_file(LEGACY_LAST_REVISION_FILE)
+    if legacy_version is not None:
+        reporter.info("legacy version", "r{}".format(legacy_version))
+
+    reporter.info(
+        "failure recovery",
+        "make clean -> cmake . -> bd -> mk",
+    )
+
+    return reporter.finish()
 
 # ================= MAIN LOOP =================
 
@@ -633,6 +1053,23 @@ def validate_paths():
 
     if not WORK_DIR.exists():
         ci_debug(f"warning: WORK_DIR does not exist: {WORK_DIR}")
+
+
+
+def build_parser():
+    """Build the command-line parser."""
+    parser = argparse.ArgumentParser(
+        description="GalaxCore SVN build watcher",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "check paths, csh commands, SVN, permissions, and build inputs "
+            "without changing files"
+        ),
+    )
+    return parser
 
 
 def main():
@@ -684,7 +1121,11 @@ def main():
 
 
 if __name__ == "__main__":
+    args = build_parser().parse_args()
+
     try:
+        if args.check:
+            sys.exit(run_config_check())
         sys.exit(main())
     except KeyboardInterrupt:
         running = False

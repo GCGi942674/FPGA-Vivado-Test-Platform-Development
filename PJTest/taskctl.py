@@ -572,7 +572,11 @@ def format_revision(row):
 
 
 def cmd_list(args):
-    """List parent tasks with aggregate progress."""
+    """List the most recent parent tasks with aggregate progress."""
+    limit = int(args.limit)
+    if limit <= 0:
+        raise ValueError("--limit must be greater than 0")
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -586,6 +590,29 @@ def cmd_list(args):
               AND w.current_attempt_id = e.current_attempt_id
         )
     """
+
+    # Select only the requested parent tasks first. This prevents SQLite from
+    # aggregating every historical task and all of its examples before LIMIT.
+    conditions = []
+    params = []
+
+    if args.status:
+        conditions.append("status = ?")
+        params.append(args.status)
+
+    recent_tasks_query = """
+        SELECT *
+        FROM tasks
+    """
+
+    if conditions:
+        recent_tasks_query += " WHERE " + " AND ".join(conditions)
+
+    recent_tasks_query += """
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    params.append(limit)
 
     query = """
         SELECT
@@ -604,36 +631,54 @@ def cmd_list(args):
             COUNT(e.example_id) AS real_total,
             SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
             SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS db_running_count,
-            SUM(CASE WHEN e.status = 'running' AND %s THEN 1 ELSE 0 END) AS active_running_count,
-            SUM(CASE WHEN e.status = 'running' AND NOT (%s) THEN 1 ELSE 0 END) AS stale_running_count,
+            SUM(
+                CASE
+                    WHEN e.status = 'running' AND %s THEN 1
+                    ELSE 0
+                END
+            ) AS active_running_count,
+            SUM(
+                CASE
+                    WHEN e.status = 'running' AND NOT (%s) THEN 1
+                    ELSE 0
+                END
+            ) AS stale_running_count,
             SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
-            SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
-            SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
-        FROM tasks t
+            SUM(
+                CASE
+                    WHEN e.status IN ('failed', 'timeout') THEN 1
+                    ELSE 0
+                END
+            ) AS failed_count,
+            SUM(
+                CASE
+                    WHEN e.status IN (
+                        'success',
+                        'failed',
+                        'timeout',
+                        'canceled'
+                    ) THEN 1
+                    ELSE 0
+                END
+            ) AS done_count
+        FROM (
+            %s
+        ) AS t
         LEFT JOIN task_examples e
             ON t.task_id = e.task_id
-    """ % (active_predicate, active_predicate)
-
-    conditions = []
-    params = []
-
-    if args.status:
-        conditions.append("t.status = ?")
-        params.append(args.status)
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-
-    query += """
-        GROUP BY t.task_id
+        GROUP BY t.id, t.task_id
         ORDER BY t.id DESC
-        LIMIT ?
-    """
-    params.append(args.limit)
+    """ % (
+        active_predicate,
+        active_predicate,
+        recent_tasks_query,
+    )
 
-    cur.execute(query, params)
-    rows = cur.fetchall()
-    conn.close()
+    try:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    finally:
+        conn.close()
 
     if not rows:
         print("No tasks found.")
@@ -2549,9 +2594,15 @@ def build_parser():
     p_add.add_argument("--max-time", type=int, help="timeout seconds per example")
     p_add.set_defaults(func=cmd_add)
 
-    p_list = sub.add_parser("list", help="list tasks")
+    p_list = sub.add_parser("list", help="list recent tasks")
     p_list.add_argument("--status", help="filter by task status")
-    p_list.add_argument("--limit", type=int, default=20, help="max rows, default: 20")
+    p_list.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=5,
+        help="number of recent tasks to show, default: 5",
+    )
     p_list.set_defaults(func=cmd_list)
 
     p_show = sub.add_parser("show", help="show full task detail and configuration")

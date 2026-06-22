@@ -20,6 +20,7 @@ Usage:
     ./worker.py --scheduler http://192.168.10.11:8888 --worker-name tiger --jobs 8 --once
     ./worker.py --update-test2
     ./worker.py --recheckout-slots
+    ./worker.py --check
 """
 
 import argparse
@@ -89,7 +90,7 @@ DEFAULT_WORKER_NAME = (
 
 SHARE_ZIP_DIR = Path(os.environ.get(
     "SHARE_ZIP_DIR",
-    "/home/xshare/zw_cache/distributed_test_system/GalaxCore_bin/zip",
+    "/home/xshare/zhouwei_runcache/GalaxCore/zip",
 ))
 
 DEFAULT_DUMP_JSON = os.environ.get("PJTEST_DUMP_JSON", "0") == "1"
@@ -1871,9 +1872,540 @@ def worker_manager_loop(args):
         console_line(None, "Interrupted; shutdown requested")
         return 130
 
+
+class CheckReporter(object):
+    """Collect and print worker configuration check results."""
+
+    def __init__(self):
+        self.counts = {
+            "OK": 0,
+            "WARN": 0,
+            "FAIL": 0,
+            "INFO": 0,
+        }
+
+    def add(self, status, item, detail):
+        """Print one aligned check result and update counters."""
+        status = str(status).upper()
+        if status not in self.counts:
+            status = "INFO"
+        self.counts[status] += 1
+        console_line(None, "%-4s %-24s %s" % (status, item, detail))
+
+    def ok(self, item, detail):
+        self.add("OK", item, detail)
+
+    def warn(self, item, detail):
+        self.add("WARN", item, detail)
+
+    def fail(self, item, detail):
+        self.add("FAIL", item, detail)
+
+    def info(self, item, detail):
+        self.add("INFO", item, detail)
+
+    def finish(self):
+        """Print summary and return a shell-friendly exit code."""
+        console_line(
+            None,
+            "CHECK_SUMMARY ok=%d warn=%d fail=%d info=%d" % (
+                self.counts["OK"],
+                self.counts["WARN"],
+                self.counts["FAIL"],
+                self.counts["INFO"],
+            ),
+        )
+        return 1 if self.counts["FAIL"] else 0
+
+
+def nearest_existing_parent(path):
+    """Return the nearest existing path at or above the requested path."""
+    current = Path(path).expanduser()
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
+
+
+def check_directory_access(reporter, item, path, required=False):
+    """Check whether a directory exists or can be created by the worker."""
+    path = Path(path).expanduser()
+    if path.is_dir():
+        readable = os.access(str(path), os.R_OK | os.X_OK)
+        writable = os.access(str(path), os.W_OK | os.X_OK)
+        if readable and writable:
+            reporter.ok(item, "%s (read/write)" % path)
+        elif readable:
+            if required:
+                reporter.fail(item, "%s (read-only)" % path)
+            else:
+                reporter.warn(item, "%s (read-only)" % path)
+        else:
+            reporter.fail(item, "%s (not readable)" % path)
+        return
+
+    if path.exists():
+        reporter.fail(item, "%s exists but is not a directory" % path)
+        return
+
+    parent = nearest_existing_parent(path.parent)
+    can_create = parent.is_dir() and os.access(str(parent), os.W_OK | os.X_OK)
+    if can_create:
+        reporter.warn(item, "%s missing; parent is writable: %s" % (path, parent))
+    else:
+        reporter.fail(item, "%s missing and cannot be created from %s" % (path, parent))
+
+
+def check_file_access(reporter, item, path, executable=False, required=True):
+    """Check one regular file and optional executable permission."""
+    path = Path(path).expanduser()
+    if not path.is_file():
+        if required:
+            reporter.fail(item, "missing: %s" % path)
+        else:
+            reporter.warn(item, "missing: %s" % path)
+        return False
+
+    if not os.access(str(path), os.R_OK):
+        reporter.fail(item, "not readable: %s" % path)
+        return False
+
+    if executable and not os.access(str(path), os.X_OK):
+        reporter.fail(item, "not executable: %s" % path)
+        return False
+
+    suffix = "readable/executable" if executable else "readable"
+    reporter.ok(item, "%s (%s)" % (path, suffix))
+    return True
+
+
+def find_command(candidates):
+    """Return the first available command from a candidate list."""
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def check_command_available(reporter, item, candidates, required=True):
+    """Check whether at least one command candidate is available."""
+    found = find_command(candidates)
+    if found:
+        reporter.ok(item, found)
+        return found
+
+    message = "not found in PATH: %s" % ", ".join(candidates)
+    if required:
+        reporter.fail(item, message)
+    else:
+        reporter.warn(item, message)
+    return None
+
+
+def parse_flow_config_summary(path):
+    """Return a lightweight summary of a worker slot flow_config file."""
+    path = Path(path)
+    keys = []
+    set_re = re.compile(r"^\s*set\s+([A-Za-z_][A-Za-z0-9_]*)\s+")
+    kv_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*|\s+)")
+
+    with path.open("r", encoding="utf-8", errors="ignore") as stream:
+        for raw_line in stream:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            match = set_re.match(line)
+            if not match:
+                match = kv_re.match(line)
+            if match:
+                keys.append(match.group(1))
+
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    return len(keys), duplicates
+
+
+def check_slot_configuration(reporter, args, base_worker_name, slot_index):
+    """Check one configured worker slot without creating or changing it."""
+    slot_worker_name = make_slot_worker_name(base_worker_name, slot_index)
+    root = slot_galaxcore_root(args.slot_root, slot_worker_name)
+    status = slot_checkout_status(root)
+    item_prefix = "slot%d" % slot_index
+
+    if not status["root_exists"]:
+        reporter.warn(item_prefix, "not initialized; startup will checkout %s" % root)
+        return
+
+    missing = []
+    if not status["svn_dir"]:
+        missing.append(".svn")
+    if not status["test2_dir"]:
+        missing.append("test2")
+    if not status["run_sh"]:
+        missing.append("test2/run.sh")
+
+    if missing:
+        reporter.fail(item_prefix, "incomplete checkout %s; missing=%s" % (
+            root,
+            ",".join(missing),
+        ))
+        return
+
+    reporter.ok(item_prefix, "checkout ready: %s" % root)
+
+    test2 = root / "test2"
+    check_file_access(
+        reporter,
+        "%s run.sh" % item_prefix,
+        test2 / "run.sh",
+        executable=True,
+        required=True,
+    )
+
+    flow_config = test2 / "flow_config"
+    if check_file_access(
+        reporter,
+        "%s flow_config" % item_prefix,
+        flow_config,
+        executable=False,
+        required=False,
+    ):
+        try:
+            key_count, duplicates = parse_flow_config_summary(flow_config)
+            detail = "recognized_keys=%d" % key_count
+            if duplicates:
+                reporter.warn(
+                    "%s flow keys" % item_prefix,
+                    "%s duplicate_keys=%s" % (detail, ",".join(duplicates)),
+                )
+            else:
+                reporter.info("%s flow keys" % item_prefix, detail)
+        except Exception as exc:
+            reporter.warn("%s flow parse" % item_prefix, str(exc))
+
+    if CLEAN_AFTER_RUN:
+        check_file_access(
+            reporter,
+            "%s clean.sh" % item_prefix,
+            test2 / "clean.sh",
+            executable=True,
+            required=False,
+        )
+    else:
+        reporter.info("%s clean.sh" % item_prefix, "disabled by PJTEST_CLEAN_AFTER_RUN=0")
+
+    effective_install_root = (
+        Path(args.install_root).expanduser().resolve()
+        if args.install_root
+        else root
+    )
+    target_binary, flow_target = resolve_install_targets(effective_install_root)
+    target_parent = target_binary.parent
+    if target_parent.is_dir() and os.access(str(target_parent), os.W_OK | os.X_OK):
+        reporter.ok("%s binary dst" % item_prefix, str(target_binary))
+    elif target_parent.is_dir():
+        reporter.fail("%s binary dst" % item_prefix, "parent not writable: %s" % target_parent)
+    else:
+        parent = nearest_existing_parent(target_parent)
+        if parent.is_dir() and os.access(str(parent), os.W_OK | os.X_OK):
+            reporter.warn(
+                "%s binary dst" % item_prefix,
+                "parent missing but can be created: %s" % target_parent,
+            )
+        else:
+            reporter.fail(
+                "%s binary dst" % item_prefix,
+                "cannot create under: %s" % parent,
+            )
+
+    if flow_target.exists():
+        reporter.info("%s flow dst" % item_prefix, str(flow_target))
+    else:
+        reporter.warn("%s flow dst" % item_prefix, "missing: %s" % flow_target)
+
+
+def zip_revision(path):
+    """Extract a numeric revision from a GalaxCore zip filename."""
+    match = re.search(r"(?:_|-|_r)(\d+)\.zip$", path.name, re.IGNORECASE)
+    return int(match.group(1)) if match else -1
+
+
+def check_shared_zip_directory(reporter):
+    """Check shared zip directory and inspect the newest GalaxCore package."""
+    if not SHARE_ZIP_DIR.is_dir():
+        reporter.fail("shared zip dir", "missing: %s" % SHARE_ZIP_DIR)
+        return
+
+    if not os.access(str(SHARE_ZIP_DIR), os.R_OK | os.X_OK):
+        reporter.fail("shared zip dir", "not readable: %s" % SHARE_ZIP_DIR)
+        return
+
+    zip_paths = sorted(
+        SHARE_ZIP_DIR.glob("*.zip"),
+        key=lambda path: (zip_revision(path), path.stat().st_mtime),
+    )
+    if not zip_paths:
+        reporter.warn("shared zip dir", "%s contains no zip files" % SHARE_ZIP_DIR)
+        return
+
+    latest = zip_paths[-1]
+    reporter.ok(
+        "shared zip dir",
+        "%s zip_count=%d latest=%s" % (SHARE_ZIP_DIR, len(zip_paths), latest.name),
+    )
+
+    if not zipfile.is_zipfile(str(latest)):
+        reporter.fail("latest zip", "invalid zip: %s" % latest)
+        return
+
+    try:
+        with zipfile.ZipFile(str(latest), "r") as archive:
+            bad_member = archive.testzip()
+            names = archive.namelist()
+    except Exception as exc:
+        reporter.fail("latest zip", "%s: %s" % (latest, exc))
+        return
+
+    if bad_member:
+        reporter.fail("latest zip", "CRC failure member=%s file=%s" % (bad_member, latest))
+        return
+
+    base_names = {Path(name.rstrip("/")).name for name in names if name.rstrip("/")}
+    has_binary = "GalaxCore" in base_names or "Galaxcore" in base_names
+    has_flow = any(
+        part == "flow"
+        for name in names
+        for part in Path(name).parts
+    )
+
+    if has_binary:
+        reporter.ok("latest zip", "%s contains GalaxCore" % latest)
+    else:
+        reporter.fail("latest zip", "%s does not contain GalaxCore" % latest)
+
+    if has_flow:
+        reporter.info("latest zip flow", "flow directory is included")
+    else:
+        reporter.info("latest zip flow", "flow is not included; existing slot flow will be kept")
+
+
+def check_scheduler_endpoint(reporter, scheduler_url):
+    """Validate scheduler URL and test TCP reachability without registering."""
+    try:
+        from urllib.parse import urlparse
+    except ImportError:  # pragma: no cover
+        from urlparse import urlparse
+
+    parsed = urlparse(str(scheduler_url))
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        reporter.fail("scheduler URL", "invalid: %s" % scheduler_url)
+        return
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    reporter.ok(
+        "scheduler URL",
+        "%s host=%s port=%d" % (scheduler_url, parsed.hostname, port),
+    )
+
+    try:
+        connection = socket.create_connection((parsed.hostname, port), timeout=3)
+        connection.close()
+        reporter.ok("scheduler TCP", "%s:%d reachable" % (parsed.hostname, port))
+    except Exception as exc:
+        reporter.warn("scheduler TCP", "%s:%d unreachable: %s" % (
+            parsed.hostname,
+            port,
+            exc,
+        ))
+
+
+def check_svn_endpoint(reporter, svn_command, svn_url):
+    """Validate SVN URL with a read-only svn info request."""
+    if not svn_command:
+        return
+
+    if not str(svn_url).strip():
+        reporter.fail("SVN URL", "empty")
+        return
+
+    try:
+        proc = subprocess.run(
+            [svn_command, "info", str(svn_url)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        reporter.warn("SVN URL", "svn info timed out after 10s: %s" % svn_url)
+        return
+    except Exception as exc:
+        reporter.warn("SVN URL", "%s: %s" % (svn_url, exc))
+        return
+
+    if proc.returncode == 0:
+        revision = "unknown"
+        for line in (proc.stdout or "").splitlines():
+            if line.lower().startswith("revision:"):
+                revision = line.split(":", 1)[1].strip()
+                break
+        reporter.ok("SVN URL", "%s revision=%s" % (svn_url, revision))
+    else:
+        detail = " ".join((proc.stdout or "").strip().split())
+        reporter.warn("SVN URL", "svn info rc=%d %s" % (
+            proc.returncode,
+            short_target(detail or svn_url, 140),
+        ))
+
+
+def run_configuration_check(args):
+    """Check effective worker configuration without starting worker slots."""
+    reporter = CheckReporter()
+    base_worker_name = args.worker_name or DEFAULT_WORKER_NAME or get_default_worker_name()
+
+    console_line(None, "PJTest worker configuration check")
+    reporter.info("worker name", base_worker_name)
+    reporter.info("hostname", socket.gethostname())
+    reporter.info("scheduler", str(args.scheduler))
+    reporter.info("jobs", str(args.jobs))
+    reporter.info("single slot", str(args.single_slot or "disabled"))
+    reporter.info("shell", str(args.shell))
+    reporter.info("install root", str(args.install_root or "slot-local"))
+    reporter.info("slot root", str(Path(args.slot_root).expanduser()))
+    reporter.info("SVN URL", str(args.svn_url))
+    reporter.info("shared zip", str(SHARE_ZIP_DIR))
+    reporter.info("log root", str(LOG_ROOT))
+    reporter.info("pending reports", str(PENDING_REPORT_ROOT))
+    reporter.info("protobuf lib", str(PROTOBUF_LIB_DIR or "disabled"))
+    reporter.info("binary relative", str(BIN_RELATIVE_DIR))
+    reporter.info("binary override", str(TARGET_BINARY_ENV or "disabled"))
+    reporter.info("flow override", str(FLOW_TARGET_DIR_ENV or "disabled"))
+    reporter.info(
+        "flow ignored keys",
+        ",".join(sorted(FLOW_CONFIG_IGNORE_KEYS)) or "none",
+    )
+    reporter.info("clean after run", str(int(CLEAN_AFTER_RUN)))
+    reporter.info("clean timeout", str(CLEAN_TIMEOUT))
+    reporter.info("update test2", str(int(bool(args.update_test2))))
+    reporter.info("recheckout slots", str(int(bool(args.recheckout_slots))))
+    reporter.info("tmux slots", str(int(bool(args.tmux_slots))))
+    reporter.info("once mode", str(int(bool(args.once))))
+    reporter.info("dump JSON", str(int(bool(args.dump_json))))
+    reporter.info("SVN timeout", str(SVN_COMMAND_TIMEOUT))
+    reporter.info("report retry", "%ss max=%s" % (
+        args.report_retry_interval,
+        args.report_max_retries,
+    ))
+
+    if int(args.jobs) < 1:
+        reporter.fail("jobs value", "--jobs must be >= 1")
+    else:
+        reporter.ok("jobs value", str(args.jobs))
+
+    if int(args.interval) < 0:
+        reporter.fail("pull interval", "must be >= 0")
+    else:
+        reporter.ok("pull interval", "%ss" % args.interval)
+
+    if int(args.heartbeat_interval) <= 0:
+        reporter.fail("heartbeat interval", "must be > 0")
+    else:
+        reporter.ok("heartbeat interval", "%ss" % args.heartbeat_interval)
+
+    if int(args.report_retry_interval) <= 0:
+        reporter.fail("report retry", "interval must be > 0")
+    if int(args.report_max_retries) < 0:
+        reporter.fail("report retry", "max retries must be >= 0")
+    if int(args.shutdown_timeout) < 0:
+        reporter.fail("shutdown timeout", "must be >= 0")
+
+    check_scheduler_endpoint(reporter, args.scheduler)
+
+    svn_command = check_command_available(reporter, "command svn", ["svn"], required=True)
+    if args.shell == "csh":
+        check_command_available(reporter, "command csh", ["tcsh", "csh"], required=True)
+    else:
+        check_command_available(reporter, "command bash", ["bash"], required=True)
+
+    check_command_available(
+        reporter,
+        "command tmux",
+        ["tmux"],
+        required=bool(args.tmux_slots),
+    )
+    check_svn_endpoint(reporter, svn_command, args.svn_url)
+
+    check_directory_access(reporter, "slot root", args.slot_root, required=True)
+    check_directory_access(reporter, "log root", LOG_ROOT, required=False)
+    check_directory_access(reporter, "pending root", PENDING_REPORT_ROOT, required=False)
+    check_directory_access(reporter, "temporary root", tempfile.gettempdir(), required=True)
+
+    if PROTOBUF_LIB_DIR:
+        protobuf_path = Path(PROTOBUF_LIB_DIR).expanduser()
+        if protobuf_path.is_dir():
+            libraries = sorted(protobuf_path.glob("libprotobuf*.so*"))
+            if libraries:
+                reporter.ok(
+                    "protobuf lib",
+                    "%s files=%d" % (protobuf_path, len(libraries)),
+                )
+            else:
+                reporter.warn(
+                    "protobuf lib",
+                    "%s exists but no libprotobuf*.so* found" % protobuf_path,
+                )
+        else:
+            reporter.fail("protobuf lib", "missing: %s" % protobuf_path)
+
+    check_shared_zip_directory(reporter)
+
+    if args.install_root:
+        install_root = Path(args.install_root).expanduser()
+        check_directory_access(
+            reporter,
+            "install root",
+            install_root,
+            required=True,
+        )
+        if int(args.jobs) > 1 and args.single_slot is None:
+            reporter.warn(
+                "install root sharing",
+                "all %d slots will install into the same path: %s" % (
+                    int(args.jobs),
+                    install_root,
+                ),
+            )
+
+    if args.single_slot is not None:
+        if int(args.single_slot) < 1:
+            reporter.fail("single slot", "--single-slot must be >= 1")
+            slot_indices = []
+        else:
+            slot_indices = [int(args.single_slot)]
+    elif int(args.jobs) > 0:
+        slot_indices = list(range(1, int(args.jobs) + 1))
+    else:
+        slot_indices = []
+
+    for slot_index in slot_indices:
+        check_slot_configuration(
+            reporter,
+            args,
+            base_worker_name,
+            slot_index,
+        )
+
+    return reporter.finish()
+
 def build_parser():
     """Build CLI parser."""
     parser = argparse.ArgumentParser(description="PJTest HTTP worker")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="check effective configuration, paths, commands, scheduler/SVN reachability, slots, and latest zip without starting workers",
+    )
     parser.add_argument(
         "--scheduler",
         default=DEFAULT_SCHEDULER_URL,
@@ -1991,6 +2523,8 @@ def main():
     args = build_parser().parse_args()
 
     try:
+        if args.check:
+            return run_configuration_check(args)
         if args.tmux_slots:
             return launch_tmux_slots(args)
         if args.single_slot is not None:

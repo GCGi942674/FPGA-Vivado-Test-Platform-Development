@@ -97,6 +97,7 @@ DEFAULT_DUMP_JSON = os.environ.get("PJTEST_DUMP_JSON", "0") == "1"
 
 REPORT_RETRY_INTERVAL = int(os.environ.get("PJTEST_REPORT_RETRY_INTERVAL", "10"))
 REPORT_MAX_RETRIES = int(os.environ.get("PJTEST_REPORT_MAX_RETRIES", "0"))
+PULL_TIMEOUT = int(os.environ.get("PJTEST_PULL_TIMEOUT", "60"))
 
 PROTOBUF_LIB_DIR = os.environ.get(
     "PROTOBUF_LIB_DIR",
@@ -364,8 +365,14 @@ def heartbeat_loop(scheduler_url, worker_name, state, stop_event, interval):
         stop_event.wait(interval)
 
 
-def pull_task(scheduler_url, worker_name, capabilities, dump_json=False):
-    """Pull one task example from scheduler."""
+def pull_task(
+    scheduler_url,
+    worker_name,
+    capabilities,
+    dump_json=False,
+    timeout=PULL_TIMEOUT,
+):
+    """Pull one task example using an explicit, configurable timeout."""
     return http_json(
         scheduler_url,
         "/api/task/pull",
@@ -374,6 +381,7 @@ def pull_task(scheduler_url, worker_name, capabilities, dump_json=False):
             "hostname": socket.gethostname(),
             "capabilities": capabilities,
         },
+        timeout=timeout,
         dump_json=dump_json,
     )
 
@@ -1593,9 +1601,15 @@ def worker_loop(args):
             flush_pending_reports(args.scheduler, worker_name, state, args)
 
             try:
-                response = pull_task(args.scheduler, worker_name, capabilities, dump_json=args.dump_json)
+                response = pull_task(
+                    args.scheduler,
+                    worker_name,
+                    capabilities,
+                    dump_json=args.dump_json,
+                    timeout=args.pull_timeout,
+                )
             except Exception as exc:
-                console_error(worker_name, "PULL_FAIL %s" % exc)
+                console_error(worker_name, "PULL_FAIL response may be lost; retry idempotently: %s" % exc)
                 state.set("error", None, None, None, "pull failed: %s" % exc)
                 if args.once:
                     return 1
@@ -1686,6 +1700,8 @@ def build_single_slot_command(args, slot_index):
         str(args.interval),
         "--heartbeat-interval",
         str(args.heartbeat_interval),
+        "--pull-timeout",
+        str(args.pull_timeout),
         "--report-retry-interval",
         str(args.report_retry_interval),
         "--report-max-retries",
@@ -2480,6 +2496,12 @@ def build_parser():
         type=int,
         default=30,
         help="heartbeat interval seconds, default: 30",
+    )
+    parser.add_argument(
+        "--pull-timeout",
+        type=int,
+        default=PULL_TIMEOUT,
+        help="task pull HTTP timeout seconds, default: env PJTEST_PULL_TIMEOUT or 60",
     )
     parser.add_argument(
         "--report-retry-interval",

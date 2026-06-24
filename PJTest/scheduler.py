@@ -18,13 +18,14 @@ Main APIs:
     GET  /api/build/latest
 
 Usage:
-    ./scheduler.py --host 0.0.0.0 --port 9000
+    ./scheduler.py
     ./scheduler.py --check   # check configuration and exit
 """
 
 import argparse
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -40,60 +41,148 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from config import (
+    CONFIG_FILE,
+    get_bool,
+    get_float,
+    get_int,
+    get_path,
+    get_path_list,
+    get_value,
+)
 
-DB_PATH = Path(os.environ.get(
-    "PJTEST_DB_PATH",
-    "/home/user3/PJTest/data/task_queue.db",
-))
 
-DEFAULT_ZIP_DIRS = [
-    Path("/home/xshare/zw_cache/distributed_test_system/GalaxCore_bin/zip"),
-]
+DB_PATH = get_path(
+    "paths",
+    "database",
+    env_name="PJTEST_DB_PATH",
+)
+
+DEFAULT_ZIP_DIRS = get_path_list("paths", "zip_dirs")
 
 ZIP_RE = re.compile(r"^Galax[Cc]ore_(\d+)\.zip$")
 TERMINAL_TASK_STATUSES = set(["success", "failed", "canceled"])
 TERMINAL_EXAMPLE_STATUSES = set(["success", "failed", "timeout", "canceled"])
 
-REPORT_ROOT = Path(os.environ.get(
-    "PJTEST_SHARE_REPORT_DIR",
-    "/home/xshare/zw_cache/distributed_test_system/reports",
-))
+REPORT_ROOT = get_path(
+    "paths",
+    "report_root",
+    env_name="PJTEST_SHARE_REPORT_DIR",
+)
+REPORT_RETENTION_DAYS = get_int(
+    "reports",
+    "retention_days",
+    env_name="PJTEST_REPORT_RETENTION_DAYS",
+    minimum=1,
+)
+REPORT_MAINTENANCE_INTERVAL_SEC = get_int(
+    "reports",
+    "maintenance_interval_sec",
+    env_name="PJTEST_REPORT_MAINTENANCE_INTERVAL_SEC",
+    minimum=60,
+)
+REPORT_OLD_DIR_NAME = get_value("reports", "old_dir_name")
+REPORT_SUMMARY_DIR_NAME = get_value("reports", "summary_dir_name")
 
-# 公共日志目录（用于存放已完成任务的报告副本）
-RUN_LOG_DIR = Path(os.environ.get(
-    "PJTEST_RUN_LOG_DIR",
-    os.path.expanduser("~xiaonan/Share/zw_cache/run_log"),
-))
+# Shared log directory for completed task report copies.
+RUN_LOG_DIR = get_path(
+    "paths",
+    "run_log_dir",
+    env_name="PJTEST_RUN_LOG_DIR",
+)
 
-# The share root is intentionally kept clean.  Scheduler-generated task
-# summaries are written only under:
-#     REPORT_ROOT / <revision> / <task_id> /
-# Do not write flat latest files such as execution_report.json or
-# stat_summary into /home/xshare/zw_cache/distributed_test_system.
+# Scheduler-generated task reports are organized as:
+#     REPORT_ROOT / <revision> / <template>_<task_id> /
+# Reports older than the retention window are moved below REPORT_ROOT / Old.
+# REPORT_ROOT / Summary keeps one latest stat_summary per template.
 
-SCHEDULER_LOG_ROOT = Path(os.environ.get(
-    "PJTEST_SCHEDULER_LOG_ROOT",
-    "/home/user3/PJTest/logs/scheduler",
-))
+SCHEDULER_LOG_ROOT = get_path(
+    "paths",
+    "scheduler_log_root",
+    env_name="PJTEST_SCHEDULER_LOG_ROOT",
+)
 
-SCHEDULER_DEBUG = os.environ.get(
-    "PJTEST_SCHEDULER_DEBUG",
-    "0",
-) != "0"
+SCHEDULER_DEBUG = get_bool(
+    "scheduler",
+    "debug",
+    env_name="PJTEST_SCHEDULER_DEBUG",
+)
 
 LOG_LOCK = threading.Lock()
 DB_WRITE_LOCK = threading.RLock()
-DB_LOCK_RETRIES = int(os.environ.get("PJTEST_DB_LOCK_RETRIES", "8"))
-DB_LOCK_RETRY_BASE_SEC = float(os.environ.get("PJTEST_DB_LOCK_RETRY_BASE_SEC", "0.25"))
-SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("PJTEST_SQLITE_BUSY_TIMEOUT_MS", "60000"))
-REQUEUE_STALE_RUNNING = os.environ.get("PJTEST_REQUEUE_STALE_RUNNING", "0") != "0"
+DB_LOCK_RETRIES = get_int(
+    "database",
+    "lock_retries",
+    env_name="PJTEST_DB_LOCK_RETRIES",
+    minimum=1,
+)
+DB_LOCK_RETRY_BASE_SEC = get_float(
+    "database",
+    "lock_retry_base_sec",
+    env_name="PJTEST_DB_LOCK_RETRY_BASE_SEC",
+    minimum=0.0,
+)
+DB_CONNECT_TIMEOUT_SEC = get_int(
+    "database",
+    "connect_timeout_sec",
+    minimum=1,
+)
+SQLITE_BUSY_TIMEOUT_MS = get_int(
+    "database",
+    "busy_timeout_ms",
+    env_name="PJTEST_SQLITE_BUSY_TIMEOUT_MS",
+    minimum=1,
+)
+REPORT_RECENT_ATTEMPT_LIMIT = get_int(
+    "reports",
+    "recent_attempt_limit",
+    minimum=1,
+)
+TASK_API_DEFAULT_LIMIT = get_int(
+    "http",
+    "task_api_default_limit",
+    minimum=1,
+)
+TASK_API_MAX_LIMIT = get_int(
+    "http",
+    "task_api_max_limit",
+    minimum=1,
+)
+EXAMPLE_API_DEFAULT_LIMIT = get_int(
+    "http",
+    "example_api_default_limit",
+    minimum=1,
+)
+EXAMPLE_API_MAX_LIMIT = get_int(
+    "http",
+    "example_api_max_limit",
+    minimum=1,
+)
+REQUEUE_STALE_RUNNING = get_bool(
+    "scheduler",
+    "requeue_stale_running",
+    env_name="PJTEST_REQUEUE_STALE_RUNNING",
+)
 
+DEFAULT_SCHEDULER_HOST = get_value("scheduler", "host")
+DEFAULT_SCHEDULER_PORT = get_int("scheduler", "port", minimum=1)
+DEFAULT_RECONCILE_INTERVAL = get_int(
+    "scheduler",
+    "reconcile_interval_sec",
+    minimum=1,
+)
+DEFAULT_WORKER_TIMEOUT = get_int(
+    "scheduler",
+    "worker_timeout_sec",
+    minimum=1,
+)
 
-# ======================== 新增 check 功能 ========================
+# ======================== Configuration check ========================
 def check_configuration():
     """Check and display scheduler configuration and environment."""
     print("PJTest Scheduler Configuration Check")
     print("=" * 60)
+    print("Config File  : %s" % CONFIG_FILE)
 
     # 1. Database
     db_path = DB_PATH
@@ -130,6 +219,10 @@ def check_configuration():
             print(f"  [OK] Parent directory {parent} is writable.")
         else:
             print(f"  [ERROR] Parent directory {parent} is NOT writable or does not exist.")
+
+    print(f"  Retention days: {REPORT_RETENTION_DAYS}")
+    print(f"  Old directory : {REPORT_ROOT / REPORT_OLD_DIR_NAME}")
+    print(f"  Summary dir   : {REPORT_ROOT / REPORT_SUMMARY_DIR_NAME}")
 
     # 3. RUN_LOG_DIR
     print(f"\nRUN_LOG_DIR: {RUN_LOG_DIR}")
@@ -183,8 +276,11 @@ def check_configuration():
     # 7. Environment variables (optional)
     print("\nEnvironment variables (overrides):")
     env_vars = [
+        "PJTEST_CONFIG_FILE",
         "PJTEST_DB_PATH",
         "PJTEST_SHARE_REPORT_DIR",
+        "PJTEST_REPORT_RETENTION_DAYS",
+        "PJTEST_REPORT_MAINTENANCE_INTERVAL_SEC",
         "PJTEST_RUN_LOG_DIR",
         "PJTEST_SCHEDULER_LOG_ROOT",
         "PJTEST_SCHEDULER_DEBUG",
@@ -200,7 +296,7 @@ def check_configuration():
             print(f"  {var}={val}")
 
     print("\nCheck complete.")
-# ======================== 结束新增部分 ========================
+# ====================== End configuration check ======================
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -213,7 +309,7 @@ def get_conn():
     """Create a SQLite connection with runtime pragmas."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=60)
+    conn = sqlite3.connect(str(DB_PATH), timeout=DB_CONNECT_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=%d" % SQLITE_BUSY_TIMEOUT_MS)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -224,7 +320,7 @@ def init_database_pragmas():
     """Initialize SQLite database mode once at scheduler startup."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=60)
+    conn = sqlite3.connect(str(DB_PATH), timeout=DB_CONNECT_TIMEOUT_SEC)
     try:
         conn.execute("PRAGMA busy_timeout=%d" % SQLITE_BUSY_TIMEOUT_MS)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -684,13 +780,13 @@ def refresh_one_task_status(cur, task_id):
             "task_status_changed",
             "%s -> %s" % (old_status, new_status),
         )
-        return True  # 状态发生了变化
+        return True  # The task status changed.
 
     return False
 
 
 def refresh_all_task_statuses(cur):
-    """Refresh all non-terminal parent tasks."""
+    """Refresh all non-terminal parent tasks and return changed task ids."""
     cur.execute(
         """
         SELECT task_id
@@ -701,12 +797,12 @@ def refresh_all_task_statuses(cur):
     )
     rows = cur.fetchall()
 
-    changed = 0
+    changed_task_ids = []
     for row in rows:
         if refresh_one_task_status(cur, row["task_id"]):
-            changed += 1
+            changed_task_ids.append(row["task_id"])
 
-    return changed
+    return changed_task_ids
 
 
 def resolve_task_build(cur, task_row):
@@ -767,6 +863,72 @@ def resolve_task_build(cur, task_row):
         ),
     )
     return str(revision), fixed_zip, None
+
+
+def select_existing_assignment(cur, worker_name):
+    """Return an unfinished assignment already owned by this worker.
+
+    A pull response can be lost after SQLite commits the assignment. Returning
+    the same attempt on the next pull makes task claiming idempotent and
+    prevents one worker from accumulating multiple running examples.
+    """
+    cur.execute(
+        """
+        SELECT
+            e.example_id AS example_id,
+            e.task_id AS task_id,
+            e.seq AS seq,
+            e.platform AS platform,
+            e.target_arg AS target_arg,
+            e.run_tcl_path AS run_tcl_path,
+            e.cmd AS cmd,
+            e.retry_count AS retry_count,
+            e.max_retry AS example_max_retry,
+
+            t.task_name AS task_name,
+            t.template_name AS template_name,
+            t.revision AS revision,
+            t.revision_policy AS revision_policy,
+            t.resolved_zip_path AS resolved_zip_path,
+            t.suite AS suite,
+            t.target_worker AS target_worker,
+            t.priority AS priority,
+            t.max_retry AS task_max_retry,
+            t.max_time AS max_time,
+            t.work_root AS work_root,
+            t.target_dir AS target_dir,
+            t.flow_config_json AS flow_config_json,
+
+            a.attempt_id AS existing_attempt_id,
+            a.attempt_no AS existing_attempt_no,
+            a.revision AS attempt_revision,
+            a.zip_path AS attempt_zip_path,
+
+            CASE
+                WHEN w.current_task_id = e.task_id
+                 AND w.current_example_id = e.example_id
+                 AND w.current_attempt_id = e.current_attempt_id
+                THEN 0
+                ELSE 1
+            END AS assignment_rank
+        FROM task_examples e
+        JOIN tasks t
+            ON t.task_id = e.task_id
+        JOIN task_attempts a
+            ON a.attempt_id = e.current_attempt_id
+           AND a.example_id = e.example_id
+        LEFT JOIN workers w
+            ON w.worker_name = ?
+        WHERE e.status = 'running'
+          AND e.assigned_worker = ?
+          AND a.status = 'running'
+          AND t.status IN ('pending', 'running', 'canceling')
+        ORDER BY assignment_rank ASC, e.started_at ASC, e.id ASC
+        LIMIT 1
+        """,
+        (worker_name, worker_name),
+    )
+    return cur.fetchone()
 
 
 def select_pending_example(cur, worker_name):
@@ -857,13 +1019,66 @@ def build_example_payload(row, revision, zip_path, attempt_id, attempt_no):
 
 
 def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None):
-    """Claim one pending example and return worker payload without retry."""
+    """Claim one pending example or recover the existing assignment."""
     conn = get_conn()
     cur = conn.cursor()
     now = local_now()
 
     try:
         cur.execute("BEGIN IMMEDIATE")
+
+        existing = select_existing_assignment(cur, worker_name)
+        if existing:
+            attempt_id = existing["existing_attempt_id"]
+            attempt_no = int(existing["existing_attempt_no"] or 1)
+            revision = existing["attempt_revision"] or existing["revision"]
+            zip_path = existing["attempt_zip_path"] or existing["resolved_zip_path"]
+
+            upsert_worker(
+                cur,
+                worker_name=worker_name,
+                hostname=hostname,
+                status="running",
+                task_id=existing["task_id"],
+                example_id=existing["example_id"],
+                attempt_id=attempt_id,
+                capabilities=capabilities,
+                message="recovered existing example %s" % existing["example_id"],
+            )
+
+            insert_event(
+                cur,
+                existing["task_id"],
+                existing["example_id"],
+                attempt_id,
+                worker_name,
+                "example_claim_recovered",
+                "Returned the existing running attempt after a repeated pull",
+            )
+
+            payload = build_example_payload(
+                existing,
+                revision,
+                zip_path,
+                attempt_id,
+                attempt_no,
+            )
+            conn.commit()
+            enqueue_share_report(existing["task_id"])
+
+            log_scheduler(
+                "WARN",
+                "pull recovered worker=%s task=%s example=%s attempt=%s target=%s"
+                % (
+                    worker_name,
+                    existing["task_id"],
+                    existing["example_id"],
+                    attempt_id,
+                    payload["target_arg"],
+                ),
+                task_id=existing["task_id"],
+            )
+            return payload, "recovered existing assignment"
 
         upsert_worker(
             cur,
@@ -1016,7 +1231,6 @@ def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None
         )
 
         payload = build_example_payload(row, revision, zip_path, attempt_id, attempt_no)
-        report_task_id = row["task_id"]
         log_scheduler(
             "INFO",
             "pull assigned worker=%s task=%s example=%s attempt=%s seq=%s revision=%s target=%s"
@@ -1032,8 +1246,7 @@ def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None
             task_id=row["task_id"],
         )
         conn.commit()
-        # 任务拉取时刷新报告（可能任务状态变为 running）
-        write_share_reports_for_task(report_task_id)
+        enqueue_share_report(row["task_id"])
         return payload, None
 
     except Exception:
@@ -1042,7 +1255,6 @@ def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None
 
     finally:
         conn.close()
-
 
 def claim_example_for_worker(worker_name, hostname=None, capabilities=None):
     """Claim one pending example and return worker payload with DB lock retry."""
@@ -1301,8 +1513,8 @@ def _finish_attempt_once(data):
 
         refresh_one_task_status(cur, task_id)
         conn.commit()
-        # 每次报告后刷新共享报告
-        write_share_reports_for_task(task_id)
+        # Queue a non-blocking report refresh after the transaction commits.
+        enqueue_share_report(task_id)
 
         log_scheduler(
             "INFO",
@@ -1347,26 +1559,34 @@ def finish_attempt(data):
     )
 
 
-def requeue_or_fail_stale_example(cur, worker_name, example):
-    """Requeue or fail one example that was owned by a stale worker."""
+def requeue_or_fail_stale_example(
+    cur,
+    worker_name,
+    example,
+    reason,
+    detail,
+):
+    """Requeue or fail one running example whose assignment was lost."""
     now = local_now()
     retry_count = int(example["retry_count"] or 0)
     max_retry = int(example["max_retry"] or 0)
     attempt_id = example["current_attempt_id"]
+    attempt_status = "assignment_lost" if reason == "assignment_superseded" else "worker_lost"
 
     if attempt_id:
         cur.execute(
             """
             UPDATE task_attempts
-            SET status = 'worker_lost',
+            SET status = ?,
                 finished_at = ?,
                 message = ?
             WHERE attempt_id = ?
               AND status = 'running'
             """,
             (
+                attempt_status,
                 now,
-                "worker heartbeat timeout",
+                detail,
                 attempt_id,
             ),
         )
@@ -1383,19 +1603,27 @@ def requeue_or_fail_stale_example(cur, worker_name, example):
                 updated_at = ?,
                 started_at = NULL,
                 finished_at = NULL,
-                failed_reason = 'worker_offline',
+                exit_code = NULL,
+                failed_step = 'scheduler_reconcile',
+                failed_reason = ?,
                 message = ?
             WHERE example_id = ?
+              AND status = 'running'
             """,
             (
                 new_retry_count,
                 now,
-                "requeued because worker %s became offline" % worker_name,
+                reason,
+                "%s; requeued retry=%d/%d" % (
+                    detail,
+                    new_retry_count,
+                    max_retry,
+                ),
                 example["example_id"],
             ),
         )
         event_name = "example_requeued"
-        message = "Worker offline. retry=%d/%d" % (new_retry_count, max_retry)
+        message = "%s. retry=%d/%d" % (detail, new_retry_count, max_retry)
     else:
         cur.execute(
             """
@@ -1404,20 +1632,27 @@ def requeue_or_fail_stale_example(cur, worker_name, example):
                 assigned_worker = ?,
                 updated_at = ?,
                 finished_at = ?,
-                failed_reason = 'worker_offline',
+                exit_code = NULL,
+                failed_step = 'scheduler_reconcile',
+                failed_reason = ?,
                 message = ?
             WHERE example_id = ?
+              AND status = 'running'
             """,
             (
                 worker_name,
                 now,
                 now,
-                "failed because worker %s became offline and retry limit reached" % worker_name,
+                reason,
+                "%s; retry limit reached" % detail,
                 example["example_id"],
             ),
         )
         event_name = "example_failed"
-        message = "Worker offline and retry limit reached."
+        message = "%s. retry limit reached." % detail
+
+    if cur.rowcount != 1:
+        return False
 
     insert_event(
         cur,
@@ -1428,7 +1663,7 @@ def requeue_or_fail_stale_example(cur, worker_name, example):
         event_name,
         message,
     )
-
+    return True
 
 def atomic_write_text(path, text):
     """Write a text file atomically using a unique temporary file."""
@@ -1518,9 +1753,9 @@ def get_task_report_data(task_id):
             FROM task_attempts
             WHERE task_id = ?
             ORDER BY id DESC
-            LIMIT 200
+            LIMIT ?
             """,
-            (task_id,),
+            (task_id, REPORT_RECENT_ATTEMPT_LIMIT),
         )
         attempt_rows = cur.fetchall()
 
@@ -1737,16 +1972,287 @@ def sanitize_report_component(value, default_value="unknown"):
     return text or default_value
 
 
-def get_report_revision_dir(report):
-    """Return the revision directory name used below REPORT_ROOT."""
-    task = report["task"]
-    revision = task.get("revision")
-    revision_display = task.get("revision_display") or revision
+def get_task_field(task, key, default=None):
+    """Return one task field from a dict or sqlite row."""
+    try:
+        value = task[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
 
+
+def get_task_revision_dir(task):
+    """Return the revision directory name for one task mapping."""
+    revision = get_task_field(task, "revision")
     if revision and re.match(r"^\d+$", str(revision)):
         return "r%s" % revision
 
+    revision_display = get_task_field(task, "revision_display")
+    if not revision_display:
+        policy = get_task_field(task, "revision_policy", "fixed")
+        if policy == "latest":
+            revision_display = "latest"
+        else:
+            revision_display = revision
+
     return sanitize_report_component(revision_display, "unknown_revision")
+
+
+def get_report_revision_dir(report):
+    """Return the revision directory name used below REPORT_ROOT."""
+    return get_task_revision_dir(report["task"])
+
+
+def get_task_report_dir_name(task):
+    """Return a readable report directory name such as place_task_xxx."""
+    template_name = (
+        get_task_field(task, "template_name")
+        or get_task_field(task, "task_name")
+        or "task"
+    )
+    task_id = get_task_field(task, "task_id", "unknown_task")
+    return "%s_%s" % (
+        sanitize_report_component(template_name, "task"),
+        sanitize_report_component(task_id, "unknown_task"),
+    )
+
+
+def get_report_cutoff_date():
+    """Return the oldest calendar date kept in the active report tree."""
+    return datetime.now().date() - timedelta(days=REPORT_RETENTION_DAYS - 1)
+
+
+def should_archive_task_report(task):
+    """Return True when a terminal task is older than the retention window."""
+    status = get_task_field(task, "status")
+    if status not in TERMINAL_TASK_STATUSES:
+        return False
+
+    created_at = get_task_field(task, "created_at")
+    try:
+        created_time = parse_local_time(created_at)
+    except Exception:
+        return False
+
+    return bool(created_time and created_time.date() < get_report_cutoff_date())
+
+
+def get_task_report_directory(report_root, task):
+    """Return the active or archived report directory for one task."""
+    revision_dir = get_task_revision_dir(task)
+    task_dir_name = get_task_report_dir_name(task)
+
+    if should_archive_task_report(task):
+        return Path(report_root) / REPORT_OLD_DIR_NAME / revision_dir / task_dir_name
+
+    return Path(report_root) / revision_dir / task_dir_name
+
+
+def move_report_tree(source, destination):
+    """Move a report directory while preserving files already at destination."""
+    source = Path(source)
+    destination = Path(destination)
+
+    if not source.exists() or source == destination:
+        return False
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        shutil.move(str(source), str(destination))
+        return True
+
+    if source.is_dir() and destination.is_dir():
+        for child in source.iterdir():
+            target = destination / child.name
+            if child.is_dir() and target.is_dir():
+                move_report_tree(child, target)
+            else:
+                if target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                shutil.move(str(child), str(target))
+        try:
+            source.rmdir()
+        except OSError:
+            pass
+        return True
+
+    if destination.is_dir():
+        shutil.rmtree(str(destination))
+    else:
+        destination.unlink()
+    shutil.move(str(source), str(destination))
+    return True
+
+
+def prepare_task_report_directory(report_root, task):
+    """Normalize legacy names and place one task in active or Old storage."""
+    report_root = Path(report_root)
+    revision_dir = get_task_revision_dir(task)
+    task_id = str(get_task_field(task, "task_id", "unknown_task"))
+    task_dir_name = get_task_report_dir_name(task)
+
+    active_base = report_root / revision_dir
+    old_base = report_root / REPORT_OLD_DIR_NAME / revision_dir
+    target_dir = get_task_report_directory(report_root, task)
+
+    candidates = [
+        active_base / task_id,
+        old_base / task_id,
+        active_base / task_dir_name,
+        old_base / task_dir_name,
+    ]
+
+    for candidate in candidates:
+        if candidate != target_dir and candidate.exists():
+            move_report_tree(candidate, target_dir)
+
+    return target_dir
+
+
+def cleanup_empty_report_directories(report_root):
+    """Remove empty revision directories without touching Old or Summary."""
+    report_root = Path(report_root)
+    if not report_root.is_dir():
+        return
+
+    for child in report_root.iterdir():
+        if child.name in (REPORT_OLD_DIR_NAME, REPORT_SUMMARY_DIR_NAME):
+            continue
+        if child.is_dir():
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+
+    old_root = report_root / REPORT_OLD_DIR_NAME
+    if old_root.is_dir():
+        for child in old_root.iterdir():
+            if child.is_dir():
+                try:
+                    child.rmdir()
+                except OSError:
+                    pass
+
+
+def maintain_report_directories(report_root=REPORT_ROOT):
+    """Normalize task directories and archive terminal tasks older than ten days."""
+    report_root = Path(report_root)
+    report_root.mkdir(parents=True, exist_ok=True)
+    (report_root / REPORT_OLD_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (report_root / REPORT_SUMMARY_DIR_NAME).mkdir(parents=True, exist_ok=True)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    moved = 0
+    try:
+        cur.execute(
+            """
+            SELECT task_id, task_name, template_name, revision,
+                   revision_policy, status, created_at
+            FROM tasks
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        task = row_to_dict(row)
+        before = []
+        revision_dir = get_task_revision_dir(task)
+        task_id = str(task["task_id"])
+        task_dir_name = get_task_report_dir_name(task)
+        before.extend([
+            report_root / revision_dir / task_id,
+            report_root / REPORT_OLD_DIR_NAME / revision_dir / task_id,
+            report_root / revision_dir / task_dir_name,
+            report_root / REPORT_OLD_DIR_NAME / revision_dir / task_dir_name,
+        ])
+        existing_before = set(str(path) for path in before if path.exists())
+        target = prepare_task_report_directory(report_root, task)
+        if existing_before and str(target) not in existing_before:
+            moved += 1
+
+    cleanup_empty_report_directories(report_root)
+    return moved
+
+
+def get_task_elapsed(task, generated_at=None):
+    """Return task elapsed seconds and a readable duration string."""
+    started_at = get_task_field(task, "started_at")
+    if not started_at:
+        return None, "-"
+
+    try:
+        start_time = parse_local_time(started_at)
+        end_text = get_task_field(task, "finished_at") or generated_at
+        end_time = parse_local_time(end_text) if end_text else datetime.now()
+    except Exception:
+        return None, "-"
+
+    elapsed_seconds = max(0, int((end_time - start_time).total_seconds()))
+    days, remainder = divmod(elapsed_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days:
+        elapsed_text = "%dd %02d:%02d:%02d" % (days, hours, minutes, seconds)
+    else:
+        elapsed_text = "%02d:%02d:%02d" % (hours, minutes, seconds)
+
+    return elapsed_seconds, elapsed_text
+
+
+def is_latest_template_task(task):
+    """Return True when this task is the newest task for its template."""
+    template_name = get_task_field(task, "template_name")
+    task_id = get_task_field(task, "task_id")
+    if not template_name or not task_id:
+        return False
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT task_id
+            FROM tasks
+            WHERE template_name = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (template_name,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    return bool(row and row["task_id"] == task_id)
+
+
+def write_latest_template_summary(report, report_root=REPORT_ROOT):
+    """Overwrite the latest stat_summary file for one template."""
+    task = report["task"]
+    if not is_latest_template_task(task):
+        return False
+
+    template_name = sanitize_report_component(
+        get_task_field(task, "template_name")
+        or get_task_field(task, "task_name")
+        or "task",
+        "task",
+    )
+    summary_path = (
+        Path(report_root)
+        / REPORT_SUMMARY_DIR_NAME
+        / ("%s_stat_summary" % template_name)
+    )
+    atomic_write_text(summary_path, build_stat_summary_text(report))
+    return True
 
 
 def clean_report_text(value):
@@ -1765,6 +2271,10 @@ def build_stat_summary_text(report):
     """Build stat_summary content for one task."""
     task = report["task"]
     summary = report["summary"]
+    elapsed_seconds, elapsed_time = get_task_elapsed(
+        task,
+        generated_at=report.get("generated_at"),
+    )
 
     lines = [
         "generated_at     %s" % report["generated_at"],
@@ -1786,6 +2296,8 @@ def build_stat_summary_text(report):
         "updated_at       %s" % (task["updated_at"] or ""),
         "started_at       %s" % (task["started_at"] or ""),
         "finished_at      %s" % (task["finished_at"] or ""),
+        "elapsed_seconds  %s" % (elapsed_seconds if elapsed_seconds is not None else "-"),
+        "elapsed_time     %s" % elapsed_time,
         "message          %s" % clean_report_text(task["message"]),
         "",
     ]
@@ -1804,10 +2316,8 @@ def build_status_list_text(report, status):
 
 
 def get_task_report_paths(report):
-    """Return final task report paths under reports/<revision>/<task_id>."""
-    task = report["task"]
-    revision_dir = get_report_revision_dir(report)
-    task_dir = REPORT_ROOT / revision_dir / str(task["task_id"])
+    """Return final paths under active Reports or Reports/Old."""
+    task_dir = get_task_report_directory(REPORT_ROOT, report["task"])
     return {
         "task_dir": task_dir,
         "stat_summary": task_dir / "stat_summary",
@@ -1818,11 +2328,12 @@ def get_task_report_paths(report):
 
 
 def write_task_share_reports(task_id):
-    """Write final task report files to reports/<revision>/<task_id>."""
+    """Write task files and overwrite the latest template summary."""
     report = get_task_report_data(task_id)
     if not report:
         return False
 
+    prepare_task_report_directory(REPORT_ROOT, report["task"])
     paths = get_task_report_paths(report)
     files = {
         "stat_summary": build_stat_summary_text(report),
@@ -1834,6 +2345,7 @@ def write_task_share_reports(task_id):
     for name, content in files.items():
         atomic_write_text(paths[name], content)
 
+    write_latest_template_summary(report, REPORT_ROOT)
     return True
 
 
@@ -1842,7 +2354,7 @@ def copy_task_reports_to_run_log(task_id, report=None):
     只有当 task 同时满足“终态”和“统计强一致”时，才执行拷贝。
     作用层级：动作层（defensive gate），不影响状态机层。
     """
-    # 1. 如果没有传入 report，从数据库重新读取（确保获取最新快照）
+    # Reload the latest database snapshot when no report was supplied.
     if report is None:
         report = get_task_report_data(task_id)
         if not report:
@@ -1852,12 +2364,17 @@ def copy_task_reports_to_run_log(task_id, report=None):
     task_status = report["task"]["status"]
     summary = report["summary"]
 
-    # 2. 终态检查（状态机层已经保证，但这里作为第一道门）
+    # Require a terminal task state before copying.
     if task_status not in TERMINAL_TASK_STATUSES:
-        log_scheduler("DEBUG", "task not terminal, skip run_log copy: %s" % task_status, task_id=task_id)
+        if SCHEDULER_DEBUG:
+            log_scheduler(
+                "DEBUG",
+                "task not terminal, skip run_log copy: %s" % task_status,
+                task_id=task_id,
+            )
         return False
 
-    # 3. 强一致性校验（分布式防御层，关键新增）
+    # Require aggregate counters to be fully consistent.
     if not (summary["done"] == summary["total"] and
             summary["running"] == 0 and
             summary["pending"] == 0):
@@ -1870,7 +2387,7 @@ def copy_task_reports_to_run_log(task_id, report=None):
         )
         return False
 
-    # 4. 获取源目录和目标目录
+    # Resolve source and destination directories.
     paths = get_task_report_paths(report)
     src_dir = paths["task_dir"]
     if not src_dir.exists():
@@ -1880,12 +2397,12 @@ def copy_task_reports_to_run_log(task_id, report=None):
     revision_dir = get_report_revision_dir(report)
     dst_dir = RUN_LOG_DIR / revision_dir / str(task_id)
 
-    # 5. 如果目标已存在，跳过（幂等性）
+    # Keep the copy operation idempotent.
     if dst_dir.exists():
         log_scheduler("INFO", "run_log already exists, skip: %s" % dst_dir, task_id=task_id)
         return True
 
-    # 6. 执行拷贝
+    # Copy the completed report tree.
     try:
         RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src_dir, dst_dir, symlinks=True)
@@ -1897,6 +2414,31 @@ def copy_task_reports_to_run_log(task_id, report=None):
 
 
 REPORT_WRITE_LOCK = threading.Lock()
+REPORT_QUEUE = queue.Queue()
+REPORT_QUEUE_STATE_LOCK = threading.Lock()
+REPORT_QUEUE_PENDING = set()
+REPORT_QUEUE_ACTIVE = set()
+REPORT_QUEUE_DIRTY = set()
+REPORT_MAINTENANCE_LOCK = threading.Lock()
+REPORT_MAINTENANCE_LAST_RUN = 0.0
+
+
+def run_report_maintenance(force=False):
+    """Run report directory maintenance at a bounded frequency."""
+    global REPORT_MAINTENANCE_LAST_RUN
+
+    now = time.time()
+    with REPORT_MAINTENANCE_LOCK:
+        if (
+            not force
+            and now - REPORT_MAINTENANCE_LAST_RUN
+            < REPORT_MAINTENANCE_INTERVAL_SEC
+        ):
+            return 0
+
+        moved = maintain_report_directories(REPORT_ROOT)
+        REPORT_MAINTENANCE_LAST_RUN = now
+        return moved
 
 
 def write_share_reports_for_task(task_id):
@@ -1911,13 +2453,99 @@ def write_share_reports_for_task(task_id):
             task_id=task_id,
             also_stdout=False,
         )
-        # 调用带防御校验的拷贝函数
+        # Copy only when the terminal-state consistency gate passes.
         copy_task_reports_to_run_log(task_id)
+        run_report_maintenance(force=False)
         return ok
     except Exception as exc:
         log_exception("failed to write share reports for %s" % task_id, exc, task_id=task_id)
         return False
 
+
+def enqueue_share_report(task_id):
+    """Queue one coalesced report refresh without blocking an HTTP request."""
+    if not task_id:
+        return False
+
+    task_id = str(task_id)
+    should_queue = False
+
+    with REPORT_QUEUE_STATE_LOCK:
+        if task_id in REPORT_QUEUE_PENDING or task_id in REPORT_QUEUE_ACTIVE:
+            REPORT_QUEUE_DIRTY.add(task_id)
+        else:
+            REPORT_QUEUE_PENDING.add(task_id)
+            should_queue = True
+
+    if should_queue:
+        REPORT_QUEUE.put(task_id)
+
+    return should_queue
+
+
+def enqueue_latest_template_reports():
+    """Queue one report refresh for the newest task of every template."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT t.task_id
+            FROM tasks t
+            JOIN (
+                SELECT template_name, MAX(id) AS max_id
+                FROM tasks
+                WHERE template_name IS NOT NULL
+                  AND template_name != ''
+                GROUP BY template_name
+            ) latest
+                ON latest.max_id = t.id
+            ORDER BY t.id
+            """
+        )
+        task_ids = [row["task_id"] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    for task_id in task_ids:
+        enqueue_share_report(task_id)
+
+    return len(task_ids)
+
+
+def report_writer_loop(stop_event):
+    """Write queued reports outside scheduler HTTP and SQLite transactions."""
+    while True:
+        with REPORT_QUEUE_STATE_LOCK:
+            queue_idle = not REPORT_QUEUE_PENDING and not REPORT_QUEUE_ACTIVE
+
+        if stop_event.is_set() and queue_idle and REPORT_QUEUE.empty():
+            return
+
+        try:
+            task_id = REPORT_QUEUE.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        with REPORT_QUEUE_STATE_LOCK:
+            REPORT_QUEUE_PENDING.discard(task_id)
+            REPORT_QUEUE_ACTIVE.add(task_id)
+
+        try:
+            write_share_reports_for_task(task_id)
+        finally:
+            requeue = False
+            with REPORT_QUEUE_STATE_LOCK:
+                REPORT_QUEUE_ACTIVE.discard(task_id)
+                if task_id in REPORT_QUEUE_DIRTY:
+                    REPORT_QUEUE_DIRTY.discard(task_id)
+                    REPORT_QUEUE_PENDING.add(task_id)
+                    requeue = True
+
+            if requeue:
+                REPORT_QUEUE.put(task_id)
+
+            REPORT_QUEUE.task_done()
 
 def get_tasks_summary_data(limit=200):
     """Build a global summary for all recent tasks."""
@@ -2060,7 +2688,7 @@ def write_global_share_reports():
 
 
 def _reconcile_once_without_retry(worker_timeout):
-    """Mark stale workers offline and refresh task aggregates without retry."""
+    """Recover lost assignments and refresh task aggregates without retry."""
     conn = get_conn()
     cur = conn.cursor()
     threshold = datetime.now() - timedelta(seconds=worker_timeout)
@@ -2075,7 +2703,8 @@ def _reconcile_once_without_retry(worker_timeout):
 
         cur.execute(
             """
-            SELECT worker_name, current_task_id, current_example_id, last_seen_at
+            SELECT worker_name, current_task_id, current_example_id,
+                   current_attempt_id, last_seen_at
             FROM workers
             WHERE status != 'offline'
               AND last_seen_at < ?
@@ -2088,34 +2717,15 @@ def _reconcile_once_without_retry(worker_timeout):
             stale_count += 1
             worker_name = worker["worker_name"]
 
-            if REQUEUE_STALE_RUNNING:
-                cur.execute(
-                    """
-                    SELECT example_id, task_id, retry_count, max_retry, current_attempt_id
-                    FROM task_examples
-                    WHERE assigned_worker = ?
-                      AND status = 'running'
-                    ORDER BY id
-                    """,
-                    (worker_name,),
-                )
-                examples = cur.fetchall()
-
-                for example in examples:
-                    requeue_or_fail_stale_example(cur, worker_name, example)
-                    affected_examples += 1
-                    affected_task_ids.add(example["task_id"])
-                    refresh_one_task_status(cur, example["task_id"])
-            else:
-                insert_event(
-                    cur,
-                    worker["current_task_id"],
-                    worker["current_example_id"],
-                    None,
-                    worker_name,
-                    "worker_stale",
-                    "heartbeat timeout; running examples left unchanged",
-                )
+            insert_event(
+                cur,
+                worker["current_task_id"],
+                worker["current_example_id"],
+                worker["current_attempt_id"],
+                worker_name,
+                "worker_stale",
+                "heartbeat timeout; worker marked offline",
+            )
 
             cur.execute(
                 """
@@ -2135,15 +2745,82 @@ def _reconcile_once_without_retry(worker_timeout):
                 ),
             )
 
-        changed_tasks = refresh_all_task_statuses(cur)
+        if REQUEUE_STALE_RUNNING:
+            cur.execute(
+                """
+                SELECT
+                    e.example_id,
+                    e.task_id,
+                    e.retry_count,
+                    e.max_retry,
+                    e.current_attempt_id,
+                    e.assigned_worker,
+                    w.status AS worker_status,
+                    w.current_task_id AS worker_task_id,
+                    w.current_example_id AS worker_example_id,
+                    w.current_attempt_id AS worker_attempt_id
+                FROM task_examples e
+                LEFT JOIN workers w
+                    ON w.worker_name = e.assigned_worker
+                WHERE e.status = 'running'
+                  AND (
+                      w.worker_name IS NULL
+                      OR w.status = 'offline'
+                      OR (
+                          w.status IN ('running', 'reporting')
+                          AND NOT (
+                              w.current_task_id = e.task_id
+                              AND w.current_example_id = e.example_id
+                              AND w.current_attempt_id = e.current_attempt_id
+                          )
+                      )
+                  )
+                ORDER BY e.id
+                """
+            )
+            lost_examples = cur.fetchall()
+
+            for example in lost_examples:
+                worker_name = example["assigned_worker"] or "unknown"
+                if example["worker_status"] in ("running", "reporting"):
+                    reason = "assignment_superseded"
+                    detail = (
+                        "worker %s moved to task=%s example=%s attempt=%s before reporting this attempt"
+                        % (
+                            worker_name,
+                            example["worker_task_id"] or "-",
+                            example["worker_example_id"] or "-",
+                            example["worker_attempt_id"] or "-",
+                        )
+                    )
+                elif example["worker_status"] == "offline":
+                    reason = "worker_offline"
+                    detail = "worker %s is offline" % worker_name
+                else:
+                    reason = "worker_missing"
+                    detail = "worker record is missing for %s" % worker_name
+
+                if requeue_or_fail_stale_example(
+                    cur,
+                    worker_name,
+                    example,
+                    reason,
+                    detail,
+                ):
+                    affected_examples += 1
+                    affected_task_ids.add(example["task_id"])
+
+        for task_id in sorted(affected_task_ids):
+            refresh_one_task_status(cur, task_id)
+
+        changed_task_ids = set(refresh_all_task_statuses(cur))
         conn.commit()
 
-        for affected_task_id in sorted(affected_task_ids):
-            write_share_reports_for_task(affected_task_id)
-        if changed_tasks and not affected_task_ids:
-            write_global_share_reports()
+        report_task_ids = affected_task_ids | changed_task_ids
+        for task_id in sorted(report_task_ids):
+            enqueue_share_report(task_id)
 
-        return stale_count, affected_examples, changed_tasks
+        return stale_count, affected_examples, len(changed_task_ids)
 
     except Exception:
         conn.rollback()
@@ -2151,7 +2828,6 @@ def _reconcile_once_without_retry(worker_timeout):
 
     finally:
         conn.close()
-
 
 def reconcile_once(worker_timeout):
     """Mark stale workers offline and refresh task aggregates with DB lock retry."""
@@ -2251,6 +2927,10 @@ class SchedulerHandler(BaseHTTPRequestHandler):
 
             if path in ("/api/task/report", "/api/task/update"):
                 self.handle_task_report()
+                return
+
+            if path == "/api/task/refresh-report":
+                self.handle_task_refresh_report()
                 return
 
             self.send_json({"ok": False, "error": "not found"}, status=404)
@@ -2391,12 +3071,35 @@ class SchedulerHandler(BaseHTTPRequestHandler):
         response, status = finish_attempt(data)
         self.send_json(response, status=status)
 
+    def handle_task_refresh_report(self):
+        """Queue a report refresh requested by an administrative tool."""
+        data = read_json(self)
+        task_id = data.get("task_id")
+        if not task_id:
+            self.send_json({"ok": False, "error": "missing task_id"}, status=400)
+            return
+
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1 FROM tasks WHERE task_id = ?", (task_id,))
+            exists = cur.fetchone() is not None
+        finally:
+            conn.close()
+
+        if not exists:
+            self.send_json({"ok": False, "error": "task not found"}, status=404)
+            return
+
+        queued = enqueue_share_report(task_id)
+        self.send_json({"ok": True, "task_id": task_id, "queued": queued})
+
     def handle_list_tasks(self, parsed):
         """List parent tasks as JSON."""
         query = parse_qs(parsed.query)
         status = query.get("status", [None])[0]
-        limit = int(query.get("limit", [50])[0])
-        limit = max(1, min(limit, 200))
+        limit = int(query.get("limit", [TASK_API_DEFAULT_LIMIT])[0])
+        limit = max(1, min(limit, TASK_API_MAX_LIMIT))
 
         conn = get_conn()
         cur = conn.cursor()
@@ -2450,8 +3153,8 @@ class SchedulerHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         task_id = query.get("task_id", [None])[0]
         status = query.get("status", [None])[0]
-        limit = int(query.get("limit", [500])[0])
-        limit = max(1, min(limit, 2000))
+        limit = int(query.get("limit", [EXAMPLE_API_DEFAULT_LIMIT])[0])
+        limit = max(1, min(limit, EXAMPLE_API_MAX_LIMIT))
 
         conn = get_conn()
         cur = conn.cursor()
@@ -2504,18 +3207,18 @@ class SchedulerHandler(BaseHTTPRequestHandler):
 def build_parser():
     """Build CLI parser."""
     parser = argparse.ArgumentParser(description="PJTest central HTTP scheduler")
-    parser.add_argument("--host", default="0.0.0.0", help="listen host")
-    parser.add_argument("--port", type=int, default=9000, help="listen port")
+    parser.add_argument("--host", default=DEFAULT_SCHEDULER_HOST, help="listen host")
+    parser.add_argument("--port", type=int, default=DEFAULT_SCHEDULER_PORT, help="listen port")
     parser.add_argument(
         "--reconcile-interval",
         type=int,
-        default=10,
+        default=DEFAULT_RECONCILE_INTERVAL,
         help="background reconciliation interval seconds",
     )
     parser.add_argument(
         "--worker-timeout",
         type=int,
-        default=300,
+        default=DEFAULT_WORKER_TIMEOUT,
         help="mark worker offline after this many heartbeat seconds",
     )
     parser.add_argument(
@@ -2530,14 +3233,28 @@ def main():
     """Program entry."""
     args = build_parser().parse_args()
 
-    # 如果指定 --check，仅执行检查并退出
+    # Run the configuration check without starting the HTTP service.
     if args.check:
         check_configuration()
         return 0
 
     init_database_pragmas()
+    try:
+        run_report_maintenance(force=True)
+    except Exception as exc:
+        log_exception("initial report maintenance failed", exc)
+
     server = ThreadingHTTPServer((args.host, args.port), SchedulerHandler)
     stop_event = threading.Event()
+    report_thread = threading.Thread(
+        target=report_writer_loop,
+        args=(stop_event,),
+        name="pjtest-report-writer",
+    )
+    report_thread.daemon = True
+    report_thread.start()
+    enqueue_latest_template_reports()
+
     reconcile_thread = threading.Thread(
         target=reconcile_loop,
         args=(stop_event, args.reconcile_interval, args.worker_timeout),
@@ -2549,6 +3266,15 @@ def main():
     log_scheduler("INFO", "database=%s" % DB_PATH)
     log_scheduler("INFO", "latest_zip_dirs=%s" % ", ".join(str(path) for path in get_zip_dirs()))
     log_scheduler("INFO", "report_root=%s" % REPORT_ROOT)
+    log_scheduler(
+        "INFO",
+        "report_retention_days=%s old_dir=%s summary_dir=%s"
+        % (
+            REPORT_RETENTION_DAYS,
+            REPORT_ROOT / REPORT_OLD_DIR_NAME,
+            REPORT_ROOT / REPORT_SUMMARY_DIR_NAME,
+        ),
+    )
     log_scheduler("INFO", "scheduler_log_root=%s" % SCHEDULER_LOG_ROOT)
     log_scheduler("INFO", "run_log_dir=%s" % RUN_LOG_DIR)
     print("Press Ctrl+C to stop.")
@@ -2561,6 +3287,8 @@ def main():
     finally:
         stop_event.set()
         server.server_close()
+        reconcile_thread.join(timeout=5)
+        report_thread.join(timeout=10)
         log_scheduler("INFO", "scheduler server closed")
 
     return 0

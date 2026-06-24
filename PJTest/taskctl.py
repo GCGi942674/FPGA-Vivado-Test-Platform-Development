@@ -19,80 +19,95 @@ Usage:
     ./taskctl.py delete <task_id> [--force]
 """
 
-import yaml  # 新增
+import yaml
 import argparse
 import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from config import (
+    CONFIG_FILE,
+    get_int,
+    get_list,
+    get_path,
+    get_path_list,
+    get_section,
+    get_value,
+)
+
 try:
-    from urllib.request import urlopen
+    from urllib.request import Request, urlopen
     from urllib.error import HTTPError, URLError
 except ImportError:  # pragma: no cover, Python 2 fallback is not expected.
-    from urllib2 import urlopen, HTTPError, URLError
+    from urllib2 import Request, urlopen, HTTPError, URLError
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get(
-    "PJTEST_DB_PATH",
-    "/home/user3/PJTest/data/task_queue.db",
-))
-TEMPLATE_DIR = Path(os.environ.get(
-    "PJTEST_TEMPLATE_DIR",
-    str(BASE_DIR / "templates"),
-))
+DB_PATH = get_path(
+    "paths",
+    "database",
+    env_name="PJTEST_DB_PATH",
+)
+TEMPLATE_DIR = get_path(
+    "paths",
+    "template_dir",
+    env_name="PJTEST_TEMPLATE_DIR",
+)
 
-DEFAULT_WORK_ROOT = "/home/user3/workspace/galaxcore/test2"
+DEFAULT_WORK_ROOT = get_value(
+    "paths",
+    "default_work_root",
+)
+DEFAULT_TARGET_DIR = get_value("task_defaults", "target_dir")
+DEFAULT_SUITE = get_value("task_defaults", "suite")
+DEFAULT_PRIORITY = get_int("task_defaults", "priority")
+DEFAULT_MAX_RETRY = get_int("task_defaults", "max_retry", minimum=0)
+DEFAULT_MAX_TIME = get_int("task_defaults", "max_time_sec", minimum=1)
+DEFAULT_LIST_LIMIT = get_int("task_defaults", "list_limit", minimum=1)
+DEFAULT_SHOW_LIMIT = get_int("task_defaults", "show_limit", minimum=1)
 
-IGNORED_DIRS = {
-    ".git",
-    ".svn",
-    "__pycache__",
-    "output",
-    "outputs",
-    "result",
-    "results",
-    "report",
-    "reports",
-    "log",
-    "logs",
-}
-
-DEFAULT_FLOW_CONFIG = {
-    "report_timing_summary": 0,
-    "opt_design": 0,
-    "place_design": 1,
-    "place_design_from_syn": 0,
-    "phys_opt_design": 0,
-    "route_design": 1,
-    "route_design_from_place": 0,
-    "write_checkpoint": 0,
-    "write_bitstream": 1,
-    "bit_cmp": 1,
-    "msk_cmp": 1,
-    "bgn_cmp": 1,
-    "dcp_cmp": 0,
-    "checksum_cmp": 0,
-    "enable_copy": 1,
-}
-
+IGNORED_DIRS = set(get_list("scan", "ignored_dirs"))
+DEFAULT_FLOW_CONFIG = dict(
+    (key, int(value))
+    for key, value in get_section("flow_config").items()
+)
 
 TERMINAL_EXAMPLE_STATUSES = set(["success", "failed", "timeout", "canceled"])
 TERMINAL_TASK_STATUSES = set(["success", "failed", "canceled"])
-SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("PJTEST_SQLITE_BUSY_TIMEOUT_MS", "60000"))
-
+DB_CONNECT_TIMEOUT_SEC = get_int(
+    "database",
+    "connect_timeout_sec",
+    minimum=1,
+)
+SQLITE_BUSY_TIMEOUT_MS = get_int(
+    "database",
+    "busy_timeout_ms",
+    env_name="PJTEST_SQLITE_BUSY_TIMEOUT_MS",
+    minimum=1,
+)
+ADMIN_REQUEST_TIMEOUT_SEC = get_int(
+    "http",
+    "admin_request_timeout_sec",
+    minimum=1,
+)
+HEALTH_CHECK_TIMEOUT_SEC = get_int(
+    "http",
+    "health_check_timeout_sec",
+    minimum=1,
+)
 
 def get_conn():
     """Create a SQLite connection with runtime pragmas."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=60)
+    conn = sqlite3.connect(str(DB_PATH), timeout=DB_CONNECT_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=%d" % SQLITE_BUSY_TIMEOUT_MS)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -500,13 +515,13 @@ def insert_task_and_examples(
 def cmd_add(args):
     """Create one parent task and split it into examples."""
     template_name, template = load_template(args.template_name)
-    target_dir = args.target_dir or "."
+    target_dir = args.target_dir or DEFAULT_TARGET_DIR
 
     work_root = template.get("work_root", DEFAULT_WORK_ROOT)
-    suite = template.get("suite", "night_build")
-    priority = get_int_value(args.priority, template, "priority", 100)
-    max_retry = get_int_value(args.max_retry, template, "max_retry", 1)
-    max_time = get_int_value(args.max_time, template, "max_time", 3600)
+    suite = template.get("suite", DEFAULT_SUITE)
+    priority = get_int_value(args.priority, template, "priority", DEFAULT_PRIORITY)
+    max_retry = get_int_value(args.max_retry, template, "max_retry", DEFAULT_MAX_RETRY)
+    max_time = get_int_value(args.max_time, template, "max_time", DEFAULT_MAX_TIME)
 
     task_name = args.name or template.get("task_name") or template_name
     revision_policy, revision = parse_revision_arg(args.revision)
@@ -966,10 +981,19 @@ def cmd_delete(args):
 
 
 
-SHARE_REPORT_DIR = Path(os.environ.get(
-    "PJTEST_SHARE_REPORT_DIR",
-    "/home/xshare/zw_cache/distributed_test_system/reports",
-))
+SHARE_REPORT_DIR = get_path(
+    "paths",
+    "report_root",
+    env_name="PJTEST_SHARE_REPORT_DIR",
+)
+REPORT_RETENTION_DAYS = get_int(
+    "reports",
+    "retention_days",
+    env_name="PJTEST_REPORT_RETENTION_DAYS",
+    minimum=1,
+)
+REPORT_OLD_DIR_NAME = get_value("reports", "old_dir_name")
+REPORT_SUMMARY_DIR_NAME = get_value("reports", "summary_dir_name")
 
 
 def resolve_task_id(conn, task_id=None):
@@ -1384,7 +1408,7 @@ def cmd_show(args):
     done = counts["done_count"]
     flow_config = json_loads_dict(task["flow_config_json"])
     report_root = SHARE_REPORT_DIR
-    report_dir = report_root / report_revision_dir(task) / task_id
+    report_dir = get_task_report_directory(report_root, task)
 
     print_key_value(
         "Task Detail",
@@ -1619,6 +1643,7 @@ def build_stat_summary(task, counts, workers):
     """Build stat_summary file content."""
     total = counts["total"]
     done = counts["done_count"]
+    elapsed_seconds, elapsed_time = get_task_elapsed(task)
 
     lines = [
         "task_id          %s" % task["task_id"],
@@ -1637,10 +1662,12 @@ def build_stat_summary(task, counts, workers):
         "progress         %s" % progress_text(done, total),
         "workers          %s" % workers,
         "created_at       %s" % task["created_at"],
+        "updated_at       %s" % (task["updated_at"] or ""),
+        "started_at       %s" % (task["started_at"] or ""),
+        "finished_at      %s" % (task["finished_at"] or ""),
+        "elapsed_seconds  %s" % (elapsed_seconds if elapsed_seconds is not None else "-"),
+        "elapsed_time     %s" % elapsed_time,
     ]
-
-    if "updated_at" in task.keys():
-        lines.append("updated_at       %s" % task["updated_at"])
 
     lines.append("")
     return "\n".join(lines)
@@ -1707,13 +1734,261 @@ def report_revision_dir(task):
     return sanitize_report_component(revision_text, "unknown_revision")
 
 
+def get_task_field(task, key, default=None):
+    """Return one task field from a dict or sqlite row."""
+    try:
+        value = task[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def get_task_report_dir_name(task):
+    """Return a readable report directory name such as place_task_xxx."""
+    template_name = (
+        get_task_field(task, "template_name")
+        or get_task_field(task, "task_name")
+        or "task"
+    )
+    task_id = get_task_field(task, "task_id", "unknown_task")
+    return "%s_%s" % (
+        sanitize_report_component(template_name, "task"),
+        sanitize_report_component(task_id, "unknown_task"),
+    )
+
+
+def parse_report_time(value):
+    """Parse a task timestamp stored by PJTest."""
+    if not value:
+        return None
+    return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+
+
+def get_report_cutoff_date():
+    """Return the oldest calendar date kept in the active report tree."""
+    return datetime.now().date() - timedelta(days=REPORT_RETENTION_DAYS - 1)
+
+
+def should_archive_task_report(task):
+    """Return True when a terminal task is older than the retention window."""
+    if get_task_field(task, "status") not in TERMINAL_TASK_STATUSES:
+        return False
+
+    try:
+        created_time = parse_report_time(get_task_field(task, "created_at"))
+    except Exception:
+        return False
+
+    return bool(created_time and created_time.date() < get_report_cutoff_date())
+
+
+def get_task_report_directory(report_root, task):
+    """Return the active or archived report directory for one task."""
+    revision_dir = report_revision_dir(task)
+    task_dir_name = get_task_report_dir_name(task)
+
+    if should_archive_task_report(task):
+        return Path(report_root) / REPORT_OLD_DIR_NAME / revision_dir / task_dir_name
+
+    return Path(report_root) / revision_dir / task_dir_name
+
+
+def move_report_tree(source, destination):
+    """Move a report directory while preserving files already at destination."""
+    source = Path(source)
+    destination = Path(destination)
+
+    if not source.exists() or source == destination:
+        return False
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        shutil.move(str(source), str(destination))
+        return True
+
+    if source.is_dir() and destination.is_dir():
+        for child in source.iterdir():
+            target = destination / child.name
+            if child.is_dir() and target.is_dir():
+                move_report_tree(child, target)
+            else:
+                if target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    else:
+                        target.unlink()
+                shutil.move(str(child), str(target))
+        try:
+            source.rmdir()
+        except OSError:
+            pass
+        return True
+
+    if destination.is_dir():
+        shutil.rmtree(str(destination))
+    else:
+        destination.unlink()
+    shutil.move(str(source), str(destination))
+    return True
+
+
+def prepare_task_report_directory(report_root, task):
+    """Normalize legacy names and place one task in active or Old storage."""
+    report_root = Path(report_root)
+    revision_dir = report_revision_dir(task)
+    task_id = str(get_task_field(task, "task_id", "unknown_task"))
+    task_dir_name = get_task_report_dir_name(task)
+
+    active_base = report_root / revision_dir
+    old_base = report_root / REPORT_OLD_DIR_NAME / revision_dir
+    target_dir = get_task_report_directory(report_root, task)
+
+    candidates = [
+        active_base / task_id,
+        old_base / task_id,
+        active_base / task_dir_name,
+        old_base / task_dir_name,
+    ]
+    for candidate in candidates:
+        if candidate != target_dir and candidate.exists():
+            move_report_tree(candidate, target_dir)
+
+    return target_dir
+
+
+def cleanup_empty_report_directories(report_root):
+    """Remove empty revision directories without touching Old or Summary."""
+    report_root = Path(report_root)
+    if not report_root.is_dir():
+        return
+
+    for child in report_root.iterdir():
+        if child.name in (REPORT_OLD_DIR_NAME, REPORT_SUMMARY_DIR_NAME):
+            continue
+        if child.is_dir():
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+
+    old_root = report_root / REPORT_OLD_DIR_NAME
+    if old_root.is_dir():
+        for child in old_root.iterdir():
+            if child.is_dir():
+                try:
+                    child.rmdir()
+                except OSError:
+                    pass
+
+
+def maintain_report_directories(report_root):
+    """Normalize names and archive terminal reports outside the retention window."""
+    report_root = Path(report_root)
+    report_root.mkdir(parents=True, exist_ok=True)
+    (report_root / REPORT_OLD_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (report_root / REPORT_SUMMARY_DIR_NAME).mkdir(parents=True, exist_ok=True)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT task_id, task_name, template_name, revision,
+                   revision_policy, status, created_at
+            FROM tasks
+            ORDER BY id ASC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    for task in rows:
+        prepare_task_report_directory(report_root, task)
+
+    cleanup_empty_report_directories(report_root)
+
+
+def get_task_elapsed(task):
+    """Return task elapsed seconds and a readable duration string."""
+    started_at = get_task_field(task, "started_at")
+    if not started_at:
+        return None, "-"
+
+    try:
+        start_time = parse_report_time(started_at)
+        end_time = parse_report_time(get_task_field(task, "finished_at"))
+        if end_time is None:
+            end_time = datetime.now()
+    except Exception:
+        return None, "-"
+
+    elapsed_seconds = max(0, int((end_time - start_time).total_seconds()))
+    days, remainder = divmod(elapsed_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days:
+        elapsed_text = "%dd %02d:%02d:%02d" % (days, hours, minutes, seconds)
+    else:
+        elapsed_text = "%02d:%02d:%02d" % (hours, minutes, seconds)
+
+    return elapsed_seconds, elapsed_text
+
+
+def is_latest_template_task(task):
+    """Return True when this task is the newest task for its template."""
+    template_name = get_task_field(task, "template_name")
+    task_id = get_task_field(task, "task_id")
+    if not template_name or not task_id:
+        return False
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT task_id
+            FROM tasks
+            WHERE template_name = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (template_name,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    return bool(row and row["task_id"] == task_id)
+
+
+def write_latest_template_summary(report_root, task, content):
+    """Overwrite the latest stat_summary file for one template."""
+    if not is_latest_template_task(task):
+        return False
+
+    template_name = sanitize_report_component(
+        get_task_field(task, "template_name")
+        or get_task_field(task, "task_name")
+        or "task",
+        "task",
+    )
+    summary_path = (
+        Path(report_root)
+        / REPORT_SUMMARY_DIR_NAME
+        / ("%s_stat_summary" % template_name)
+    )
+    write_text_file(summary_path, content)
+    return True
+
+
 def write_task_report(task_id, out_dir=None):
     """Generate final report files from database for one task.
 
-    Reports are written only under:
-        <report_root>/<revision>/<task_id>/
-
-    Nothing is written directly into /home/xshare/zw_cache/distributed_test_system.
+    Reports are written under either:
+        <report_root>/<revision>/<template>_<task_id>/
+        <report_root>/Old/<revision>/<template>_<task_id>/
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -1728,11 +2003,12 @@ def write_task_report(task_id, out_dir=None):
         conn.close()
 
     report_root = Path(out_dir) if out_dir else SHARE_REPORT_DIR
-    revision_dir = report_revision_dir(task)
-    task_dir = report_root / revision_dir / task_id
+    prepare_task_report_directory(report_root, task)
+    task_dir = get_task_report_directory(report_root, task)
+    stat_summary = build_stat_summary(task, counts, workers)
 
     files = {
-        "stat_summary": build_stat_summary(task, counts, workers),
+        "stat_summary": stat_summary,
         "status_summary": build_status_summary(rows),
         "list_pass_to_run": build_list_file(rows, "success"),
         "list_fail_to_run": build_list_file(rows, "failed"),
@@ -1743,6 +2019,9 @@ def write_task_report(task_id, out_dir=None):
     for filename, content in files.items():
         write_text_file(task_dir / filename, content)
 
+    write_latest_template_summary(report_root, task, stat_summary)
+    maintain_report_directories(report_root)
+    task_dir = get_task_report_directory(report_root, task)
     return report_root, task_dir, files
 
 
@@ -1767,9 +2046,9 @@ def cmd_apply(args):
     with yaml_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
-    # 支持两种格式：
-    # 1. 直接是一个列表：[ {template: place, target: .}, ... ]
-    # 2. 包含 tasks 字段的字典：{ tasks: [ ... ] }
+    # Support either a top-level list or a mapping with a tasks key.
+    # Format 1: [{template: place, target: .}, ...]
+    # Format 2: {tasks: [...]}
     if isinstance(data, dict) and "tasks" in data:
         task_list = data["tasks"]
     elif isinstance(data, list):
@@ -1787,27 +2066,27 @@ def cmd_apply(args):
 
     for idx, entry in enumerate(task_list, 1):
         template = entry.get("template")
-        target = entry.get("target", ".")
+        target = entry.get("target", DEFAULT_TARGET_DIR)
 
         if not template:
             print("[%d/%d] SKIP: missing 'template' field" % (idx, total))
             failed += 1
             continue
 
-        # 构造模拟的 argparse.Namespace 对象，模拟 ./taskctl.py add 的参数
+        # Build an argparse-like object and reuse the add command implementation.
         class Args:
             pass
         task_args = Args()
         task_args.template_name = template
         task_args.target_dir = target
-        task_args.revision = entry.get("revision")  # None 表示 latest
+        task_args.revision = entry.get("revision")  # None selects the latest revision.
         task_args.name = entry.get("name")
         task_args.priority = entry.get("priority")
         task_args.max_retry = entry.get("max_retry")
         task_args.max_time = entry.get("max_time")
 
         try:
-            # 复用 cmd_add 的核心逻辑
+            # Reuse the normal add command path.
             cmd_add(task_args)
             success += 1
             print("[%d/%d] OK: %s %s" % (idx, total, template, target))
@@ -1828,12 +2107,10 @@ def cmd_apply(args):
 DEFAULT_SCHEDULER_URL = (
     os.environ.get("PJTEST_SCHEDULER_URL")
     or os.environ.get("SCHEDULER_URL")
-    or "http://192.168.10.11:8888"
+    or get_value("scheduler", "url")
 ).rstrip("/")
 
-DEFAULT_ZIP_DIRS = [
-    Path("/home/xshare/zhouwei_runcache/GalaxCore/zip"),
-]
+DEFAULT_ZIP_DIRS = get_path_list("paths", "zip_dirs")
 
 ZIP_RE = re.compile(r"^Galax[Cc]ore_(\d+)\.zip$")
 
@@ -1919,7 +2196,7 @@ def check_scheduler_health(url):
     health_url = url.rstrip("/") + "/api/health"
 
     try:
-        with urlopen(health_url, timeout=3) as resp:
+        with urlopen(health_url, timeout=HEALTH_CHECK_TIMEOUT_SEC) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         data = json.loads(raw) if raw.strip() else {}
         if data.get("ok"):
@@ -1941,6 +2218,7 @@ def cmd_check(args):
     """Check central PJTest environment."""
     print("PJTest environment check")
     print("=" * 80)
+    print("Config file             : %s" % CONFIG_FILE)
 
     ok_all = True
 
@@ -2319,6 +2597,150 @@ def cmd_diagnose(args):
         sys.exit(2)
 
 
+def refresh_parent_task_status(cur, task_id):
+    """Refresh one parent task after a direct administrative database edit."""
+    cur.execute(
+        """
+        SELECT
+            t.task_id,
+            t.status,
+            t.started_at,
+            t.finished_at,
+            COUNT(e.example_id) AS total,
+            SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+            SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
+            SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
+            SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN e.status = 'canceled' THEN 1 ELSE 0 END) AS canceled_count,
+            SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
+        FROM tasks t
+        LEFT JOIN task_examples e
+            ON t.task_id = e.task_id
+        WHERE t.task_id = ?
+        GROUP BY t.task_id
+        """,
+        (task_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError("Task not found: %s" % task_id)
+
+    old_status = row["status"]
+    total = int(row["total"] or 0)
+    pending = int(row["pending_count"] or 0)
+    running = int(row["running_count"] or 0)
+    success = int(row["success_count"] or 0)
+    failed = int(row["failed_count"] or 0)
+    canceled = int(row["canceled_count"] or 0)
+    done = int(row["done_count"] or 0)
+
+    if total <= 0:
+        new_status = "failed"
+        message = "No examples found."
+    elif old_status == "canceling" and running > 0:
+        new_status = "canceling"
+        message = "Task canceling. waiting_running=%d progress=%d/%d" % (
+            running,
+            done,
+            total,
+        )
+    elif old_status == "canceling" and pending > 0:
+        new_status = "canceling"
+        message = "Task canceling. pending=%d" % pending
+    elif running > 0:
+        new_status = "running"
+        message = "Task is running. progress=%d/%d" % (done, total)
+    elif pending > 0:
+        if done > 0:
+            new_status = "running"
+            message = "Task is partially done. progress=%d/%d" % (done, total)
+        else:
+            new_status = "pending"
+            message = "Task is pending. progress=0/%d" % total
+    elif canceled > 0:
+        new_status = "canceled"
+        message = "Task canceled. canceled=%d done=%d total=%d" % (
+            canceled,
+            done,
+            total,
+        )
+    elif failed > 0:
+        new_status = "failed"
+        message = "Task finished with failures. success=%d failed=%d total=%d" % (
+            success,
+            failed,
+            total,
+        )
+    elif success == total:
+        new_status = "success"
+        message = "Task finished successfully. total=%d" % total
+    else:
+        new_status = "running"
+        message = "Task status is being reconciled. progress=%d/%d" % (done, total)
+
+    now = local_now()
+    started_at = row["started_at"]
+    finished_at = row["finished_at"]
+
+    if new_status == "running" and not started_at:
+        started_at = now
+    if new_status in TERMINAL_TASK_STATUSES and not finished_at:
+        finished_at = now
+    if new_status not in TERMINAL_TASK_STATUSES:
+        finished_at = None
+
+    cur.execute(
+        """
+        UPDATE tasks
+        SET status = ?,
+            started_at = ?,
+            finished_at = ?,
+            updated_at = ?,
+            message = ?
+        WHERE task_id = ?
+        """,
+        (
+            new_status,
+            started_at,
+            finished_at,
+            now,
+            message,
+            task_id,
+        ),
+    )
+
+    if old_status != new_status:
+        insert_event(
+            cur,
+            task_id,
+            None,
+            None,
+            None,
+            "task_status_changed",
+            "%s -> %s" % (old_status, new_status),
+        )
+
+    return new_status
+
+
+def request_scheduler_report_refresh(task_id, scheduler_url=None):
+    """Ask the scheduler to refresh reports outside this command process."""
+    base_url = (scheduler_url or DEFAULT_SCHEDULER_URL).rstrip("/")
+    url = base_url + "/api/task/refresh-report"
+    body = json.dumps({"task_id": task_id}).encode("utf-8")
+    req = Request(url, data=body)
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    req.add_header("Content-Length", str(len(body)))
+
+    with urlopen(req, timeout=ADMIN_REQUEST_TIMEOUT_SEC) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+
+    data = json.loads(raw) if raw.strip() else {}
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error") or "scheduler rejected report refresh")
+    return data
+
+
 def default_exit_code_for_status(status):
     """Return a conservative default exit code for manual repair."""
     if status == "success":
@@ -2331,15 +2753,24 @@ def default_exit_code_for_status(status):
 
 
 def cmd_repair_example(args):
-    """Manually repair one example and its current attempt."""
+    """Manually repair one example and keep parent/worker state consistent."""
     status = args.status
     exit_code = args.exit_code
     if exit_code is None:
         exit_code = default_exit_code_for_status(status)
 
+    if status in ("failed", "timeout") and exit_code == 0:
+        raise ValueError(
+            "%s status cannot use exit code 0; omit --exit-code or use a non-zero value"
+            % status
+        )
+    if status == "success" and exit_code not in (None, 0):
+        raise ValueError("success status must use exit code 0")
+
     conn = get_conn()
     cur = conn.cursor()
     now = local_now()
+    task_id = None
 
     try:
         cur.execute("BEGIN IMMEDIATE")
@@ -2356,6 +2787,7 @@ def cmd_repair_example(args):
             print("Use --force to overwrite it.")
             return
 
+        task_id = example["task_id"]
         timed_out = 1 if status == "timeout" else 0
         failed_step = None
         failed_reason = None
@@ -2366,7 +2798,6 @@ def cmd_repair_example(args):
             failed_step = "manual_repair"
             failed_reason = "manual repair failed exit_code_%s" % exit_code
         elif status == "canceled":
-            failed_step = None
             failed_reason = "manual repair canceled"
 
         message = args.message or "manual repair by taskctl: status=%s exit_code=%s" % (
@@ -2413,9 +2844,34 @@ def cmd_repair_example(args):
             ),
         )
 
+        if example["assigned_worker"]:
+            cur.execute(
+                """
+                UPDATE workers
+                SET status = 'idle',
+                    current_task_id = NULL,
+                    current_example_id = NULL,
+                    current_attempt_id = NULL,
+                    updated_at = ?,
+                    message = ?
+                WHERE worker_name = ?
+                  AND current_task_id = ?
+                  AND current_example_id = ?
+                  AND current_attempt_id = ?
+                """,
+                (
+                    now,
+                    "assignment cleared by repair-example",
+                    example["assigned_worker"],
+                    task_id,
+                    args.example_id,
+                    attempt_id,
+                ),
+            )
+
         insert_event(
             cur,
-            example["task_id"],
+            task_id,
             args.example_id,
             attempt_id,
             example["assigned_worker"],
@@ -2423,6 +2879,7 @@ def cmd_repair_example(args):
             message,
         )
 
+        new_task_status = refresh_parent_task_status(cur, task_id)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2430,12 +2887,26 @@ def cmd_repair_example(args):
     finally:
         conn.close()
 
+    report_message = "queued"
+    try:
+        request_scheduler_report_refresh(task_id)
+    except Exception as scheduler_exc:
+        try:
+            write_task_report(task_id)
+            report_message = "local fallback (%s)" % scheduler_exc
+        except Exception as local_exc:
+            report_message = "failed: scheduler=%s local=%s" % (
+                scheduler_exc,
+                local_exc,
+            )
+
     print("Example repaired: %s status=%s exit_code=%s" % (
         args.example_id,
         status,
         exit_code if exit_code is not None else "-",
     ))
-
+    print("Task status    : %s" % new_task_status)
+    print("Report refresh : %s" % report_message)
 
 def cmd_cancel(args):
     """Cancel a task safely.
@@ -2581,8 +3052,8 @@ def build_parser():
     p_add.add_argument(
         "target_dir",
         nargs="?",
-        default=".",
-        help="target directory under work_root, default: .",
+        default=DEFAULT_TARGET_DIR,
+        help="target directory under work_root, default from config",
     )
     p_add.add_argument(
         "--revision",
@@ -2600,8 +3071,8 @@ def build_parser():
         "-n",
         "--limit",
         type=int,
-        default=5,
-        help="number of recent tasks to show, default: 5",
+        default=DEFAULT_LIST_LIMIT,
+        help="number of recent tasks to show, default from config",
     )
     p_list.set_defaults(func=cmd_list)
 
@@ -2610,8 +3081,8 @@ def build_parser():
     p_show.add_argument(
         "--limit",
         type=int,
-        default=20,
-        help="max recent examples/attempts to show, default: 20",
+        default=DEFAULT_SHOW_LIMIT,
+        help="max recent examples/attempts to show, default from config",
     )
     p_show.add_argument(
         "--attempts",
@@ -2629,7 +3100,7 @@ def build_parser():
         help="do not print running/failure example sections",
     )
     p_show.set_defaults(func=cmd_show)
-    
+
     p_examples = sub.add_parser("examples", help="list examples of a task")
     p_examples.add_argument("task_id", help="task id")
     p_examples.add_argument("--status", help="filter examples by status")
@@ -2670,7 +3141,7 @@ def build_parser():
     p_report.add_argument("task_id", nargs="?", default=None, help="task id, default: latest")
     p_report.add_argument(
         "--out",
-        help="output report root, default: /home/xshare/zw_cache/distributed_test_system/reports",
+        help="output report root, default from config",
     )
     p_report.set_defaults(func=cmd_report)
 
@@ -2699,7 +3170,7 @@ def build_parser():
     p_check = sub.add_parser("check", help="check PJTest environment")
     p_check.add_argument(
         "--scheduler",
-        help="scheduler URL, default: env SCHEDULER_URL/PJTEST_SCHEDULER_URL or http://192.168.10.11:8888",
+        help="scheduler URL, default from config or environment",
     )
     p_check.set_defaults(func=cmd_check)
 

@@ -50,8 +50,8 @@ BIN_SRC = Path(os.environ.get(
     str(WORK_DIR / "bin" / "Linux_64" / "GalaxCore"),
 )).expanduser()
 
-# 注意：原 C++ 里是 Galaxcore_bin；这里按你现在说的 GalaxCore_bin。
-# 如果你机器上实际目录仍然是 Galaxcore_bin，可以设置环境变量 GALAXCORE_BIN_DST 覆盖。
+# The original C++ used Galaxcore_bin; this version uses GalaxCore_bin.
+# Set GALAXCORE_BIN_DST if the actual directory still uses the old name.
 BIN_DST = Path(os.environ.get(
     "GALAXCORE_BIN_DST",
     "/home/xiaonan/Share/zw_cache/GalaxCore_bin",
@@ -67,13 +67,13 @@ MK_FAIL_FILE = Path(os.environ.get(
     str(BIN_DST / "mk_fail"),
 )).expanduser()
 
-# 新文件名：last_version
+# Current checkpoint file name: last_version
 LAST_VERSION_FILE = Path(os.environ.get(
     "GALAXCORE_LAST_VERSION_FILE",
     str(BIN_DST / "last_version"),
 )).expanduser()
 
-# 兼容旧 C++ 文件名：last_revision.txt
+# Legacy C++ checkpoint file name: last_revision.txt
 LEGACY_LAST_REVISION_FILE = BIN_DST / "last_revision.txt"
 
 SVN_URL = os.environ.get(
@@ -536,18 +536,103 @@ def line_revision(line):
     return None
 
 
+def line_reason(line):
+    """Extract the normalized reason field from one mk_fail record."""
+    stripped = line.strip()
+
+    # Current aligned format:
+    # FAIL  r15456  author  submit_failed  [2026-06-22 19:41:41]
+    current_match = re.match(
+        r"^(?:Success|SUCCESS|FAIL)\s+"
+        r"r\d+\s+"
+        r"\S+\s+"
+        r"(.*?)\s+"
+        r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*$",
+        stripped,
+    )
+    if current_match:
+        return current_match.group(1).strip()
+
+    # Compatibility with possible key/value history records.
+    legacy_match = re.search(r"\breason=([^\s]+)", stripped)
+    if legacy_match:
+        return legacy_match.group(1).strip()
+
+    return None
+
+
+def collapse_active_failure_streak(fail_lines, success_revision):
+    """Collapse only the newest active same-reason failure streak.
+
+    The file stores failures newest first, but the retained record must be the
+    earliest failure in the active streak so the original revision and author
+    remain visible.
+
+    A later successful revision is a streak boundary. Older historical groups
+    are left unchanged because only the latest success record is retained.
+    """
+    if not fail_lines:
+        return fail_lines
+
+    newest_reason = line_reason(fail_lines[0])
+    if not newest_reason:
+        return fail_lines
+
+    streak_end = 1
+    for index in range(1, len(fail_lines)):
+        current_line = fail_lines[index]
+        current_revision = line_revision(current_line)
+        current_reason = line_reason(current_line)
+
+        if current_reason != newest_reason:
+            break
+
+        if (
+            success_revision is not None
+            and current_revision is not None
+            and current_revision < success_revision
+        ):
+            break
+
+        streak_end = index + 1
+
+    if streak_end <= 1:
+        return fail_lines
+
+    earliest_streak_line = fail_lines[streak_end - 1]
+    return [earliest_streak_line] + fail_lines[streak_end:]
+
+
 def update_mk_fail_success(rev, author, zip_name):
     """
     Write latest success as line 1.
     Keep failure records below it, newest first.
     If this revision existed in fail records, remove it.
+
+    Before closing the active failure streak, collapse any repeated records so
+    only the earliest revision and author of that streak remain.
     """
     old_lines = read_nonempty_lines(MK_FAIL_FILE)
 
+    previous_success_line = None
     fail_lines = []
+
     for line in old_lines:
-        if line_status(line) == "FAIL" and line_revision(line) != rev:
+        status = line_status(line)
+        if status == "SUCCESS" and previous_success_line is None:
+            previous_success_line = line
+        elif status == "FAIL" and line_revision(line) != rev:
             fail_lines.append(line)
+
+    previous_success_revision = (
+        line_revision(previous_success_line)
+        if previous_success_line
+        else None
+    )
+    fail_lines = collapse_active_failure_streak(
+        fail_lines,
+        previous_success_revision,
+    )
 
     success_line = make_record("SUCCESS", rev, author, zip_name, "ok")
     write_lines(MK_FAIL_FILE, [success_line] + fail_lines)
@@ -555,10 +640,13 @@ def update_mk_fail_success(rev, author, zip_name):
 
 def update_mk_fail_failure(rev, author, zip_name, reason):
     """
-    Keep latest success at line 1.
-    Insert latest failure at line 2.
-    Failure list is newest first.
-    Duplicate fail records for same revision are removed.
+    Keep latest success at line 1 and failures below it, newest groups first.
+
+    Consecutive failures with the same reason form one failure streak. Only the
+    earliest revision and author in that streak are kept. A successful revision
+    or a different failure reason starts a new streak.
+
+    Duplicate records for the same revision are removed.
     """
     old_lines = read_nonempty_lines(MK_FAIL_FILE)
 
@@ -572,13 +660,59 @@ def update_mk_fail_failure(rev, author, zip_name, reason):
         elif status == "FAIL" and line_revision(line) != rev:
             fail_lines.append(line)
 
-    new_fail_line = make_record("FAIL", rev, author, zip_name, reason)
+    success_revision = line_revision(success_line) if success_line else None
+    new_reason = str(reason).strip() or "ok"
+
+    # Clean the previously active streak before deciding whether the new
+    # failure belongs to it. This also upgrades existing mk_fail files.
+    fail_lines = collapse_active_failure_streak(
+        fail_lines,
+        success_revision,
+    )
+
+    latest_failure_line = fail_lines[0] if fail_lines else None
+    latest_failure_revision = (
+        line_revision(latest_failure_line)
+        if latest_failure_line
+        else None
+    )
+    latest_failure_reason = (
+        line_reason(latest_failure_line)
+        if latest_failure_line
+        else None
+    )
+
+    success_after_latest_failure = (
+        success_revision is not None
+        and (
+            latest_failure_revision is None
+            or success_revision > latest_failure_revision
+        )
+    )
+
+    same_active_streak = (
+        latest_failure_line is not None
+        and latest_failure_reason == new_reason
+        and not success_after_latest_failure
+    )
+
+    if same_active_streak:
+        # Do not add a later duplicate failure from the same active streak.
+        pass
+    else:
+        new_fail_line = make_record(
+            "FAIL",
+            rev,
+            author,
+            zip_name,
+            new_reason,
+        )
+        fail_lines = [new_fail_line] + fail_lines
 
     if success_line:
-        new_lines = [success_line, new_fail_line] + fail_lines
+        new_lines = [success_line] + fail_lines
     else:
-        # Before first success exists, latest failure temporarily stays at line 1.
-        new_lines = [new_fail_line] + fail_lines
+        new_lines = fail_lines
 
     write_lines(MK_FAIL_FILE, new_lines)
 

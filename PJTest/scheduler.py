@@ -653,27 +653,84 @@ def upsert_worker(
         )
 
 
-def refresh_one_task_status(cur, task_id):
-    """Refresh parent task status from child examples."""
+def compute_revision_scan_result(cur, task_id, existing_result=None):
+    """Compute structured first-bad metadata from terminal scan examples."""
     cur.execute(
         """
-        SELECT
-            t.task_id,
-            t.status,
-            t.started_at,
-            t.finished_at,
-            COUNT(e.example_id) AS total,
-            SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
-            SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
-            SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
-            SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
-            SUM(CASE WHEN e.status = 'canceled' THEN 1 ELSE 0 END) AS canceled_count,
-            SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
-        FROM tasks t
-        LEFT JOIN task_examples e
-            ON t.task_id = e.task_id
-        WHERE t.task_id = ?
-        GROUP BY t.task_id
+        SELECT example_id, revision, status, message, log_file
+        FROM task_examples
+        WHERE task_id = ?
+        ORDER BY CAST(revision AS INTEGER), seq, id
+        """,
+        (task_id,),
+    )
+    rows = cur.fetchall()
+    result = dict(existing_result or {})
+    result["candidate_revisions"] = [int(row["revision"]) for row in rows]
+
+    if not rows:
+        result["scan_status"] = "no_examples"
+        return "failed", "Revision scan has no examples.", result
+
+    first = rows[0]
+    last = rows[-1]
+    if first["status"] != "success":
+        result["scan_status"] = "invalid_good_boundary"
+        return "failed", "Good boundary r%s did not pass." % first["revision"], result
+    if last["status"] not in ("failed", "timeout"):
+        result["scan_status"] = "invalid_bad_boundary"
+        return "failed", "Bad boundary r%s did not fail." % last["revision"], result
+
+    first_bad = None
+    last_good = None
+    success_after_bad = []
+    for row in rows:
+        if row["status"] in ("failed", "timeout") and first_bad is None:
+            first_bad = row
+        elif row["status"] == "success":
+            if first_bad is None:
+                last_good = row
+            else:
+                success_after_bad.append(int(row["revision"]))
+
+    if first_bad is None:
+        result["scan_status"] = "no_failure_found"
+        return "failed", "Revision scan completed without a failing revision.", result
+
+    result.update({
+        "scan_status": "non_monotonic" if success_after_bad else "failure_found",
+        "last_good_revision": int(last_good["revision"]) if last_good else None,
+        "first_bad_revision": int(first_bad["revision"]),
+        "last_good_example_id": last_good["example_id"] if last_good else None,
+        "first_bad_example_id": first_bad["example_id"],
+        "first_bad_message": first_bad["message"] or "",
+        "first_bad_log_file": first_bad["log_file"] or "",
+        "non_monotonic_revisions": success_after_bad,
+    })
+    message = "Revision scan found first bad r%s; last good r%s" % (
+        first_bad["revision"], last_good["revision"] if last_good else "-",
+    )
+    if success_after_bad:
+        message += "; non-monotonic success after failure: %s" % ",".join(
+            str(value) for value in success_after_bad
+        )
+    return "success", message, result
+
+def refresh_one_task_status(cur, task_id):
+    """Refresh task status, including revision-scan result semantics."""
+    cur.execute(
+        """
+        SELECT t.task_id, t.status, t.split_mode, t.result_json,
+               t.started_at, t.finished_at,
+               COUNT(e.example_id) AS total,
+               SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+               SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
+               SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
+               SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
+               SUM(CASE WHEN e.status = 'canceled' THEN 1 ELSE 0 END) AS canceled_count,
+               SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
+        FROM tasks t LEFT JOIN task_examples e ON t.task_id = e.task_id
+        WHERE t.task_id = ? GROUP BY t.task_id
         """,
         (task_id,),
     )
@@ -682,108 +739,60 @@ def refresh_one_task_status(cur, task_id):
         return False
 
     old_status = row["status"]
-    total = row["total"] or 0
-    pending = row["pending_count"] or 0
-    running = row["running_count"] or 0
-    success = row["success_count"] or 0
-    failed = row["failed_count"] or 0
-    canceled = row["canceled_count"] or 0
-    done = row["done_count"] or 0
+    total = int(row["total"] or 0)
+    pending = int(row["pending_count"] or 0)
+    running = int(row["running_count"] or 0)
+    success = int(row["success_count"] or 0)
+    failed = int(row["failed_count"] or 0)
+    canceled = int(row["canceled_count"] or 0)
+    done = int(row["done_count"] or 0)
+    result_json = json_loads_dict(row["result_json"])
+    result_json.update({"total": total, "done": done, "success": success,
+                        "failed": failed, "running": running, "pending": pending})
 
     if total <= 0:
-        new_status = "failed"
-        message = "No examples found."
-    elif old_status == "canceling" and running > 0:
-        new_status = "canceling"
-        message = "Task canceling. waiting_running=%d progress=%d/%d" % (
-            running,
-            done,
-            total,
-        )
-    elif old_status == "canceling" and pending > 0:
-        new_status = "canceling"
-        message = "Task canceling. pending examples should be canceled. pending=%d" % pending
+        new_status, message = "failed", "No examples found."
+    elif old_status == "canceling" and (running > 0 or pending > 0):
+        new_status, message = "canceling", "Task canceling. progress=%d/%d" % (done, total)
     elif running > 0:
-        new_status = "running"
-        message = "Task is running. progress=%d/%d" % (done, total)
+        new_status, message = "running", "Task is running. progress=%d/%d" % (done, total)
     elif pending > 0:
-        if done > 0:
-            new_status = "running"
-            message = "Task is partially done. progress=%d/%d" % (done, total)
-        else:
-            new_status = "pending"
-            message = "Task is pending. progress=0/%d" % total
+        new_status = "running" if done > 0 else "pending"
+        message = "Task is partially done. progress=%d/%d" % (done, total) if done else "Task is pending. progress=0/%d" % total
     elif canceled > 0:
-        new_status = "canceled"
-        message = "Task canceled. canceled=%d done=%d total=%d" % (
-            canceled,
-            done,
-            total,
-        )
+        new_status, message = "canceled", "Task canceled. canceled=%d done=%d total=%d" % (canceled, done, total)
+    elif row["split_mode"] == "revision_scan":
+        new_status, message, result_json = compute_revision_scan_result(cur, task_id, result_json)
     elif failed > 0:
-        new_status = "failed"
-        message = "Task finished with failures. success=%d failed=%d total=%d" % (
-            success,
-            failed,
-            total,
-        )
+        new_status, message = "failed", "Task finished with failures. success=%d failed=%d total=%d" % (success, failed, total)
     elif success == total:
-        new_status = "success"
-        message = "Task finished successfully. total=%d" % total
+        new_status, message = "success", "Task finished successfully. total=%d" % total
     else:
-        new_status = "running"
-        message = "Task status is being reconciled. progress=%d/%d" % (done, total)
+        new_status, message = "running", "Task status is being reconciled. progress=%d/%d" % (done, total)
 
     now = local_now()
     started_at = row["started_at"]
     finished_at = row["finished_at"]
-
-    set_started_at = started_at
-    set_finished_at = finished_at
-
     if new_status == "running" and not started_at:
-        set_started_at = now
-
+        started_at = now
     if new_status in TERMINAL_TASK_STATUSES and not finished_at:
-        set_finished_at = now
-
+        finished_at = now
     if new_status not in TERMINAL_TASK_STATUSES:
-        set_finished_at = None
+        finished_at = None
 
     cur.execute(
         """
-        UPDATE tasks
-        SET status = ?,
-            started_at = ?,
-            finished_at = ?,
-            updated_at = ?,
-            message = ?
+        UPDATE tasks SET status = ?, started_at = ?, finished_at = ?,
+                         updated_at = ?, result_json = ?, message = ?
         WHERE task_id = ?
         """,
-        (
-            new_status,
-            set_started_at,
-            set_finished_at,
-            now,
-            message,
-            task_id,
-        ),
+        (new_status, started_at, finished_at, now,
+         json.dumps(result_json, ensure_ascii=False, sort_keys=True), message, task_id),
     )
-
     if old_status != new_status:
-        insert_event(
-            cur,
-            task_id,
-            None,
-            None,
-            None,
-            "task_status_changed",
-            "%s -> %s" % (old_status, new_status),
-        )
-        return True  # The task status changed.
-
+        insert_event(cur, task_id, None, None, None, "task_status_changed", "%s -> %s" % (old_status, new_status))
+        return True
     return False
-
 
 def refresh_all_task_statuses(cur):
     """Refresh all non-terminal parent tasks and return changed task ids."""
@@ -865,6 +874,50 @@ def resolve_task_build(cur, task_row):
     return str(revision), fixed_zip, None
 
 
+def resolve_example_build(cur, row):
+    """Resolve the build snapshot for one execution item.
+
+    A per-example revision must never fall back to the task-level ZIP because
+    that ZIP may belong to a different revision.
+    """
+    example_revision = row["example_revision"]
+    example_zip = row["example_resolved_zip_path"]
+    if example_revision is not None and str(example_revision).strip() != "":
+        revision = str(example_revision)
+        if example_zip and Path(example_zip).is_file():
+            return revision, example_zip, None
+        fixed_zip = find_zip_for_revision(revision)
+        if not fixed_zip:
+            return None, None, "compiled GalaxCore zip not found for example revision %s" % revision
+        cur.execute(
+            """
+            UPDATE task_examples SET resolved_zip_path = ?, updated_at = ?
+            WHERE example_id = ?
+            """,
+            (fixed_zip, local_now(), row["example_id"]),
+        )
+        return revision, fixed_zip, None
+    return resolve_task_build(cur, row)
+
+
+def resolve_existing_assignment_build(cur, row):
+    """Recover exactly the build used by an existing running attempt."""
+    attempt_revision = row["attempt_revision"]
+    attempt_zip = row["attempt_zip_path"]
+    if attempt_revision:
+        revision = str(attempt_revision)
+        if attempt_zip and Path(attempt_zip).is_file():
+            return revision, attempt_zip, None
+        fixed_zip = find_zip_for_revision(revision)
+        if not fixed_zip:
+            return None, None, "compiled GalaxCore zip not found for running attempt revision %s" % revision
+        cur.execute(
+            "UPDATE task_attempts SET zip_path = ? WHERE attempt_id = ?",
+            (fixed_zip, row["existing_attempt_id"]),
+        )
+        return revision, fixed_zip, None
+    return resolve_example_build(cur, row)
+
 def select_existing_assignment(cur, worker_name):
     """Return an unfinished assignment already owned by this worker.
 
@@ -884,6 +937,8 @@ def select_existing_assignment(cur, worker_name):
             e.cmd AS cmd,
             e.retry_count AS retry_count,
             e.max_retry AS example_max_retry,
+            e.revision AS example_revision,
+            e.resolved_zip_path AS example_resolved_zip_path,
 
             t.task_name AS task_name,
             t.template_name AS template_name,
@@ -945,6 +1000,8 @@ def select_pending_example(cur, worker_name):
             e.cmd AS cmd,
             e.retry_count AS retry_count,
             e.max_retry AS example_max_retry,
+            e.revision AS example_revision,
+            e.resolved_zip_path AS example_resolved_zip_path,
 
             t.task_name AS task_name,
             t.template_name AS template_name,
@@ -1003,7 +1060,7 @@ def build_example_payload(row, revision, zip_path, attempt_id, attempt_no):
         "template_name": row["template_name"],
         "suite": row["suite"],
         "revision": revision,
-        "revision_policy": row["revision_policy"] or "fixed",
+        "revision_policy": "fixed" if row["example_revision"] else (row["revision_policy"] or "fixed"),
         "zip_path": zip_path,
         "galaxcore_zip_path": zip_path,
         "work_root": work_root,
@@ -1031,8 +1088,10 @@ def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None
         if existing:
             attempt_id = existing["existing_attempt_id"]
             attempt_no = int(existing["existing_attempt_no"] or 1)
-            revision = existing["attempt_revision"] or existing["revision"]
-            zip_path = existing["attempt_zip_path"] or existing["resolved_zip_path"]
+            revision, zip_path, build_error = resolve_existing_assignment_build(cur, existing)
+            if build_error:
+                conn.rollback()
+                return None, build_error
 
             upsert_worker(
                 cur,
@@ -1103,7 +1162,7 @@ def _claim_example_for_worker_once(worker_name, hostname=None, capabilities=None
                 )
             return None, None
 
-        revision, zip_path, error = resolve_task_build(cur, row)
+        revision, zip_path, error = resolve_example_build(cur, row)
         if error:
             cur.execute(
                 """
@@ -1780,7 +1839,9 @@ def get_task_report_data(task_id):
     revision_policy = task["revision_policy"] or "fixed"
     revision_display = str(revision or "")
 
-    if revision_policy == "latest":
+    if task["split_mode"] == "revision_scan" or revision_policy == "per_example":
+        revision_display = str(revision or "per-example")
+    elif revision_policy == "latest":
         if revision and str(revision).lower() != "latest":
             revision_display = "latest->%s" % revision
         else:
@@ -1795,6 +1856,8 @@ def get_task_report_data(task_id):
             "example_id": row["example_id"],
             "task_id": row["task_id"],
             "platform": row["platform"],
+            "revision": row["revision"],
+            "resolved_zip_path": row["resolved_zip_path"],
             "target_arg": row["target_arg"],
             "run_tcl_path": row["run_tcl_path"],
             "cmd": row["cmd"],
@@ -1842,6 +1905,7 @@ def get_task_report_data(task_id):
             "work_root": task["work_root"],
             "target_dir": task["target_dir"],
             "split_mode": task["split_mode"],
+            "result": json_loads_dict(task["result_json"]),
             "flow_config": json_loads_dict(task["flow_config_json"]),
             "created_at": task["created_at"],
             "updated_at": task["updated_at"],
@@ -1910,9 +1974,10 @@ def format_task_report_text(report):
     lines.append("")
     lines.append("Examples")
     lines.append("-" * 100)
-    lines.append("%-6s %-14s %-10s %-10s %-7s %-6s %s" % (
+    lines.append("%-6s %-14s %-10s %-10s %-10s %-7s %-6s %s" % (
         "SEQ",
         "EXAMPLE_ID",
+        "REV",
         "STATUS",
         "WORKER",
         "RETRY",
@@ -1927,9 +1992,10 @@ def format_task_report_text(report):
             example.get("max_retry") if example.get("max_retry") is not None else 0,
         )
         exit_code = example.get("exit_code")
-        lines.append("%-6s %-14s %-10s %-10s %-7s %-6s %s" % (
+        lines.append("%-6s %-14s %-10s %-10s %-10s %-7s %-6s %s" % (
             example.get("seq") or "",
             example.get("example_id") or "",
+            example.get("revision") or "-",
             example.get("status") or "",
             example.get("assigned_worker") or "-",
             retry,
@@ -1983,20 +2049,18 @@ def get_task_field(task, key, default=None):
 
 def get_task_revision_dir(task):
     """Return the revision directory name for one task mapping."""
+    if get_task_field(task, "split_mode") == "revision_scan":
+        return "scan_%s" % sanitize_report_component(
+            get_task_field(task, "revision"), "revision_scan"
+        )
     revision = get_task_field(task, "revision")
     if revision and re.match(r"^\d+$", str(revision)):
         return "r%s" % revision
-
     revision_display = get_task_field(task, "revision_display")
     if not revision_display:
         policy = get_task_field(task, "revision_policy", "fixed")
-        if policy == "latest":
-            revision_display = "latest"
-        else:
-            revision_display = revision
-
+        revision_display = "latest" if policy == "latest" else revision
     return sanitize_report_component(revision_display, "unknown_revision")
-
 
 def get_report_revision_dir(report):
     """Return the revision directory name used below REPORT_ROOT."""
@@ -2151,7 +2215,7 @@ def maintain_report_directories(report_root=REPORT_ROOT):
         cur.execute(
             """
             SELECT task_id, task_name, template_name, revision,
-                   revision_policy, status, created_at
+                   revision_policy, split_mode, status, created_at
             FROM tasks
             ORDER BY id ASC
             """
@@ -2299,21 +2363,30 @@ def build_stat_summary_text(report):
         "elapsed_seconds  %s" % (elapsed_seconds if elapsed_seconds is not None else "-"),
         "elapsed_time     %s" % elapsed_time,
         "message          %s" % clean_report_text(task["message"]),
-        "",
     ]
+    if task.get("split_mode") == "revision_scan":
+        result = task.get("result") or {}
+        lines.extend([
+            "scan_status      %s" % clean_report_text(result.get("scan_status")),
+            "last_good        %s" % clean_report_text(result.get("last_good_revision")),
+            "first_bad        %s" % clean_report_text(result.get("first_bad_revision")),
+            "non_monotonic    %s" % clean_report_text(result.get("non_monotonic_revisions")),
+        ])
+    lines.append("")
     return "\n".join(lines)
 
 
 def build_status_list_text(report, status):
-    """Build target_arg list for examples matching status."""
+    """Build status list, preserving revision identity for vertical scans."""
     lines = []
+    is_scan = report["task"].get("split_mode") == "revision_scan"
     for example in report["examples"]:
-        if example.get("status") == status:
-            lines.append(example.get("target_arg") or example.get("run_tcl_path") or "")
-
-    lines = [line for line in lines if line]
+        if example.get("status") != status:
+            continue
+        target = example.get("target_arg") or example.get("run_tcl_path") or ""
+        if target:
+            lines.append("r%s\t%s" % (example.get("revision"), target) if is_scan else target)
     return "\n".join(lines) + ("\n" if lines else "")
-
 
 def get_task_report_paths(report):
     """Return final paths under active Reports or Reports/Old."""
@@ -2562,6 +2635,8 @@ def get_tasks_summary_data(limit=200):
                 t.revision,
                 t.revision_policy,
                 t.resolved_zip_path,
+                t.split_mode,
+                t.result_json,
                 t.status,
                 t.priority,
                 t.target_dir,
@@ -2600,7 +2675,9 @@ def get_tasks_summary_data(limit=200):
         revision = row["revision"]
         revision_policy = row["revision_policy"] or "fixed"
         revision_display = str(revision or "")
-        if revision_policy == "latest":
+        if row["split_mode"] == "revision_scan" or revision_policy == "per_example":
+            revision_display = str(revision or "per-example")
+        elif revision_policy == "latest":
             if revision and str(revision).lower() != "latest":
                 revision_display = "latest->%s" % revision
             else:
@@ -2614,6 +2691,8 @@ def get_tasks_summary_data(limit=200):
             "revision_policy": revision_policy,
             "revision_display": revision_display,
             "resolved_zip_path": row["resolved_zip_path"],
+            "split_mode": row["split_mode"],
+            "result": json_loads_dict(row["result_json"]),
             "status": row["status"],
             "priority": row["priority"],
             "target_dir": row["target_dir"],
@@ -3112,6 +3191,8 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 t.revision,
                 t.revision_policy,
                 t.resolved_zip_path,
+                t.split_mode,
+                t.result_json,
                 t.suite,
                 t.target_worker,
                 t.status,

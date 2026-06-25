@@ -117,6 +117,61 @@ FLOW_TARGET_DIR_ENV = (
 IGNORE_RUN_SH_RC = os.environ.get("GALAXCORE_IGNORE_RUN_RC", "0") != "0"
 
 
+class HttpJsonError(RuntimeError):
+    """HTTP JSON request error with status code and parsed scheduler message."""
+
+    def __init__(self, status_code, url, raw_body):
+        self.status_code = int(status_code)
+        self.url = str(url)
+        self.raw_body = str(raw_body or "")
+        self.error_message = self._parse_error_message(self.raw_body)
+
+        RuntimeError.__init__(
+            self,
+            "HTTP %s %s: %s"
+            % (
+                self.status_code,
+                self.url,
+                self.raw_body,
+            ),
+        )
+
+    @staticmethod
+    def _parse_error_message(raw_body):
+        """Extract the scheduler error field from a JSON response body."""
+        raw_body = str(raw_body or "").strip()
+
+        if not raw_body:
+            return ""
+
+        try:
+            data = json.loads(raw_body)
+        except Exception:
+            return raw_body
+
+        if isinstance(data, dict):
+            return str(data.get("error") or data.get("message") or raw_body).strip()
+
+        return raw_body
+
+
+def is_report_target_gone(exc):
+    """Return True when retrying a report can never succeed."""
+    if not isinstance(exc, HttpJsonError):
+        return False
+
+    if exc.status_code != 404:
+        return False
+
+    error_message = exc.error_message.strip().lower()
+    permanent_missing_errors = {
+        "attempt not found",
+        "task not found",
+        "example not found",
+    }
+    return error_message in permanent_missing_errors
+
+
 class WorkerState(object):
     """Thread-safe worker state shared by the heartbeat thread."""
 
@@ -310,7 +365,7 @@ def http_json(base_url, path, data=None, timeout=30, dump_json=False):
             raw = resp.read().decode("utf-8")
     except HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError("HTTP %s %s: %s" % (exc.code, url, raw))
+        raise HttpJsonError(exc.code, url, raw)
     except URLError as exc:
         raise RuntimeError("HTTP request failed %s: %s" % (url, exc))
 
@@ -392,8 +447,8 @@ def report_result(scheduler_url, payload, dump_json=False):
 
 
 def report_result_with_retry(scheduler_url, payload, state, args, worker_name):
-    """Report one result and do not pull another task until it succeeds."""
-    attempt = 0
+    """Report one result, abandoning only permanently deleted assignments."""
+    retry_count = 0
     interval = int(getattr(args, "report_retry_interval", REPORT_RETRY_INTERVAL))
     max_retries = int(getattr(args, "report_max_retries", REPORT_MAX_RETRIES))
     example_id = payload.get("example_id")
@@ -407,44 +462,102 @@ def report_result_with_retry(scheduler_url, payload, state, args, worker_name):
                 payload,
                 dump_json=getattr(state, "dump_json", False),
             )
-            if attempt > 0:
+
+            if retry_count > 0:
                 console_line(
                     worker_name,
-                    "REPORT_OK_AFTER_RETRY ex=%s retry_count=%d" % (
+                    "REPORT_OK_AFTER_RETRY ex=%s retry_count=%d"
+                    % (
                         short_task_id(example_id),
-                        attempt,
+                        retry_count,
                     ),
                 )
+
             return response
-        except Exception as exc:
-            attempt += 1
+
+        except HttpJsonError as exc:
+            if is_report_target_gone(exc):
+                state.set(
+                    "idle",
+                    task_id=None,
+                    example_id=None,
+                    attempt_id=None,
+                    message=(
+                        "orphan report discarded: %s"
+                        % exc.error_message
+                    ),
+                )
+
+                console_error(
+                    worker_name,
+                    "REPORT_DISCARDED task=%s ex=%s attempt=%s "
+                    "reason=%s"
+                    % (
+                        short_task_id(task_id),
+                        short_task_id(example_id),
+                        short_task_id(attempt_id),
+                        exc.error_message or "report target not found",
+                    ),
+                )
+
+                return {
+                    "ok": False,
+                    "discarded": True,
+                    "error": exc.error_message,
+                    "http_status": exc.status_code,
+                    "task_id": task_id,
+                    "example_id": example_id,
+                    "attempt_id": attempt_id,
+                }
+
+            retry_count += 1
             state.set(
                 "reporting",
                 task_id=task_id,
                 example_id=example_id,
                 attempt_id=attempt_id,
-                message="report retry %d: %s" % (attempt, exc),
+                message="report retry %d: %s" % (retry_count, exc),
             )
             console_error(
                 worker_name,
-                "REPORT_RETRY ex=%s attempt=%d err=%s" % (
+                "REPORT_RETRY ex=%s attempt=%d err=%s"
+                % (
                     short_task_id(example_id),
-                    attempt,
+                    retry_count,
                     exc,
                 ),
             )
 
-            if max_retries > 0 and attempt >= max_retries:
-                raise RuntimeError(
-                    "report failed after %d retries for example %s: %s" % (
-                        attempt,
-                        example_id,
-                        exc,
-                    )
-                )
+        except Exception as exc:
+            retry_count += 1
+            state.set(
+                "reporting",
+                task_id=task_id,
+                example_id=example_id,
+                attempt_id=attempt_id,
+                message="report retry %d: %s" % (retry_count, exc),
+            )
+            console_error(
+                worker_name,
+                "REPORT_RETRY ex=%s attempt=%d err=%s"
+                % (
+                    short_task_id(example_id),
+                    retry_count,
+                    exc,
+                ),
+            )
 
-            wait_seconds = max(1, interval)
-            wait_or_shutdown(args, wait_seconds)
+        if max_retries > 0 and retry_count >= max_retries:
+            raise RuntimeError(
+                "report failed after %d retries for example %s"
+                % (
+                    retry_count,
+                    example_id,
+                )
+            )
+
+        wait_seconds = max(1, interval)
+        wait_or_shutdown(args, wait_seconds)
 
 
 
@@ -520,9 +633,30 @@ def flush_pending_reports(scheduler_url, worker_name, state, args):
             short_task_id(payload.get("example_id")),
             path,
         ))
-        report_result_with_retry(scheduler_url, payload, state, args, worker_name)
+        response = report_result_with_retry(
+            scheduler_url,
+            payload,
+            state,
+            args,
+            worker_name,
+        )
         delete_pending_report(path)
-        console_line(worker_name, "PENDING_REPORT_DONE ex=%s" % short_task_id(payload.get("example_id")))
+
+        if response.get("discarded"):
+            console_line(
+                worker_name,
+                "PENDING_REPORT_DISCARDED ex=%s reason=%s"
+                % (
+                    short_task_id(payload.get("example_id")),
+                    response.get("error") or "assignment deleted",
+                ),
+            )
+        else:
+            console_line(
+                worker_name,
+                "PENDING_REPORT_DONE ex=%s"
+                % short_task_id(payload.get("example_id")),
+            )
 
 def shlex_quote(value):
     """Quote a shell argument."""
@@ -1545,8 +1679,26 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
     }
 
     pending_path = save_pending_report(worker_name, report)
-    report_result_with_retry(scheduler_url, report, state, args, worker_name)
+    report_response = report_result_with_retry(
+        scheduler_url,
+        report,
+        state,
+        args,
+        worker_name,
+    )
     delete_pending_report(pending_path)
+
+    if report_response.get("discarded"):
+        console_error(
+            worker_name,
+            "RESULT_NOT_RECORDED task=%s ex=%s attempt=%s "
+            "because scheduler assignment was deleted"
+            % (
+                short_task_id(task.get("task_id")),
+                short_task_id(task.get("example_id")),
+                short_task_id(task.get("attempt_id")),
+            ),
+        )
 
     elapsed = time.time() - start_time
     console_line(worker_name, "DONE status=%s rc=%s timeout=%s sec=%.1f %s log=%s" % (

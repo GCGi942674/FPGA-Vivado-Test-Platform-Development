@@ -378,65 +378,37 @@ def insert_task_and_examples(
     target_dir,
     flow_config,
     examples,
+    split_mode="scan",
+    result_json=None,
 ):
-    """Insert one parent task and all child examples."""
+    """Insert one task and all distributable execution items atomically."""
     conn = get_conn()
     cur = conn.cursor()
     now = local_now()
-
     task_id = "task_" + uuid.uuid4().hex[:12]
+    result_json = result_json if isinstance(result_json, dict) else {}
 
     try:
         cur.execute("BEGIN IMMEDIATE")
-
         cur.execute(
             """
             INSERT INTO tasks (
-                task_id,
-                task_name,
-                template_name,
-                revision,
-                revision_policy,
-                resolved_zip_path,
-                suite,
-                target_worker,
-                priority,
-                max_retry,
-                max_time,
-                work_root,
-                target_dir,
-                split_mode,
-                flow_config_json,
-                status,
-                total_examples,
-                repeat_enabled,
-                repeat_group,
-                repeat_index,
-                parent_task_id,
-                created_at,
-                updated_at,
-                started_at,
-                finished_at,
-                message
-            ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'any', ?, ?, ?, ?, ?, 'scan', ?,
-                      'pending', ?, 0, NULL, 1, NULL, ?, ?, NULL, NULL, ?)
+                task_id, task_name, template_name, revision, revision_policy,
+                resolved_zip_path, suite, target_worker, priority, max_retry,
+                max_time, work_root, target_dir, split_mode, flow_config_json,
+                status, total_examples, repeat_enabled, repeat_group,
+                repeat_index, parent_task_id, created_at, updated_at,
+                started_at, finished_at, result_json, message
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'any', ?, ?, ?, ?, ?, ?, ?,
+                      'pending', ?, 0, NULL, 1, NULL, ?, ?, NULL, NULL, ?, ?)
             """,
             (
-                task_id,
-                task_name,
-                template_name,
-                revision,
-                revision_policy,
-                suite,
-                priority,
-                max_retry,
-                max_time,
-                work_root,
-                target_dir,
+                task_id, task_name, template_name, revision, revision_policy,
+                suite, priority, max_retry, max_time, work_root, target_dir,
+                split_mode,
                 json.dumps(flow_config, ensure_ascii=False, sort_keys=True),
-                len(examples),
-                now,
-                now,
+                len(examples), now, now,
+                json.dumps(result_json, ensure_ascii=False, sort_keys=True),
                 "created with %d examples" % len(examples),
             ),
         )
@@ -446,71 +418,41 @@ def insert_task_and_examples(
             target_arg = example["target_arg"]
             run_tcl_path = example["run_tcl_path"]
             cmd = build_run_command(work_root, target_arg)
+            example_revision = example.get("revision")
+            example_zip = example.get("resolved_zip_path")
 
             cur.execute(
                 """
                 INSERT INTO task_examples (
-                    example_id,
-                    task_id,
-                    seq,
-                    platform,
-                    target_arg,
-                    run_tcl_path,
-                    cmd,
-                    status,
-                    assigned_worker,
-                    current_attempt_id,
-                    retry_count,
-                    max_retry,
-                    created_at,
-                    updated_at,
-                    started_at,
-                    finished_at,
-                    exit_code,
-                    failed_step,
-                    failed_reason,
-                    message,
-                    log_file,
-                    log_tail,
-                    run_log_dir,
-                    report_dir
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'pending', NULL, NULL, 0, ?,
-                          ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                          NULL, NULL)
+                    example_id, task_id, seq, platform, target_arg,
+                    run_tcl_path, cmd, revision, resolved_zip_path, status,
+                    assigned_worker, current_attempt_id, retry_count, max_retry,
+                    created_at, updated_at, started_at, finished_at, exit_code,
+                    failed_step, failed_reason, message, log_file, log_tail,
+                    run_log_dir, report_dir
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 'pending', NULL, NULL,
+                          0, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                          NULL, NULL, NULL)
                 """,
                 (
-                    example_id,
-                    task_id,
-                    seq,
-                    target_arg,
-                    run_tcl_path,
-                    cmd,
-                    max_retry,
-                    now,
-                    now,
+                    example_id, task_id, seq, target_arg, run_tcl_path, cmd,
+                    str(example_revision) if example_revision is not None else None,
+                    str(example_zip) if example_zip else None,
+                    max_retry, now, now,
                 ),
             )
 
         insert_event(
-            cur,
-            task_id,
-            None,
-            None,
-            None,
-            "task_created",
-            "Created task with %d examples" % len(examples),
+            cur, task_id, None, None, None, "task_created",
+            "Created %s task with %d examples" % (split_mode, len(examples)),
         )
-
         conn.commit()
         return task_id
-
     except Exception:
         conn.rollback()
         raise
-
     finally:
         conn.close()
-
 
 def cmd_add(args):
     """Create one parent task and split it into examples."""
@@ -560,6 +502,138 @@ def cmd_add(args):
     print("Status          : pending")
 
 
+
+def resolve_single_run_tcl(work_root, run_tcl_input):
+    """Resolve one run.tcl and return its path relative to work_root."""
+    root = Path(work_root).expanduser().resolve()
+    path = Path(run_tcl_input).expanduser()
+    path = path.resolve() if path.is_absolute() else (root / path).resolve()
+
+    if path.name != "run.tcl":
+        raise ValueError("find target must be a file named run.tcl: %s" % path)
+    if not path.is_file():
+        raise ValueError("find target does not exist: %s" % path)
+
+    ensure_inside_work_root(root, path)
+    return to_posix_relative(path, root)
+
+
+def scan_revision_zip_map():
+    """Return revision -> stable ZIP snapshot using configured directory order."""
+    revision_map = {}
+    for zip_dir in get_zip_dirs():
+        if not zip_dir.is_dir():
+            continue
+        for item in sorted(zip_dir.iterdir()):
+            if not item.is_file():
+                continue
+            match = ZIP_RE.match(item.name)
+            if not match:
+                continue
+            revision = int(match.group(1))
+            revision_map.setdefault(revision, str(item.resolve()))
+    return revision_map
+
+
+def cmd_find(args):
+    """Create one revision-scan task with one execution item per real ZIP."""
+    template_name, template = load_template(args.template_name)
+    find_config = template.get("find_fail")
+    if not isinstance(find_config, dict):
+        raise ValueError("template.find_fail must be a JSON object")
+
+    confirm_fail = int(
+        args.confirm_fail
+        if args.confirm_fail is not None
+        else find_config.get("confirm_fail", 1)
+    )
+    if confirm_fail != 1:
+        raise ValueError(
+            "revision-scan v1 requires confirm_fail=1; dynamic confirmation "
+            "examples will be added in a later version"
+        )
+
+    good_revision = int(
+        args.good if args.good is not None else find_config.get("good_revision")
+    )
+    bad_revision = int(
+        args.bad if args.bad is not None else find_config.get("bad_revision")
+    )
+    if good_revision >= bad_revision:
+        raise ValueError("good revision must be smaller than bad revision")
+
+    work_root = template.get("work_root", DEFAULT_WORK_ROOT)
+    target_arg = resolve_single_run_tcl(work_root, args.run_tcl)
+    revision_zip_map = scan_revision_zip_map()
+
+    if good_revision not in revision_zip_map:
+        raise ValueError("good revision ZIP not found: %s" % good_revision)
+    if bad_revision not in revision_zip_map:
+        raise ValueError("bad revision ZIP not found: %s" % bad_revision)
+
+    revisions = sorted(
+        revision for revision in revision_zip_map
+        if good_revision <= revision <= bad_revision
+    )
+    if len(revisions) < 2:
+        raise ValueError("at least two existing revisions are required")
+
+    suite = template.get("suite", DEFAULT_SUITE)
+    priority = get_int_value(args.priority, template, "priority", DEFAULT_PRIORITY)
+    max_retry = get_int_value(args.max_retry, template, "max_retry", DEFAULT_MAX_RETRY)
+    max_time = get_int_value(args.max_time, template, "max_time", DEFAULT_MAX_TIME)
+    task_name = args.name or template.get("task_name") or template_name
+    flow_config = merge_flow_config(template)
+
+    examples = [
+        {
+            "target_arg": target_arg,
+            "run_tcl_path": target_arg,
+            "revision": revision,
+            "resolved_zip_path": revision_zip_map[revision],
+        }
+        for revision in revisions
+    ]
+
+    result_json = {
+        "scan_status": "pending",
+        "good_revision": good_revision,
+        "bad_revision": bad_revision,
+        "candidate_revisions": revisions,
+        "confirm_fail": confirm_fail,
+    }
+    revision_display = "%s..%s" % (revisions[0], revisions[-1])
+
+    task_id = insert_task_and_examples(
+        task_name=task_name,
+        template_name=template_name,
+        revision_policy="per_example",
+        revision=revision_display,
+        suite=suite,
+        priority=priority,
+        max_retry=max_retry,
+        max_time=max_time,
+        work_root=work_root,
+        target_dir=target_arg,
+        flow_config=flow_config,
+        examples=examples,
+        split_mode="revision_scan",
+        result_json=result_json,
+    )
+
+    print("Template         : %s" % template_name)
+    print("Task type       : revision_scan")
+    print("Target          : %s" % target_arg)
+    print("Revision range  : %s" % revision_display)
+    print("Revision count  : %d" % len(revisions))
+    print("Good boundary   : %s" % good_revision)
+    print("Bad boundary    : %s" % bad_revision)
+    print("")
+    print("Task created    : %s" % task_id)
+    print("Status          : pending")
+    print("Inspect         : ./taskctl.py show %s" % task_id)
+    print("Examples        : ./taskctl.py examples %s" % task_id)
+
 def format_short(text, width):
     """Return full text for table display.
 
@@ -574,17 +648,19 @@ def format_short(text, width):
 
 
 def format_revision(row):
-    """Format revision policy and resolved revision for display."""
+    """Format task-level revision or a per-example scan range."""
+    keys = row.keys() if hasattr(row, "keys") else []
+    split_mode = row["split_mode"] if "split_mode" in keys else None
     policy = row["revision_policy"] or "fixed"
     revision = row["revision"]
 
+    if split_mode == "revision_scan" or policy == "per_example":
+        return revision or "per-example"
     if policy == "latest":
         if revision and str(revision).lower() != "latest":
             return "latest->%s" % revision
         return "latest"
-
     return revision or "-"
-
 
 def cmd_list(args):
     """List the most recent parent tasks with aggregate progress."""
@@ -637,6 +713,7 @@ def cmd_list(args):
             t.template_name,
             t.revision,
             t.revision_policy,
+            t.split_mode,
             t.suite,
             t.target_dir,
             t.status,
@@ -779,7 +856,7 @@ def cmd_examples(args):
         return
 
     query = """
-        SELECT example_id, seq, target_arg, run_tcl_path, status,
+        SELECT example_id, seq, revision, resolved_zip_path, target_arg, run_tcl_path, status,
                assigned_worker, current_attempt_id, retry_count, max_retry,
                exit_code, failed_step, failed_reason, started_at, finished_at,
                log_file, run_log_dir, report_dir, message
@@ -812,9 +889,10 @@ def cmd_examples(args):
         print("No examples found.")
         return
 
-    header = "%-18s %4s %-10s %-10s %-7s %-6s %-45s" % (
+    header = "%-18s %4s %-10s %-10s %-10s %-7s %-6s %-45s" % (
         "EXAMPLE_ID",
         "SEQ",
+        "REV",
         "STATUS",
         "WORKER",
         "RETRY",
@@ -830,10 +908,11 @@ def cmd_examples(args):
         exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
 
         print(
-            "%-18s %4d %-10s %-10s %-7s %-6s %-45s"
+            "%-18s %4d %-10s %-10s %-10s %-7s %-6s %-45s"
             % (
                 format_short(row["example_id"], 18),
                 row["seq"],
+                format_short(row["revision"] or "-", 10),
                 format_short(row["status"], 10),
                 format_short(worker, 10),
                 retry,
@@ -844,6 +923,8 @@ def cmd_examples(args):
 
         if args.verbose:
             print("    run_tcl_path       : %s" % row["run_tcl_path"])
+            print("    revision           : %s" % (row["revision"] or "-"))
+            print("    resolved_zip_path  : %s" % (row["resolved_zip_path"] or "-"))
             if row["current_attempt_id"]:
                 print("    current_attempt_id : %s" % row["current_attempt_id"])
             if row["failed_step"] or row["failed_reason"]:
@@ -1172,7 +1253,7 @@ def fetch_task_recent_examples(cur, task_id, statuses, limit):
 
     cur.execute(
         """
-        SELECT example_id, seq, target_arg, status, assigned_worker,
+        SELECT example_id, seq, revision, resolved_zip_path, target_arg, status, assigned_worker,
                current_attempt_id, retry_count, max_retry, exit_code,
                failed_step, failed_reason, started_at, finished_at,
                log_file, run_log_dir, report_dir, message
@@ -1248,9 +1329,10 @@ def print_show_examples(title, rows):
         print("")
         return
 
-    header = "%-18s %5s %-10s %-18s %-7s %-6s %s" % (
+    header = "%-18s %5s %-10s %-10s %-18s %-7s %-6s %s" % (
         "EXAMPLE_ID",
         "SEQ",
+        "REV",
         "STATUS",
         "WORKER",
         "RETRY",
@@ -1266,9 +1348,10 @@ def print_show_examples(title, rows):
             row["max_retry"] if row["max_retry"] is not None else 0,
         )
         exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
-        print("%-18s %5s %-10s %-18s %-7s %-6s %s" % (
+        print("%-18s %5s %-10s %-10s %-18s %-7s %-6s %s" % (
             row["example_id"],
             row["seq"],
+            row["revision"] or "-",
             row["status"],
             row["assigned_worker"] or "-",
             retry,
@@ -1457,6 +1540,21 @@ def cmd_show(args):
         ],
     )
 
+    result_json = json_loads_dict(task["result_json"] if "result_json" in task.keys() else "{}")
+    if task["split_mode"] == "revision_scan":
+        print_key_value(
+            "Revision Scan Result",
+            [
+                ("Scan Status", result_json.get("scan_status", "pending")),
+                ("Good Boundary", result_json.get("good_revision")),
+                ("Bad Boundary", result_json.get("bad_revision")),
+                ("Last Good", result_json.get("last_good_revision")),
+                ("First Bad", result_json.get("first_bad_revision")),
+                ("First Bad Example", result_json.get("first_bad_example_id")),
+                ("Non-monotonic", ",".join(str(x) for x in result_json.get("non_monotonic_revisions", [])) or "-"),
+            ],
+        )
+
     print_flow_config(flow_config)
 
     if args.raw_json:
@@ -1490,7 +1588,7 @@ def fetch_examples_by_status(cur, task_id, status):
     """Fetch examples by status."""
     cur.execute(
         """
-        SELECT example_id, seq, target_arg, run_tcl_path, status,
+        SELECT example_id, seq, revision, resolved_zip_path, target_arg, run_tcl_path, status,
                assigned_worker, current_attempt_id, retry_count, max_retry,
                exit_code, failed_step, failed_reason, started_at, finished_at,
                log_file, run_log_dir, report_dir, message
@@ -1515,14 +1613,9 @@ def print_examples_rows(rows, verbose=False, names_only=False):
         print("No examples found.")
         return
 
-    header = "%-18s %4s %-10s %-10s %-7s %-6s %-45s" % (
-        "EXAMPLE_ID",
-        "SEQ",
-        "STATUS",
-        "WORKER",
-        "RETRY",
-        "EXIT",
-        "TARGET_ARG",
+    header = "%-18s %4s %-10s %-10s %-10s %-7s %-6s %-45s" % (
+        "EXAMPLE_ID", "SEQ", "REV", "STATUS", "WORKER",
+        "RETRY", "EXIT", "TARGET_ARG",
     )
     print(header)
     print("-" * len(header))
@@ -1531,17 +1624,13 @@ def print_examples_rows(rows, verbose=False, names_only=False):
         worker = row["assigned_worker"] or "-"
         retry = "%d/%d" % (row["retry_count"], row["max_retry"])
         exit_code = "-" if row["exit_code"] is None else str(row["exit_code"])
-
         print(
-            "%-18s %4d %-10s %-10s %-7s %-6s %-45s"
+            "%-18s %4d %-10s %-10s %-10s %-7s %-6s %-45s"
             % (
-                format_short(row["example_id"], 18),
-                row["seq"],
-                format_short(row["status"], 10),
-                format_short(worker, 10),
-                retry,
-                exit_code,
-                format_short(row["target_arg"], 45),
+                format_short(row["example_id"], 18), row["seq"],
+                format_short(row["revision"] or "-", 10),
+                format_short(row["status"], 10), format_short(worker, 10),
+                retry, exit_code, format_short(row["target_arg"], 45),
             )
         )
 
@@ -1626,7 +1715,7 @@ def fetch_all_examples(cur, task_id):
     """Fetch all examples for report generation."""
     cur.execute(
         """
-        SELECT example_id, seq, target_arg, run_tcl_path, status,
+        SELECT example_id, seq, revision, resolved_zip_path, target_arg, run_tcl_path, status,
                assigned_worker, retry_count, max_retry, exit_code,
                started_at, finished_at, log_file, run_log_dir,
                report_dir, message
@@ -1669,6 +1758,15 @@ def build_stat_summary(task, counts, workers):
         "elapsed_time     %s" % elapsed_time,
     ]
 
+    if get_task_field(task, "split_mode") == "revision_scan":
+        result = json_loads_dict(get_task_field(task, "result_json", "{}"))
+        lines.extend([
+            "scan_status      %s" % clean_report_text(result.get("scan_status")),
+            "last_good        %s" % clean_report_text(result.get("last_good_revision")),
+            "first_bad        %s" % clean_report_text(result.get("first_bad_revision")),
+            "non_monotonic    %s" % clean_report_text(result.get("non_monotonic_revisions")),
+        ])
+
     lines.append("")
     return "\n".join(lines)
 
@@ -1677,7 +1775,7 @@ def build_status_summary(rows):
     """Build status_summary file content."""
     lines = []
     lines.append(
-        "SEQ\tEXAMPLE_ID\tSTATUS\tWORKER\tRETRY\tEXIT\tTARGET_ARG\tLOG_FILE\tMESSAGE"
+        "SEQ\tEXAMPLE_ID\tREVISION\tSTATUS\tWORKER\tRETRY\tEXIT\tTARGET_ARG\tZIP_PATH\tLOG_FILE\tMESSAGE"
     )
 
     for row in rows:
@@ -1686,15 +1784,17 @@ def build_status_summary(rows):
         worker = row["assigned_worker"] or "-"
 
         lines.append(
-            "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s"
+            "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s"
             % (
                 row["seq"],
                 clean_report_text(row["example_id"]),
+                clean_report_text(row["revision"] or "-"),
                 clean_report_text(row["status"]),
                 clean_report_text(worker),
                 clean_report_text(retry),
                 clean_report_text(exit_code),
                 clean_report_text(row["target_arg"]),
+                clean_report_text(row["resolved_zip_path"] or "-"),
                 clean_report_text(row["log_file"]),
                 clean_report_text(row["message"]),
             )
@@ -1705,11 +1805,15 @@ def build_status_summary(rows):
 
 
 def build_list_file(rows, status):
-    """Build a path list for one status."""
+    """Build a path list; revision scans prefix each repeated target."""
     selected = [row for row in rows if row["status"] == status]
-    lines = [row["target_arg"] for row in selected]
+    lines = []
+    for row in selected:
+        if row["revision"]:
+            lines.append("r%s\t%s" % (row["revision"], row["target_arg"]))
+        else:
+            lines.append(row["target_arg"])
     return "\n".join(lines) + ("\n" if lines else "")
-
 
 def sanitize_report_component(value, default_value="unknown"):
     """Return a filesystem-safe report path component."""
@@ -1725,14 +1829,13 @@ def sanitize_report_component(value, default_value="unknown"):
 
 def report_revision_dir(task):
     """Return revision directory name used below report root."""
+    if get_task_field(task, "split_mode") == "revision_scan":
+        return "scan_%s" % sanitize_report_component(task["revision"], "revision_scan")
     revision = task["revision"]
     revision_text = format_revision(task)
-
     if revision and re.match(r"^\d+$", str(revision)):
         return "r%s" % revision
-
     return sanitize_report_component(revision_text, "unknown_revision")
-
 
 def get_task_field(task, key, default=None):
     """Return one task field from a dict or sqlite row."""
@@ -2265,6 +2368,21 @@ def cmd_check(args):
             cur.execute("SELECT COUNT(*) AS count FROM workers")
             worker_count = cur.fetchone()["count"]
 
+            cur.execute("PRAGMA table_info(task_examples)")
+            example_columns = set(row[1] for row in cur.fetchall())
+            missing_revision_columns = sorted(
+                {"revision", "resolved_zip_path"} - example_columns
+            )
+            if missing_revision_columns:
+                print_check_item(
+                    "revision scan schema",
+                    False,
+                    "missing task_examples columns: %s" % ", ".join(missing_revision_columns),
+                )
+                ok_all = False
+            else:
+                print_check_item("revision scan schema", True, "task_examples revision snapshot columns exist")
+
             print_check_item(
                 "database counts",
                 True,
@@ -2597,27 +2715,84 @@ def cmd_diagnose(args):
         sys.exit(2)
 
 
-def refresh_parent_task_status(cur, task_id):
-    """Refresh one parent task after a direct administrative database edit."""
+def compute_revision_scan_result(cur, task_id, existing_result=None):
+    """Compute first-bad metadata after all scan examples are terminal."""
     cur.execute(
         """
-        SELECT
-            t.task_id,
-            t.status,
-            t.started_at,
-            t.finished_at,
-            COUNT(e.example_id) AS total,
-            SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
-            SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
-            SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
-            SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
-            SUM(CASE WHEN e.status = 'canceled' THEN 1 ELSE 0 END) AS canceled_count,
-            SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
-        FROM tasks t
-        LEFT JOIN task_examples e
-            ON t.task_id = e.task_id
-        WHERE t.task_id = ?
-        GROUP BY t.task_id
+        SELECT example_id, revision, status, message, log_file
+        FROM task_examples
+        WHERE task_id = ?
+        ORDER BY CAST(revision AS INTEGER), seq, id
+        """,
+        (task_id,),
+    )
+    rows = cur.fetchall()
+    result = dict(existing_result or {})
+    result["candidate_revisions"] = [int(row["revision"]) for row in rows]
+
+    if not rows:
+        result["scan_status"] = "no_examples"
+        return "failed", "Revision scan has no examples.", result
+
+    first = rows[0]
+    last = rows[-1]
+    if first["status"] != "success":
+        result["scan_status"] = "invalid_good_boundary"
+        return "failed", "Good boundary r%s did not pass." % first["revision"], result
+    if last["status"] not in ("failed", "timeout"):
+        result["scan_status"] = "invalid_bad_boundary"
+        return "failed", "Bad boundary r%s did not fail." % last["revision"], result
+
+    first_bad = None
+    last_good = None
+    success_after_bad = []
+    for row in rows:
+        if row["status"] in ("failed", "timeout") and first_bad is None:
+            first_bad = row
+        elif row["status"] == "success":
+            if first_bad is None:
+                last_good = row
+            else:
+                success_after_bad.append(int(row["revision"]))
+
+    if first_bad is None:
+        result["scan_status"] = "no_failure_found"
+        return "failed", "Revision scan completed without a failing revision.", result
+
+    result.update({
+        "scan_status": "non_monotonic" if success_after_bad else "failure_found",
+        "last_good_revision": int(last_good["revision"]) if last_good else None,
+        "first_bad_revision": int(first_bad["revision"]),
+        "last_good_example_id": last_good["example_id"] if last_good else None,
+        "first_bad_example_id": first_bad["example_id"],
+        "first_bad_message": first_bad["message"] or "",
+        "first_bad_log_file": first_bad["log_file"] or "",
+        "non_monotonic_revisions": success_after_bad,
+    })
+    message = "Revision scan found first bad r%s; last good r%s" % (
+        first_bad["revision"], last_good["revision"] if last_good else "-",
+    )
+    if success_after_bad:
+        message += "; non-monotonic success after failure: %s" % ",".join(
+            str(value) for value in success_after_bad
+        )
+    return "success", message, result
+
+def refresh_parent_task_status(cur, task_id):
+    """Refresh one task after an administrative database edit."""
+    cur.execute(
+        """
+        SELECT t.task_id, t.status, t.split_mode, t.result_json,
+               t.started_at, t.finished_at,
+               COUNT(e.example_id) AS total,
+               SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+               SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
+               SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
+               SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
+               SUM(CASE WHEN e.status = 'canceled' THEN 1 ELSE 0 END) AS canceled_count,
+               SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
+        FROM tasks t LEFT JOIN task_examples e ON t.task_id = e.task_id
+        WHERE t.task_id = ? GROUP BY t.task_id
         """,
         (task_id,),
     )
@@ -2633,55 +2808,33 @@ def refresh_parent_task_status(cur, task_id):
     failed = int(row["failed_count"] or 0)
     canceled = int(row["canceled_count"] or 0)
     done = int(row["done_count"] or 0)
+    result_json = json_loads_dict(row["result_json"])
+    result_json.update({"total": total, "done": done, "success": success,
+                        "failed": failed, "running": running, "pending": pending})
 
     if total <= 0:
-        new_status = "failed"
-        message = "No examples found."
-    elif old_status == "canceling" and running > 0:
-        new_status = "canceling"
-        message = "Task canceling. waiting_running=%d progress=%d/%d" % (
-            running,
-            done,
-            total,
-        )
-    elif old_status == "canceling" and pending > 0:
-        new_status = "canceling"
-        message = "Task canceling. pending=%d" % pending
+        new_status, message = "failed", "No examples found."
+    elif old_status == "canceling" and (running > 0 or pending > 0):
+        new_status, message = "canceling", "Task canceling. progress=%d/%d" % (done, total)
     elif running > 0:
-        new_status = "running"
-        message = "Task is running. progress=%d/%d" % (done, total)
+        new_status, message = "running", "Task is running. progress=%d/%d" % (done, total)
     elif pending > 0:
-        if done > 0:
-            new_status = "running"
-            message = "Task is partially done. progress=%d/%d" % (done, total)
-        else:
-            new_status = "pending"
-            message = "Task is pending. progress=0/%d" % total
+        new_status = "running" if done > 0 else "pending"
+        message = "Task is partially done. progress=%d/%d" % (done, total) if done else "Task is pending. progress=0/%d" % total
     elif canceled > 0:
-        new_status = "canceled"
-        message = "Task canceled. canceled=%d done=%d total=%d" % (
-            canceled,
-            done,
-            total,
-        )
+        new_status, message = "canceled", "Task canceled. canceled=%d total=%d" % (canceled, total)
+    elif row["split_mode"] == "revision_scan":
+        new_status, message, result_json = compute_revision_scan_result(cur, task_id, result_json)
     elif failed > 0:
-        new_status = "failed"
-        message = "Task finished with failures. success=%d failed=%d total=%d" % (
-            success,
-            failed,
-            total,
-        )
+        new_status, message = "failed", "Task finished with failures. success=%d failed=%d total=%d" % (success, failed, total)
     elif success == total:
-        new_status = "success"
-        message = "Task finished successfully. total=%d" % total
+        new_status, message = "success", "Task finished successfully. total=%d" % total
     else:
-        new_status = "running"
-        message = "Task status is being reconciled. progress=%d/%d" % (done, total)
+        new_status, message = "running", "Task status is being reconciled. progress=%d/%d" % (done, total)
 
     now = local_now()
     started_at = row["started_at"]
     finished_at = row["finished_at"]
-
     if new_status == "running" and not started_at:
         started_at = now
     if new_status in TERMINAL_TASK_STATUSES and not finished_at:
@@ -2691,37 +2844,16 @@ def refresh_parent_task_status(cur, task_id):
 
     cur.execute(
         """
-        UPDATE tasks
-        SET status = ?,
-            started_at = ?,
-            finished_at = ?,
-            updated_at = ?,
-            message = ?
+        UPDATE tasks SET status = ?, started_at = ?, finished_at = ?,
+                         updated_at = ?, result_json = ?, message = ?
         WHERE task_id = ?
         """,
-        (
-            new_status,
-            started_at,
-            finished_at,
-            now,
-            message,
-            task_id,
-        ),
+        (new_status, started_at, finished_at, now,
+         json.dumps(result_json, ensure_ascii=False, sort_keys=True), message, task_id),
     )
-
     if old_status != new_status:
-        insert_event(
-            cur,
-            task_id,
-            None,
-            None,
-            None,
-            "task_status_changed",
-            "%s -> %s" % (old_status, new_status),
-        )
-
+        insert_event(cur, task_id, None, None, None, "task_status_changed", "%s -> %s" % (old_status, new_status))
     return new_status
-
 
 def request_scheduler_report_refresh(task_id, scheduler_url=None):
     """Ask the scheduler to refresh reports outside this command process."""
@@ -3064,6 +3196,18 @@ def build_parser():
     p_add.add_argument("--max-retry", type=int, help="retry count per example")
     p_add.add_argument("--max-time", type=int, help="timeout seconds per example")
     p_add.set_defaults(func=cmd_add)
+
+    p_find = sub.add_parser("find", help="create one vertical revision-scan task")
+    p_find.add_argument("template_name", help="template containing find_fail settings")
+    p_find.add_argument("run_tcl", help="one run.tcl path, absolute or relative to work_root")
+    p_find.add_argument("--good", type=int, default=None, help="override known good revision")
+    p_find.add_argument("--bad", type=int, default=None, help="override known bad revision")
+    p_find.add_argument("--confirm-fail", type=int, default=None, help="must be 1 in revision-scan v1")
+    p_find.add_argument("--name", help="task display name")
+    p_find.add_argument("--priority", type=int, help="priority, default from template")
+    p_find.add_argument("--max-retry", type=int, help="retry count per revision")
+    p_find.add_argument("--max-time", type=int, help="timeout seconds per revision")
+    p_find.set_defaults(func=cmd_find)
 
     p_list = sub.add_parser("list", help="list recent tasks")
     p_list.add_argument("--status", help="filter by task status")

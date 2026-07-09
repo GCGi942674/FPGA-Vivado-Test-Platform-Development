@@ -1402,6 +1402,17 @@ def _finish_attempt_once(data):
             conn.rollback()
             return {"ok": False, "error": "attempt not found"}, 404
 
+        if attempt["task_id"] != task_id or attempt["example_id"] != example_id:
+            conn.rollback()
+            return {
+                "ok": False,
+                "error": "attempt assignment mismatch",
+                "attempt_task_id": attempt["task_id"],
+                "attempt_example_id": attempt["example_id"],
+                "request_task_id": task_id,
+                "request_example_id": example_id,
+            }, 400
+
         if attempt["status"] != "running":
             conn.rollback()
             return {
@@ -1435,6 +1446,16 @@ def _finish_attempt_once(data):
         if not example:
             conn.rollback()
             return {"ok": False, "error": "example not found"}, 404
+
+        if example["task_id"] != task_id:
+            conn.rollback()
+            return {
+                "ok": False,
+                "error": "example task mismatch",
+                "example_task_id": example["task_id"],
+                "request_task_id": task_id,
+                "example_id": example_id,
+            }, 400
 
         retry_count = int(example["retry_count"] or 0)
         max_retry = int(example["max_retry"] or 0)

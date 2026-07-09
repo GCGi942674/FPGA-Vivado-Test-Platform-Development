@@ -37,6 +37,17 @@ Notes:
 USAGE
 }
 
+require_option_value() {
+    local option="$1"
+    local value="${2-}"
+
+    if [ -z "$value" ]; then
+        echo "Missing value for option: $option" >&2
+        print_usage >&2
+        exit 1
+    fi
+}
+
 parse_args() {
     if [ "$#" -eq 0 ]; then
         INPUT_TARGET="."
@@ -62,6 +73,7 @@ parse_args() {
                 exit 0
                 ;;
             --flow-config)
+                require_option_value "$1" "${2-}"
                 FLOW_CONFIG_PATH="$2"
                 shift 2
                 ;;
@@ -70,18 +82,22 @@ parse_args() {
                 shift
                 ;;
             --bg)
+                require_option_value "$1" "${2-}"
                 CLI_BG_MAX="$2"
                 shift 2
                 ;;
             --timeout)
+                require_option_value "$1" "${2-}"
                 CLI_TIME_LIMIT="$2"
                 shift 2
                 ;;
             --report-dst)
+                require_option_value "$1" "${2-}"
                 CLI_REPORT_DST_DIR="$2"
                 shift 2
                 ;;
             --galaxcore)
+                require_option_value "$1" "${2-}"
                 CLI_GALAXCORE_BIN="$2"
                 shift 2
                 ;;

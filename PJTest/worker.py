@@ -320,16 +320,25 @@ def is_report_target_gone(exc):
     if not isinstance(exc, HttpJsonError):
         return False
 
-    if exc.status_code != 404:
-        return False
-
     error_message = exc.error_message.strip().lower()
-    permanent_missing_errors = {
-        "attempt not found",
-        "task not found",
-        "example not found",
+    permanent_errors_by_status = {
+        400: {
+            "attempt assignment mismatch",
+            "attempt worker mismatch",
+            "example task mismatch",
+            "invalid status",
+            "missing attempt_id",
+            "missing example_id",
+            "missing task_id",
+            "missing worker",
+        },
+        404: {
+            "attempt not found",
+            "task not found",
+            "example not found",
+        },
     }
-    return error_message in permanent_missing_errors
+    return error_message in permanent_errors_by_status.get(exc.status_code, set())
 
 
 class WorkerState(object):

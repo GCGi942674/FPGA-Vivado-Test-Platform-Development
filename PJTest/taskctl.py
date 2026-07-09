@@ -1997,7 +1997,7 @@ def maintain_report_directories(report_root):
         cur.execute(
             """
             SELECT task_id, task_name, template_name, revision,
-                   revision_policy, status, created_at
+                   revision_policy, split_mode, status, created_at
             FROM tasks
             ORDER BY id ASC
             """

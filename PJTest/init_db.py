@@ -126,8 +126,10 @@ def task_examples_table_sql(table_name="task_examples"):
             finished_at TEXT,
 
             exit_code INTEGER,
+            raw_exit_code INTEGER,
             failed_step TEXT,
             failed_reason TEXT,
+            infra_reason TEXT,
             message TEXT,
 
             log_file TEXT,
@@ -166,6 +168,8 @@ def create_task_attempts(cur):
             finished_at TEXT,
 
             exit_code INTEGER,
+            raw_exit_code INTEGER,
+            infra_reason TEXT,
             timed_out INTEGER NOT NULL DEFAULT 0,
 
             log_file TEXT,
@@ -390,6 +394,16 @@ def migrate_existing_tables(cur):
             "run_log_dir": "TEXT",
             "report_dir": "TEXT",
             "message": "TEXT",
+            "raw_exit_code": "INTEGER",
+            "infra_reason": "TEXT",
+        },
+    )
+    ensure_columns(
+        cur,
+        "task_attempts",
+        {
+            "raw_exit_code": "INTEGER",
+            "infra_reason": "TEXT",
         },
     )
     ensure_columns(
@@ -457,7 +471,7 @@ def rebuild_task_examples_for_revision_scan(conn):
             "resolved_zip_path", "status", "assigned_worker",
             "current_attempt_id", "retry_count", "max_retry", "created_at",
             "updated_at", "started_at", "finished_at", "exit_code",
-            "failed_step", "failed_reason", "message", "log_file",
+            "raw_exit_code", "failed_step", "failed_reason", "infra_reason", "message", "log_file",
             "log_tail", "run_log_dir", "report_dir",
         ]
         select_parts = [name if name in existing else "NULL AS %s" % name for name in columns]

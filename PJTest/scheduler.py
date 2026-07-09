@@ -1331,19 +1331,23 @@ def _finish_attempt_once(data):
     attempt_id = data.get("attempt_id")
     status = data.get("status")
 
-    log_scheduler(
-        "INFO",
-        "report received worker=%s task=%s example=%s attempt=%s status=%s exit=%s"
-        % (
-            worker_name or "-",
-            task_id or "-",
-            example_id or "-",
-            attempt_id or "-",
-            status or "-",
-            data.get("exit_code"),
-        ),
-        task_id=task_id,
-    )
+    if SCHEDULER_DEBUG:
+        log_scheduler(
+            "DEBUG",
+            "report received worker=%s task=%s example=%s attempt=%s status=%s exit=%s raw_exit=%s infra=%s"
+            % (
+                worker_name or "-",
+                task_id or "-",
+                example_id or "-",
+                attempt_id or "-",
+                status or "-",
+                data.get("exit_code"),
+                data.get("raw_exit_code"),
+                data.get("infra_reason") or "-",
+            ),
+            task_id=task_id,
+            also_stdout=False,
+        )
 
     if not worker_name:
         return {"ok": False, "error": "missing worker"}, 400
@@ -1357,12 +1361,25 @@ def _finish_attempt_once(data):
         return {"ok": False, "error": "invalid status"}, 400
 
     exit_code = data.get("exit_code")
+    raw_exit_code = data.get("raw_exit_code")
     timed_out = 1 if data.get("timed_out") else 0
     message = data.get("message") or data.get("error_message") or ""
     log_file = data.get("log_file")
-    log_tail = data.get("log_tail")
+    log_tail = data.get("log_tail") or ""
     run_log_dir = data.get("run_log_dir")
     report_dir = data.get("report_dir")
+    infra_reason = data.get("infra_reason") or ""
+    infra_error = bool(data.get("infra_error"))
+
+    if not infra_error and status == "failed":
+        tail_text = str(log_tail or "")
+        if raw_exit_code == 75 or exit_code == 75:
+            if "Current slot already has a run.sh task running" in tail_text or "infra_slot_busy" in str(message):
+                infra_error = True
+                infra_reason = infra_reason or "slot_busy"
+
+    if infra_error and not infra_reason:
+        infra_reason = "infra_error"
 
     conn = get_conn()
     cur = conn.cursor()
@@ -1428,23 +1445,27 @@ def _finish_attempt_once(data):
             SET status = ?,
                 finished_at = ?,
                 exit_code = ?,
+                raw_exit_code = ?,
                 timed_out = ?,
                 log_file = ?,
                 log_tail = ?,
                 run_log_dir = ?,
                 report_dir = ?,
+                infra_reason = ?,
                 message = ?
             WHERE attempt_id = ?
             """,
             (
-                status,
+                "infra_failed" if infra_error else status,
                 now,
                 exit_code,
+                raw_exit_code,
                 timed_out,
                 log_file,
                 log_tail,
                 run_log_dir,
                 report_dir,
+                infra_reason,
                 message,
                 attempt_id,
             ),
@@ -1453,7 +1474,57 @@ def _finish_attempt_once(data):
         final_example_status = status
         requeued = False
 
-        if status in ("failed", "timeout") and retry_count < max_retry:
+        if infra_error:
+            final_example_status = "pending"
+            requeued = True
+
+            cur.execute(
+                """
+                UPDATE task_examples
+                SET status = 'pending',
+                    assigned_worker = NULL,
+                    current_attempt_id = NULL,
+                    updated_at = ?,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    exit_code = ?,
+                    raw_exit_code = ?,
+                    failed_step = 'worker_infra',
+                    failed_reason = ?,
+                    infra_reason = ?,
+                    message = ?,
+                    log_file = ?,
+                    log_tail = ?,
+                    run_log_dir = ?,
+                    report_dir = ?
+                WHERE example_id = ?
+                """,
+                (
+                    now,
+                    exit_code,
+                    raw_exit_code,
+                    infra_reason,
+                    infra_reason,
+                    "infra failure requeued without consuming retry: %s" % (message or infra_reason),
+                    log_file,
+                    log_tail,
+                    run_log_dir,
+                    report_dir,
+                    example_id,
+                ),
+            )
+
+            insert_event(
+                cur,
+                task_id,
+                example_id,
+                attempt_id,
+                worker_name,
+                "example_infra_requeued",
+                "Example requeued after infra failure: %s" % (infra_reason or message or "infra_error"),
+            )
+
+        elif status in ("failed", "timeout") and retry_count < max_retry:
             new_retry_count = retry_count + 1
             final_example_status = "pending"
             requeued = True
@@ -1469,7 +1540,9 @@ def _finish_attempt_once(data):
                     started_at = NULL,
                     finished_at = NULL,
                     exit_code = ?,
+                    raw_exit_code = ?,
                     failed_reason = ?,
+                    infra_reason = NULL,
                     message = ?,
                     log_file = ?,
                     log_tail = ?,
@@ -1481,6 +1554,7 @@ def _finish_attempt_once(data):
                     new_retry_count,
                     now,
                     exit_code,
+                    raw_exit_code,
                     status,
                     "requeued after %s, retry=%d/%d" % (
                         status,
@@ -1525,7 +1599,9 @@ def _finish_attempt_once(data):
                     updated_at = ?,
                     finished_at = ?,
                     exit_code = ?,
+                    raw_exit_code = ?,
                     failed_reason = ?,
+                    infra_reason = NULL,
                     message = ?,
                     log_file = ?,
                     log_tail = ?,
@@ -1540,6 +1616,7 @@ def _finish_attempt_once(data):
                     now,
                     now,
                     exit_code,
+                    raw_exit_code,
                     failed_reason,
                     message or status,
                     log_file,
@@ -1575,21 +1652,27 @@ def _finish_attempt_once(data):
         # Queue a non-blocking report refresh after the transaction commits.
         enqueue_share_report(task_id)
 
-        log_scheduler(
-            "INFO",
-            "report handled worker=%s task=%s example=%s attempt=%s status=%s final=%s requeued=%s exit=%s"
-            % (
-                worker_name,
-                task_id,
-                example_id,
-                attempt_id,
-                status,
-                final_example_status,
-                requeued,
-                exit_code,
-            ),
-            task_id=task_id,
-        )
+        slot_busy_noise = infra_reason == "slot_busy"
+
+        if not slot_busy_noise or SCHEDULER_DEBUG:
+            log_scheduler(
+                "INFO",
+                "report handled worker=%s task=%s example=%s attempt=%s status=%s final=%s requeued=%s exit=%s raw_exit=%s infra=%s"
+                % (
+                    worker_name,
+                    task_id,
+                    example_id,
+                    attempt_id,
+                    status,
+                    final_example_status,
+                    requeued,
+                    exit_code,
+                    raw_exit_code,
+                    infra_reason or "-",
+                ),
+                task_id=task_id,
+                also_stdout=not slot_busy_noise,
+            )
 
         return {
             "ok": True,

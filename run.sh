@@ -16,11 +16,19 @@ LOCK_TAG="${DTS_SLOT_WORKER:-${PJTEST_SLOT_WORKER:-${DTS_WORKER:-${GALAXCORE_WOR
 LOCK_TAG="$(echo "$LOCK_TAG" | sed 's#[^A-Za-z0-9_.-]#_#g')"
 
 RUN_SH_LOCK_FILE="${RUN_SH_LOCK_FILE:-${LOCK_DIR}/galaxcore_run_${LOCK_TAG}.lock}"
-exec 200>"$RUN_SH_LOCK_FILE"
 
-if ! flock -n 200; then
-    echo "[ERROR] Current slot already has a run.sh task running: $RUN_SH_LOCK_FILE"
-    exit 75
+# PJTest worker.py may hold this lock before it performs destructive slot
+# operations such as installing GalaxCore or running clean.sh.  In that mode,
+# run.sh must not try to acquire the same advisory lock again.
+if [ "${RUN_SH_LOCK_HELD:-0}" != "1" ]; then
+    exec 200>"$RUN_SH_LOCK_FILE"
+
+    if ! flock -n 200; then
+        echo "[ERROR] Current slot already has a run.sh task running: $RUN_SH_LOCK_FILE"
+        exit 75
+    fi
+else
+    echo "[INFO] run.sh slot lock already held by parent: $RUN_SH_LOCK_FILE"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

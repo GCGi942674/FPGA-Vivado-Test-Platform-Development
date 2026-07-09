@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import fcntl
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,18 @@ DEFAULT_WORKER_JOBS = int(os.environ.get("PJTEST_WORKER_JOBS", "8"))
 WORKER_SLOT_ROOT = Path(os.environ.get(
     "PJTEST_WORKER_SLOT_ROOT",
     "/home/user3/PJTest/worker_slots",
+))
+WORKER_PROCESS_LOCK_DIR = Path(os.environ.get(
+    "PJTEST_WORKER_PROCESS_LOCK_DIR",
+    "/home/user3/PJTest/tmp",
+))
+RUN_SH_LOCK_DIR = Path(os.environ.get(
+    "RUN_SH_LOCK_DIR",
+    "/home/user3/PJTest/tmp",
+))
+SLOT_BUSY_BACKOFF_SEC = int(os.environ.get(
+    "PJTEST_SLOT_BUSY_BACKOFF_SEC",
+    "60",
 ))
 SLOT_SVN_URL = os.environ.get(
     "PJTEST_SLOT_SVN_URL",
@@ -153,6 +166,153 @@ class HttpJsonError(RuntimeError):
             return str(data.get("error") or data.get("message") or raw_body).strip()
 
         return raw_body
+
+
+class WorkerSlotLockError(RuntimeError):
+    """Raised when another worker.py process already owns this worker slot."""
+
+
+class SlotBusyError(RuntimeError):
+    """Raised when the slot-level run lock is already held."""
+
+    def __init__(self, lock_file):
+        self.lock_file = str(lock_file)
+        RuntimeError.__init__(
+            self,
+            "Current slot already has a run.sh task running: %s" % self.lock_file,
+        )
+
+
+def sanitize_lock_tag(value):
+    """Return the same safe lock tag format used by run.sh."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "unknown"))
+
+
+_held_worker_process_locks = {}
+_held_worker_process_locks_lock = threading.Lock()
+
+
+def acquire_flock(lock_file, description, blocking=False):
+    """Open and lock one file, returning the file handle that holds the lock."""
+    lock_file = Path(lock_file).expanduser().resolve()
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(str(lock_file), "a+")
+    flags = fcntl.LOCK_EX
+    if not blocking:
+        flags |= fcntl.LOCK_NB
+
+    try:
+        fcntl.flock(handle.fileno(), flags)
+    except BlockingIOError:
+        try:
+            handle.seek(0)
+            owner = handle.read().strip()
+        except Exception:
+            owner = ""
+        handle.close()
+        detail = "already locked"
+        if owner:
+            detail += "; owner=%s" % owner.replace("\n", " ")[:300]
+        raise WorkerSlotLockError("%s lock %s %s" % (description, lock_file, detail))
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        "pid=%s hostname=%s started_at=%s description=%s\n"
+        % (os.getpid(), socket.gethostname(), local_now(), description)
+    )
+    handle.flush()
+    os.fsync(handle.fileno())
+    return handle
+
+
+def acquire_worker_process_lock(worker_name):
+    """Ensure only one worker.py process/thread owns one scheduler-visible slot."""
+    safe = sanitize_lock_tag(worker_name)
+    lock_file = WORKER_PROCESS_LOCK_DIR / ("pjtest_worker_%s.lock" % safe)
+
+    with _held_worker_process_locks_lock:
+        if worker_name in _held_worker_process_locks:
+            raise WorkerSlotLockError("duplicate worker loop in this process: %s" % worker_name)
+        handle = acquire_flock(lock_file, "worker-process:%s" % worker_name, blocking=False)
+        _held_worker_process_locks[worker_name] = handle
+        return handle
+
+
+def release_worker_process_lock(worker_name):
+    """Release a worker-process lock."""
+    with _held_worker_process_locks_lock:
+        handle = _held_worker_process_locks.pop(worker_name, None)
+    if handle is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+def run_sh_lock_file_for_worker(worker_name):
+    """Return the slot run.sh lock path before any destructive slot operation."""
+    safe = sanitize_lock_tag(worker_name)
+    return RUN_SH_LOCK_DIR.expanduser().resolve() / ("galaxcore_run_%s.lock" % safe)
+
+
+def acquire_slot_run_lock(worker_name, log=None):
+    """Hold the run.sh slot lock across install/pre-clean/run/post-clean.
+
+    run.sh itself honors RUN_SH_LOCK_HELD=1, so the child process does not try
+    to lock the same file again while the worker process keeps the lock held.
+    """
+    lock_file = run_sh_lock_file_for_worker(worker_name)
+    try:
+        handle = acquire_flock(lock_file, "run-slot:%s" % worker_name, blocking=False)
+    except WorkerSlotLockError:
+        if log is not None:
+            log_line(log, "Current slot already has a run.sh task running: %s" % lock_file)
+        raise SlotBusyError(lock_file)
+    if log is not None:
+        log_line(log, "slot run lock acquired: %s" % lock_file)
+    return handle, str(lock_file)
+
+
+def release_slot_run_lock(handle, log=None):
+    """Release the slot run lock held across one example."""
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        path = handle.name
+    except Exception:
+        path = "-"
+    try:
+        handle.close()
+    except Exception:
+        pass
+    if log is not None:
+        log_line(log, "slot run lock released: %s" % path)
+
+
+def slot_is_busy_before_pull(worker_name):
+    """Return True if this slot already has an active run lock.
+
+    This guard runs before pulling a scheduler task.  If an old run.sh or a
+    duplicate legacy worker still owns the slot lock, the worker must not pull
+    another example and create an immediate infra_failed/requeue loop.
+    """
+    handle = None
+    try:
+        handle, _lock_file = acquire_slot_run_lock(worker_name, log=None)
+        return False
+    except SlotBusyError:
+        return True
+    finally:
+        release_slot_run_lock(handle, log=None)
 
 
 def is_report_target_gone(exc):
@@ -1103,10 +1263,22 @@ def expected_result_env_path(work_root, target_arg):
     return work_root / "vivado_runner" / "runtime" / "status" / case_rel / "result.env"
 
 
-def find_result_env(work_root, target_arg):
-    """Find vivado_runner result.env for the current single example."""
+def find_result_env(work_root, target_arg, min_mtime=None):
+    """Find vivado_runner result.env for the current single example.
+
+    min_mtime prevents a failed/non-started run from reading stale result.env
+    files left by an earlier example in the same slot.
+    """
+    def is_new_enough(path):
+        if min_mtime is None:
+            return True
+        try:
+            return Path(path).stat().st_mtime >= float(min_mtime)
+        except Exception:
+            return False
+
     expected = expected_result_env_path(work_root, target_arg)
-    if expected and expected.is_file():
+    if expected and expected.is_file() and is_new_enough(expected):
         return str(expected), parse_env_file(expected)
 
     status_root = Path(work_root) / "vivado_runner" / "runtime" / "status"
@@ -1132,7 +1304,7 @@ def find_result_env(work_root, target_arg):
 
         if run_tcl and target_abs:
             try:
-                if str(Path(run_tcl).resolve()) == target_abs:
+                if str(Path(run_tcl).resolve()) == target_abs and is_new_enough(path):
                     return str(path), data
             except Exception:
                 pass
@@ -1141,7 +1313,7 @@ def find_result_env(work_root, target_arg):
             mtime = path.stat().st_mtime
         except Exception:
             mtime = 0
-        if mtime > newest_mtime:
+        if is_new_enough(path) and mtime > newest_mtime:
             newest_mtime = mtime
             newest_path = path
 
@@ -1492,6 +1664,10 @@ def run_command(task, shell_name, log, worker_name):
 
     env = os.environ.copy()
     env.update(build_runtime_env(task, worker_name))
+    if task.get("_pjtest_run_lock_held"):
+        env["RUN_SH_LOCK_HELD"] = "1"
+        if task.get("_pjtest_run_lock_file"):
+            env["RUN_SH_LOCK_FILE"] = str(task.get("_pjtest_run_lock_file"))
     if PROTOBUF_LIB_DIR:
         old_lib_path = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = (
@@ -1557,9 +1733,13 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
     """Execute one pulled task example and report the result."""
     log_dir, log_file = prepare_log_file(worker_name, task)
     exit_code = 1
+    raw_exit_code = None
     timed_out = False
     status = "failed"
     message = ""
+    infra_reason = None
+    result_env = {}
+    result_env_path = None
     start_time = time.time()
 
     state.set(
@@ -1579,74 +1759,126 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
     try:
         with open(log_file, "w", encoding="utf-8", errors="ignore") as log:
             log.write("[%s] PJTest worker started example\n" % local_now())
+            slot_lock_handle = None
 
-            slot_task = prepare_task_for_slot(
-                task,
-                worker_name,
-                args.slot_root,
-                log=log,
-            )
+            try:
+                # Hold the same slot lock before install/pre-clean.  This
+                # prevents a duplicate worker process from cleaning or
+                # reinstalling a slot while a real run.sh is still active.
+                slot_lock_handle, slot_lock_file = acquire_slot_run_lock(worker_name, log=log)
 
-            if getattr(args, "verbose_console", False):
-                console_line(worker_name, "install zip")
-            install_galaxcore_zip(slot_task, install_root_override, log)
+                slot_task = prepare_task_for_slot(
+                    task,
+                    worker_name,
+                    args.slot_root,
+                    log=log,
+                )
+                slot_task["_pjtest_run_lock_held"] = True
+                slot_task["_pjtest_run_lock_file"] = slot_lock_file
 
-            if getattr(args, "verbose_console", False):
-                console_line(worker_name, "update flow_config")
-            updated, config_message = update_flow_config_file(
-                slot_task["work_root"],
-                slot_task.get("flow_config") or {},
-            )
-            log.write("[%s] flow_config update: %s %s\n" % (
-                local_now(),
-                updated,
-                config_message,
-            ))
-            log.flush()
+                if getattr(args, "verbose_console", False):
+                    console_line(worker_name, "install zip")
+                install_galaxcore_zip(slot_task, install_root_override, log)
 
-            if getattr(args, "verbose_console", False):
-                console_line(worker_name, "pre-clean slot")
-            pre_clean_rc = run_clean_script(slot_task["work_root"], shell_name, log, reason="before run.sh", worker_name=worker_name)
-            log.write("[%s] pre-clean exit_code: %s\n" % (local_now(), pre_clean_rc))
-            log.flush()
-
-            if getattr(args, "verbose_console", False):
-                console_line(worker_name, "run command")
-            exit_code, timed_out = run_command(slot_task, shell_name, log, worker_name)
-
-            result_env_path, result_env = find_result_env(
-                slot_task["work_root"],
-                slot_task.get("target_arg"),
-            )
-            if result_env_path:
-                log.write("[%s] vivado_runner result_env: %s\n" % (local_now(), result_env_path))
-                log.write("[%s] vivado_runner result_data: %s\n" % (
+                if getattr(args, "verbose_console", False):
+                    console_line(worker_name, "update flow_config")
+                updated, config_message = update_flow_config_file(
+                    slot_task["work_root"],
+                    slot_task.get("flow_config") or {},
+                )
+                log.write("[%s] flow_config update: %s %s\n" % (
                     local_now(),
-                    json.dumps(result_env, ensure_ascii=False, sort_keys=True),
+                    updated,
+                    config_message,
                 ))
-            else:
-                log.write("[%s] vivado_runner result_env: not found\n" % local_now())
-            log.flush()
+                log.flush()
 
-            status, exit_code, message, case_status, case_reason, case_runtime = classify_result(
-                exit_code,
-                timed_out,
-                result_env,
-            )
+                if getattr(args, "verbose_console", False):
+                    console_line(worker_name, "pre-clean slot")
+                pre_clean_rc = run_clean_script(
+                    slot_task["work_root"],
+                    shell_name,
+                    log,
+                    reason="before run.sh",
+                    worker_name=worker_name,
+                )
+                log.write("[%s] pre-clean exit_code: %s\n" % (local_now(), pre_clean_rc))
+                log.flush()
 
-            if getattr(args, "verbose_console", False):
-                console_line(worker_name, "case result status=%s reason=%s" % (
-                    case_status or status,
-                    case_reason or "-",
-                ))
+                if getattr(args, "verbose_console", False):
+                    console_line(worker_name, "run command")
+                command_start_time = time.time()
+                exit_code, timed_out = run_command(slot_task, shell_name, log, worker_name)
+                raw_exit_code = exit_code
 
-            if getattr(args, "verbose_console", False):
-                console_line(worker_name, "clean slot")
-            run_clean_script(slot_task["work_root"], shell_name, log, reason="after run.sh", worker_name=worker_name)
+                # Only read result.env files produced by this command.  Without
+                # the mtime guard, a non-started run can pick up a stale
+                # result.env from an earlier example in the same slot and hide
+                # the true raw exit code.
+                result_env_path, result_env = find_result_env(
+                    slot_task["work_root"],
+                    slot_task.get("target_arg"),
+                    min_mtime=command_start_time,
+                )
+                if result_env_path:
+                    log.write("[%s] vivado_runner result_env: %s\n" % (local_now(), result_env_path))
+                    log.write("[%s] vivado_runner result_data: %s\n" % (
+                        local_now(),
+                        json.dumps(result_env, ensure_ascii=False, sort_keys=True),
+                    ))
+                else:
+                    log.write("[%s] vivado_runner result_env: not found\n" % local_now())
+                log.flush()
+
+                status, exit_code, message, case_status, case_reason, case_runtime = classify_result(
+                    exit_code,
+                    timed_out,
+                    result_env,
+                )
+
+                if raw_exit_code == 75:
+                    recent_text = tail_text(log_file, max_lines=120, max_chars=8000)
+                    if "Current slot already has a run.sh task running" in recent_text:
+                        infra_reason = "slot_busy"
+                        status = "failed"
+                        exit_code = raw_exit_code
+                        message = "infra_slot_busy raw_exit_code=75"
+
+                if getattr(args, "verbose_console", False):
+                    console_line(worker_name, "case result status=%s reason=%s" % (
+                        result_env.get("STATUS") or status,
+                        result_env.get("REASON") or infra_reason or "-",
+                    ))
+
+                if infra_reason == "slot_busy":
+                    log.write("[%s] clean.sh skipped because slot is busy\n" % local_now())
+                    log.flush()
+                else:
+                    if getattr(args, "verbose_console", False):
+                        console_line(worker_name, "clean slot")
+                    run_clean_script(slot_task["work_root"], shell_name, log, reason="after run.sh", worker_name=worker_name)
+
+            finally:
+                release_slot_run_lock(slot_lock_handle, log=log)
+
+    except SlotBusyError as exc:
+        status = "failed"
+        exit_code = 75
+        raw_exit_code = 75
+        timed_out = False
+        infra_reason = "slot_busy"
+        message = "infra_slot_busy: %s" % exc
+
+        try:
+            with open(log_file, "a", encoding="utf-8", errors="ignore") as log:
+                log.write("\n[%s] Slot busy: %s\n" % (local_now(), exc))
+        except Exception:
+            pass
 
     except Exception as exc:
         status = "failed"
         exit_code = 1
+        raw_exit_code = raw_exit_code if raw_exit_code is not None else 1
         timed_out = False
         message = str(exc)
 
@@ -1665,13 +1897,16 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
         "attempt_id": task["attempt_id"],
         "status": status,
         "exit_code": exit_code,
+        "raw_exit_code": raw_exit_code,
         "timed_out": timed_out,
+        "infra_error": bool(infra_reason),
+        "infra_reason": infra_reason,
         "message": message,
-        "case_status": result_env.get("STATUS") if "result_env" in locals() else None,
-        "case_reason": result_env.get("REASON") if "result_env" in locals() else None,
-        "case_runtime_sec": result_env.get("RUNTIME_SEC") if "result_env" in locals() else None,
-        "case_ret_code": result_env.get("RET_CODE") if "result_env" in locals() else None,
-        "result_env_file": result_env_path if "result_env_path" in locals() else None,
+        "case_status": result_env.get("STATUS") if result_env else None,
+        "case_reason": result_env.get("REASON") if result_env else None,
+        "case_runtime_sec": result_env.get("RUNTIME_SEC") if result_env else None,
+        "case_ret_code": result_env.get("RET_CODE") if result_env else None,
+        "result_env_file": result_env_path,
         "log_file": log_file,
         "log_tail": log_tail,
         "run_log_dir": log_dir,
@@ -1701,17 +1936,19 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
         )
 
     elapsed = time.time() - start_time
-    console_line(worker_name, "DONE status=%s rc=%s timeout=%s sec=%.1f %s log=%s" % (
+    console_line(worker_name, "DONE status=%s rc=%s raw_rc=%s timeout=%s infra=%s sec=%.1f %s log=%s" % (
         status,
         exit_code,
+        raw_exit_code if raw_exit_code is not None else "-",
         timed_out,
+        infra_reason or "-",
         elapsed,
         short_target(message, 70),
         log_file,
     ))
 
     state.set("idle", None, None, None, "last result: %s" % status)
-    return status
+    return status, infra_reason
 
 def build_capabilities(args):
     """Build worker capabilities reported to scheduler."""
@@ -1730,6 +1967,13 @@ def build_capabilities(args):
 def worker_loop(args):
     """Main worker loop."""
     worker_name = args.worker_name or DEFAULT_WORKER_NAME or get_default_worker_name()
+
+    try:
+        acquire_worker_process_lock(worker_name)
+    except WorkerSlotLockError as exc:
+        console_error(worker_name, "worker slot already active; refusing duplicate process: %s" % exc)
+        return 75
+
     state = WorkerState(worker_name)
     state.dump_json = args.dump_json
     capabilities = build_capabilities(args)
@@ -1751,6 +1995,28 @@ def worker_loop(args):
         while not is_shutdown_requested(args):
             state.set("idle", None, None, None, "requesting task")
             flush_pending_reports(args.scheduler, worker_name, state, args)
+
+            if slot_is_busy_before_pull(worker_name):
+                state.set(
+                    "idle",
+                    None,
+                    None,
+                    None,
+                    "slot busy before pull; wait",
+                )
+                console_error(
+                    worker_name,
+                    "SLOT_BUSY_BEFORE_PULL skip pulling task; backoff=%ss"
+                    % SLOT_BUSY_BACKOFF_SEC,
+                )
+
+                if args.once:
+                    return 75
+
+                if wait_or_shutdown(args, max(args.interval, SLOT_BUSY_BACKOFF_SEC)):
+                    break
+
+                continue
 
             try:
                 response = pull_task(
@@ -1784,7 +2050,7 @@ def worker_loop(args):
                 continue
 
             try:
-                run_one_task(
+                result_status, result_infra_reason = run_one_task(
                     args.scheduler,
                     worker_name,
                     task,
@@ -1793,6 +2059,20 @@ def worker_loop(args):
                     state,
                     args,
                 )
+
+                if result_infra_reason == "slot_busy":
+                    console_error(
+                        worker_name,
+                        "SLOT_BUSY_AFTER_REPORT backoff=%ss"
+                        % SLOT_BUSY_BACKOFF_SEC,
+                    )
+
+                    if args.once:
+                        return 75
+
+                    if wait_or_shutdown(args, max(args.interval, SLOT_BUSY_BACKOFF_SEC)):
+                        break
+
             except Exception:
                 if args.once:
                     return 1
@@ -1810,6 +2090,7 @@ def worker_loop(args):
             send_heartbeat(args.scheduler, worker_name, state)
         except Exception:
             pass
+        release_worker_process_lock(worker_name)
 
 
 

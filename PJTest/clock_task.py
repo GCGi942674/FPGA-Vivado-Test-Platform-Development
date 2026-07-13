@@ -5,7 +5,7 @@ PJTest daily batch runner.
 
 The runner reads Tasks.yaml, resolves one revision for the entire batch,
 writes a YAML snapshot in which every task uses that fixed revision, and then
-calls taskctl.py apply with the snapshot.
+submits the tasks one by one with a short interval between adjacent tasks.
 
 This guarantees that all tasks created by one daily batch use the same
 GalaxCore revision.
@@ -19,6 +19,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +34,7 @@ DEFAULT_BATCH_STATUS_FILE = "/home/user3/PJTest/batch_status.json"
 DEFAULT_LOG_FILE = "/home/user3/PJTest/logs/daily_runner.log"
 DEFAULT_BATCH_SNAPSHOT_DIR = "/home/user3/PJTest/data/batch_snapshots"
 DEFAULT_ZIP_DIR = "/home/xshare/zhouwei_runcache/GalaxCore/zip"
+DEFAULT_TASK_SUBMIT_INTERVAL_SECONDS = 30.0
 
 DB_PATH = Path(os.environ.get("PJTEST_DB_PATH", DEFAULT_DB_PATH))
 YAML_PATH = Path(os.environ.get("PJTEST_YAML_PATH", DEFAULT_YAML_PATH))
@@ -43,6 +45,12 @@ BATCH_STATUS_FILE = Path(
 LOG_FILE = Path(os.environ.get("PJTEST_DAILY_LOG_FILE", DEFAULT_LOG_FILE))
 BATCH_SNAPSHOT_DIR = Path(
     os.environ.get("PJTEST_BATCH_SNAPSHOT_DIR", DEFAULT_BATCH_SNAPSHOT_DIR)
+)
+TASK_SUBMIT_INTERVAL_SECONDS = float(
+    os.environ.get(
+        "PJTEST_TASK_SUBMIT_INTERVAL_SECONDS",
+        DEFAULT_TASK_SUBMIT_INTERVAL_SECONDS,
+    )
 )
 
 ZIP_RE = re.compile(r"^Galax[Cc]ore_(\d+)\.zip$")
@@ -353,41 +361,132 @@ def write_batch_yaml_snapshot(data, task_list, revision, start_time):
     return snapshot_path
 
 
-def run_taskctl_apply(yaml_path):
-    """Call taskctl.py apply and stream its output to the daily log."""
-    command = [
-        sys.executable,
-        str(TASKCTL_PATH),
-        "apply",
-        str(yaml_path),
-    ]
-    log_message("Running: %s" % " ".join(command))
+def run_taskctl_apply(yaml_path, interval_seconds=None):
+    """Submit snapshot tasks one by one, spacing adjacent submissions."""
+    if interval_seconds is None:
+        interval_seconds = TASK_SUBMIT_INTERVAL_SECONDS
+
+    if interval_seconds < 0:
+        raise ValueError("task submit interval cannot be negative")
 
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            bufsize=1,
-        )
+        with Path(yaml_path).open("r", encoding="utf-8") as yaml_file:
+            data = yaml.safe_load(yaml_file)
 
-        if process.stdout is not None:
-            for line in process.stdout:
-                log_message("  %s" % line.rstrip())
-
-        return_code = process.wait()
-
-        if return_code != 0:
-            log_message(
-                "taskctl apply exited with code %d" % return_code
+        if isinstance(data, dict) and "tasks" in data:
+            task_list = data["tasks"]
+        elif isinstance(data, list):
+            task_list = data
+        else:
+            raise ValueError(
+                "YAML must contain a list or a dictionary with a 'tasks' key."
             )
-            return False
 
-        return True
+        if not isinstance(task_list, list) or not task_list:
+            raise ValueError("YAML task list is empty.")
     except Exception as exc:
-        log_message("Failed to run taskctl apply: %s" % exc)
+        log_message("Failed to load batch snapshot: %s" % exc)
         return False
+
+    success = 0
+    failed = 0
+    total = len(task_list)
+
+    log_message(
+        "Submitting %d tasks one by one; interval between tasks: %.1f seconds"
+        % (total, interval_seconds)
+    )
+
+    for index, entry in enumerate(task_list, 1):
+        if not isinstance(entry, dict):
+            failed += 1
+            log_message(
+                "[%d/%d] Invalid task entry, expected a mapping."
+                % (index, total)
+            )
+        else:
+            template = entry.get("template")
+            target = entry.get("target")
+
+            if not template:
+                failed += 1
+                log_message(
+                    "[%d/%d] Missing task template, submission skipped."
+                    % (index, total)
+                )
+            else:
+                command = [
+                    sys.executable,
+                    str(TASKCTL_PATH),
+                    "add",
+                    str(template),
+                ]
+                if target is not None:
+                    command.append(str(target))
+
+                option_map = (
+                    ("revision", "--revision"),
+                    ("name", "--name"),
+                    ("priority", "--priority"),
+                    ("max_retry", "--max-retry"),
+                    ("max_time", "--max-time"),
+                )
+                for field_name, option_name in option_map:
+                    value = entry.get(field_name)
+                    if value is not None:
+                        command.extend([option_name, str(value)])
+
+                log_message(
+                    "[%d/%d] Running: %s"
+                    % (index, total, " ".join(command))
+                )
+
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        universal_newlines=True,
+                        bufsize=1,
+                    )
+
+                    if process.stdout is not None:
+                        for line in process.stdout:
+                            log_message("  %s" % line.rstrip())
+
+                    return_code = process.wait()
+                    if return_code == 0:
+                        success += 1
+                        log_message(
+                            "[%d/%d] Task submitted successfully: %s"
+                            % (index, total, template)
+                        )
+                    else:
+                        failed += 1
+                        log_message(
+                            "[%d/%d] taskctl add exited with code %d: %s"
+                            % (index, total, return_code, template)
+                        )
+                except Exception as exc:
+                    failed += 1
+                    log_message(
+                        "[%d/%d] Failed to run taskctl add for %s: %s"
+                        % (index, total, template, exc)
+                    )
+
+        # Delay only between adjacent task submissions, never after the last one.
+        if index < total:
+            log_message(
+                "Waiting %.1f seconds before submitting the next task."
+                % interval_seconds
+            )
+            time.sleep(interval_seconds)
+
+    log_message(
+        "Task submission summary: SUCCESS=%d FAILED=%d"
+        % (success, failed)
+    )
+    return failed == 0
 
 
 def start_new_batch():
@@ -424,6 +523,7 @@ def start_new_batch():
         "revision_source": revision_source,
         "zip_path": str(zip_path),
         "task_count": len(task_list),
+        "task_submit_interval_seconds": TASK_SUBMIT_INTERVAL_SECONDS,
     }
     write_batch_status(status)
 
@@ -442,7 +542,7 @@ def start_new_batch():
         status["duration_seconds"] = (
             end_time - start_time
         ).total_seconds()
-        status["error"] = "taskctl apply failed"
+        status["error"] = "task submission failed"
         write_batch_status(status)
         log_message("Batch creation failed, status updated.")
         return False

@@ -675,9 +675,30 @@ def compute_revision_scan_result(cur, task_id, existing_result=None):
     first = rows[0]
     last = rows[-1]
     if first["status"] != "success":
+        if first["status"] == "timeout":
+            result.update({
+                "scan_status": "inconclusive_timeout",
+                "timeout_revisions": [int(row["revision"]) for row in rows if row["status"] == "timeout"],
+                "timeout_example_ids": [row["example_id"] for row in rows if row["status"] == "timeout"],
+                "first_bad_revision": None,
+                "first_bad_example_id": None,
+            })
+            return "failed", "Revision scan inconclusive: good boundary r%s timed out." % first["revision"], result
         result["scan_status"] = "invalid_good_boundary"
         return "failed", "Good boundary r%s did not pass." % first["revision"], result
-    if last["status"] not in ("failed", "timeout"):
+    timeout_rows = [row for row in rows if row["status"] == "timeout"]
+    if timeout_rows:
+        result.update({
+            "scan_status": "inconclusive_timeout",
+            "timeout_revisions": [int(row["revision"]) for row in timeout_rows],
+            "timeout_example_ids": [row["example_id"] for row in timeout_rows],
+            "first_bad_revision": None,
+            "first_bad_example_id": None,
+        })
+        return "failed", "Revision scan inconclusive: timeout revisions=%s." % ",".join(
+            str(row["revision"]) for row in timeout_rows
+        ), result
+    if last["status"] != "failed":
         result["scan_status"] = "invalid_bad_boundary"
         return "failed", "Bad boundary r%s did not fail." % last["revision"], result
 
@@ -685,7 +706,7 @@ def compute_revision_scan_result(cur, task_id, existing_result=None):
     last_good = None
     success_after_bad = []
     for row in rows:
-        if row["status"] in ("failed", "timeout") and first_bad is None:
+        if row["status"] == "failed" and first_bad is None:
             first_bad = row
         elif row["status"] == "success":
             if first_bad is None:
@@ -1384,6 +1405,7 @@ def _finish_attempt_once(data):
     if status == "timeout" or timed_out or safe_int(raw_exit_code, None) == 124:
         status = "timeout"
         exit_code = 124
+        raw_exit_code = 124
         timed_out = 1
 
     conn = get_conn()

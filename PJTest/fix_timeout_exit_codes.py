@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Repair timeout rows whose final exit_code was overwritten by result.env.
+"""Normalize timeout rows whose final exit fields were inconsistent.
 
 Equivalent SQL:
 
     UPDATE task_attempts
-    SET exit_code = 124
+    SET exit_code = 124,
+        raw_exit_code = 124,
+        timed_out = 1
     WHERE status = 'timeout'
-      AND exit_code = 130
-      AND raw_exit_code = 124;
+      AND (
+          COALESCE(exit_code, -1) != 124
+          OR COALESCE(raw_exit_code, -1) != 124
+          OR COALESCE(timed_out, 0) != 1
+      );
 
     UPDATE task_examples
-    SET exit_code = 124
+    SET exit_code = 124,
+        raw_exit_code = 124
     WHERE status = 'timeout'
-      AND exit_code = 130
-      AND raw_exit_code = 124;
+      AND (
+          COALESCE(exit_code, -1) != 124
+          OR COALESCE(raw_exit_code, -1) != 124
+      );
 """
 
 import argparse
@@ -32,34 +40,73 @@ DEFAULT_DB_PATH = get_path(
 
 
 def count_bad_rows(cur, table_name):
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM %s
-        WHERE status = 'timeout'
-          AND exit_code = 130
-          AND raw_exit_code = 124
-        """ % table_name
-    )
+    if table_name == "task_attempts":
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM task_attempts
+            WHERE status = 'timeout'
+              AND (
+                  COALESCE(exit_code, -1) != 124
+                  OR COALESCE(raw_exit_code, -1) != 124
+                  OR COALESCE(timed_out, 0) != 1
+              )
+            """
+        )
+    elif table_name == "task_examples":
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM task_examples
+            WHERE status = 'timeout'
+              AND (
+                  COALESCE(exit_code, -1) != 124
+                  OR COALESCE(raw_exit_code, -1) != 124
+              )
+            """
+        )
+    else:
+        raise ValueError("unsupported table: %s" % table_name)
     return int(cur.fetchone()[0] or 0)
 
 
 def repair_table(cur, table_name):
-    cur.execute(
-        """
-        UPDATE %s
-        SET exit_code = 124
-        WHERE status = 'timeout'
-          AND exit_code = 130
-          AND raw_exit_code = 124
-        """ % table_name
-    )
+    if table_name == "task_attempts":
+        cur.execute(
+            """
+            UPDATE task_attempts
+            SET exit_code = 124,
+                raw_exit_code = 124,
+                timed_out = 1
+            WHERE status = 'timeout'
+              AND (
+                  COALESCE(exit_code, -1) != 124
+                  OR COALESCE(raw_exit_code, -1) != 124
+                  OR COALESCE(timed_out, 0) != 1
+              )
+            """
+        )
+    elif table_name == "task_examples":
+        cur.execute(
+            """
+            UPDATE task_examples
+            SET exit_code = 124,
+                raw_exit_code = 124
+            WHERE status = 'timeout'
+              AND (
+                  COALESCE(exit_code, -1) != 124
+                  OR COALESCE(raw_exit_code, -1) != 124
+              )
+            """
+        )
+    else:
+        raise ValueError("unsupported table: %s" % table_name)
     return cur.rowcount
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Repair PJTest timeout rows with exit_code=130/raw_exit_code=124."
+        description="Normalize PJTest timeout rows to exit_code=124/raw_exit_code=124."
     )
     parser.add_argument(
         "--db",

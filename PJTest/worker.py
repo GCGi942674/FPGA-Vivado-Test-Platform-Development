@@ -1360,8 +1360,8 @@ def classify_result(exit_code, timed_out, result_env, raw_exit_code=None):
     else:
         status = "failed"
 
-    report_exit_code = 124 if outer_timed_out else exit_code
-    if not outer_timed_out and ret_code is not None:
+    report_exit_code = 124 if status == "timeout" else exit_code
+    if status != "timeout" and ret_code is not None:
         try:
             report_exit_code = int(ret_code)
         except Exception:
@@ -1847,6 +1847,10 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
                     result_env,
                     raw_exit_code=raw_exit_code,
                 )
+                if status == "timeout":
+                    exit_code = 124
+                    timed_out = True
+                    raw_exit_code = 124
 
                 if raw_exit_code == 75:
                     recent_text = tail_text(log_file, max_lines=120, max_chars=8000)

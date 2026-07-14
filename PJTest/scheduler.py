@@ -1381,6 +1381,11 @@ def _finish_attempt_once(data):
     if infra_error and not infra_reason:
         infra_reason = "infra_error"
 
+    if status == "timeout" or timed_out or safe_int(raw_exit_code, None) == 124:
+        status = "timeout"
+        exit_code = 124
+        timed_out = 1
+
     conn = get_conn()
     cur = conn.cursor()
     now = local_now()

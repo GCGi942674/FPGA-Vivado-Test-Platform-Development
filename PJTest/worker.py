@@ -1332,22 +1332,24 @@ def find_result_env(work_root, target_arg, min_mtime=None):
     return None, {}
 
 
-def classify_result(exit_code, timed_out, result_env):
+def classify_result(exit_code, timed_out, result_env, raw_exit_code=None):
     """Convert vivado_runner result.env into scheduler status/message."""
     case_status = str(result_env.get("STATUS") or "").upper()
     reason = result_env.get("REASON") or ""
     ret_code = result_env.get("RET_CODE")
     runtime_sec = result_env.get("RUNTIME_SEC")
     stage = result_env.get("STAGE") or ""
+    outer_exit_code = raw_exit_code if raw_exit_code is not None else exit_code
+    outer_timed_out = bool(timed_out) or outer_exit_code == 124 or exit_code == 124
 
-    if case_status == "PASS":
+    if outer_timed_out:
+        status = "timeout"
+    elif case_status == "PASS":
         status = "success"
     elif case_status == "TIMEOUT":
         status = "timeout"
     elif case_status in ("FAIL", "FAILED", "ERROR"):
         status = "failed"
-    elif timed_out:
-        status = "timeout"
     elif exit_code == 0:
         # If run.sh exited normally but no case result was produced, do not
         # silently mark the example as passed.  A single dispatched run.tcl
@@ -1358,8 +1360,8 @@ def classify_result(exit_code, timed_out, result_env):
     else:
         status = "failed"
 
-    report_exit_code = exit_code
-    if ret_code is not None:
+    report_exit_code = 124 if outer_timed_out else exit_code
+    if not outer_timed_out and ret_code is not None:
         try:
             report_exit_code = int(ret_code)
         except Exception:
@@ -1843,6 +1845,7 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
                     exit_code,
                     timed_out,
                     result_env,
+                    raw_exit_code=raw_exit_code,
                 )
 
                 if raw_exit_code == 75:

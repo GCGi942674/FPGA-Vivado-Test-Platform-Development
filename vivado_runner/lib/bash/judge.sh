@@ -121,6 +121,33 @@ judge_case_result() {
         return 0
     fi
 
+    # report_utilization compare
+    # The result is determined only by mis_report_utilization.txt:
+    #   missing   -> utilization compare flow unfinished
+    #   non-empty -> utilization compare failed
+    #   empty     -> utilization compare passed
+    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "report_utilization"; then
+
+        local utilization_file="$case_dir/mis_report_utilization.txt"
+
+        if [ ! -f "$utilization_file" ]; then
+            CASE_REASON="REPORT_UTILIZATION_RESULT_MISSING"
+            CASE_STAGE="report_utilization"
+            return 0
+        fi
+
+        if [ -s "$utilization_file" ]; then
+            CASE_REASON="REPORT_UTILIZATION_COMPARE_FAIL"
+            CASE_STAGE="report_utilization"
+            return 0
+        fi
+
+        CASE_STATUS="PASS"
+        CASE_REASON="REPORT_UTILIZATION_COMPARE_PASS"
+        CASE_STAGE="report_utilization"
+        return 0
+    fi
+
     if check_runtime_signature "$log_file"; then
         CASE_STATUS="PASS"
         CASE_REASON="PASS"

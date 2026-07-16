@@ -34,6 +34,7 @@
     "bgn_cmp": 1,
     "dcp_cmp": 0,
     "checksum_cmp": 0,
+    "report_utilization": 0,
     "enable_copy": 1
   }
 }

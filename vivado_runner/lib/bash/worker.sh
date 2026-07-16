@@ -14,6 +14,7 @@ remove_case_artifacts() {
           "$case_dir/mis_bit.txt" \
           "$case_dir/mis_msk.txt" \
           "$case_dir/mis_checksum.txt" \
+          "$case_dir/mis_report_utilization.txt" \
           "$case_dir/mis_msd.txt" \
           "$case_dir/mis_rbd.txt" \
           "$case_dir/result_bgn.log" \

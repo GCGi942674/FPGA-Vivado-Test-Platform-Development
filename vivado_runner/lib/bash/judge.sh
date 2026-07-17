@@ -148,6 +148,33 @@ judge_case_result() {
         return 0
     fi
 
+    # rpx compare
+    # The result is determined only by mis_rpx.txt:
+    #   missing   -> rpx compare flow unfinished
+    #   non-empty -> rpx compare failed
+    #   empty     -> rpx compare passed
+    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "rpx_cmp"; then
+
+        local rpx_file="$case_dir/mis_rpx.txt"
+
+        if [ ! -f "$rpx_file" ]; then
+            CASE_REASON="RPX_RESULT_MISSING"
+            CASE_STAGE="rpx_cmp"
+            return 0
+        fi
+
+        if [ -s "$rpx_file" ]; then
+            CASE_REASON="RPX_COMPARE_FAIL"
+            CASE_STAGE="rpx_cmp"
+            return 0
+        fi
+
+        CASE_STATUS="PASS"
+        CASE_REASON="RPX_COMPARE_PASS"
+        CASE_STAGE="rpx_cmp"
+        return 0
+    fi
+
     if check_runtime_signature "$log_file"; then
         CASE_STATUS="PASS"
         CASE_REASON="PASS"

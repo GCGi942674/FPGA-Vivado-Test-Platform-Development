@@ -7,6 +7,9 @@ remove_case_artifacts() {
           "$case_dir/output.msk" \
           "$case_dir/output.msd" \
           "$case_dir/output.rbd" \
+          "$case_dir/output.bgn" \
+          "$case_dir/output_timing.rpt" \
+          "$case_dir/output_timing.rpx" \
           "$case_dir/output_cmp.bgn" \
           "$case_dir/golden_cmp.bgn" \
           "$case_dir/output.dcp" \
@@ -15,6 +18,7 @@ remove_case_artifacts() {
           "$case_dir/mis_msk.txt" \
           "$case_dir/mis_checksum.txt" \
           "$case_dir/mis_report_utilization.txt" \
+          "$case_dir/mis_rpx.txt" \
           "$case_dir/mis_msd.txt" \
           "$case_dir/mis_rbd.txt" \
           "$case_dir/result_bgn.log" \

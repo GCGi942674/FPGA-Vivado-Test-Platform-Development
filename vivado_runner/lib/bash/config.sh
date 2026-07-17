@@ -90,7 +90,7 @@ load_flow_config() {
     enabled_modules=""
     ENABLE_COPY_FROM_FLOW=0
 
-    for key in report_timing_summary opt_design place_design place_design_from_syn phys_opt_design route_design route_design_from_place write_checkpoint write_bitstream bit_cmp msk_cmp bgn_cmp checksum_cmp report_utilization dcp_cmp; do
+    for key in report_timing_summary opt_design place_design place_design_from_syn phys_opt_design route_design route_design_from_place write_checkpoint write_bitstream bit_cmp msk_cmp bgn_cmp checksum_cmp report_utilization rpx_cmp dcp_cmp; do
         if is_enabled "$key"; then
             FLOW_ARGS+=("$key")
             append_enabled_module "$key"

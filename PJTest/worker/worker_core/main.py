@@ -47,28 +47,31 @@ except ImportError:  # pragma: no cover, Python 2 fallback is not expected.
     from urllib2 import Request, urlopen, HTTPError, URLError
 
 
+WORKER_ROOT = Path(__file__).resolve().parents[1]
+PJTEST_ROOT = WORKER_ROOT.parent
+
 LOG_ROOT = Path(os.environ.get(
     "PJTEST_WORKER_LOG_ROOT",
-    "/home/user3/PJTest/logs",
+    str(PJTEST_ROOT / "logs"),
 ))
 
 PENDING_REPORT_ROOT = Path(os.environ.get(
     "PJTEST_PENDING_REPORT_ROOT",
-    "/home/user3/PJTest/pending_reports",
+    str(PJTEST_ROOT / "pending_reports"),
 ))
 
 DEFAULT_WORKER_JOBS = int(os.environ.get("PJTEST_WORKER_JOBS", "8"))
 WORKER_SLOT_ROOT = Path(os.environ.get(
     "PJTEST_WORKER_SLOT_ROOT",
-    "/home/user3/PJTest/worker_slots",
+    str(WORKER_ROOT / "worker_slots"),
 ))
 WORKER_PROCESS_LOCK_DIR = Path(os.environ.get(
     "PJTEST_WORKER_PROCESS_LOCK_DIR",
-    "/home/user3/PJTest/tmp",
+    str(WORKER_ROOT / "tmp"),
 ))
 RUN_SH_LOCK_DIR = Path(os.environ.get(
     "RUN_SH_LOCK_DIR",
-    "/home/user3/PJTest/tmp",
+    str(WORKER_ROOT / "tmp"),
 ))
 SLOT_BUSY_BACKOFF_SEC = int(os.environ.get(
     "PJTEST_SLOT_BUSY_BACKOFF_SEC",
@@ -2129,7 +2132,7 @@ def shell_join(argv):
 
 def build_single_slot_command(args, slot_index):
     """Build the command used by tmux to run exactly one slot."""
-    script_path = Path(__file__).expanduser().resolve()
+    script_path = Path(__file__).expanduser().resolve().parents[1] / "worker.py"
     argv = [
         sys.executable or "python3",
         str(script_path),
@@ -2306,6 +2309,16 @@ def worker_manager_loop(args):
             return 0 if all(value == 0 for value in results.values()) else 1
 
         while not args.shutdown_event.is_set():
+            with result_lock:
+                finished_slots = sorted(results)
+            if finished_slots:
+                console_error(
+                    None,
+                    "manager detected stopped slot threads: %s; shutting down remaining slots"
+                    % ",".join(finished_slots),
+                )
+                args.shutdown_event.set()
+                break
             time.sleep(1)
 
         console_line(None, "manager DRAIN waiting for running slots to finish")
@@ -2330,6 +2343,11 @@ def worker_manager_loop(args):
                 thread.join(timeout=1)
 
         console_line(None, "manager STOP all slots exited")
+        with result_lock:
+            final_results = dict(results)
+        if len(final_results) != jobs or any(value != 0 for value in final_results.values()):
+            console_error(None, "manager stopped because one or more slots failed: %s" % final_results)
+            return 1
         return 0
 
     except KeyboardInterrupt:
@@ -2901,7 +2919,7 @@ def build_parser():
     parser.add_argument(
         "--slot-root",
         default=str(WORKER_SLOT_ROOT),
-        help="root directory for isolated worker slots, default: /home/user3/PJTest/worker_slots",
+        help="root directory for isolated worker slots, default: <worker>/worker_slots",
     )
     parser.add_argument(
         "--svn-url",

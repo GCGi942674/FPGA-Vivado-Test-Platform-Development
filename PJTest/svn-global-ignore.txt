@@ -1,0 +1,12 @@
+__pycache__
+tmp
+worker_slots
+*.pyc
+*.pyo
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.log
+*.pid
+*.lock

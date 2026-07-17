@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover, Python 2 fallback is not expected.
     from urllib2 import Request, urlopen, HTTPError, URLError
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = get_path(
     "paths",
     "database",

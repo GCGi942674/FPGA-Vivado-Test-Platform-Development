@@ -27,12 +27,14 @@ import yaml
 
 
 # Paths can be overridden through environment variables.
-DEFAULT_DB_PATH = "/home/user3/PJTest/data/task_queue.db"
-DEFAULT_YAML_PATH = "/home/user3/PJTest/Tasks.yaml"
-DEFAULT_TASKCTL_PATH = "/home/user3/PJTest/taskctl.py"
-DEFAULT_BATCH_STATUS_FILE = "/home/user3/PJTest/batch_status.json"
-DEFAULT_LOG_FILE = "/home/user3/PJTest/logs/daily_runner.log"
-DEFAULT_BATCH_SNAPSHOT_DIR = "/home/user3/PJTest/data/batch_snapshots"
+SERVER_ROOT = Path(__file__).resolve().parents[1]
+PJTEST_ROOT = SERVER_ROOT.parent
+DEFAULT_DB_PATH = str(PJTEST_ROOT / "data" / "task_queue.db")
+DEFAULT_YAML_PATH = str(SERVER_ROOT / "task.yaml")
+DEFAULT_TASKCTL_PATH = str(SERVER_ROOT / "taskctl.py")
+DEFAULT_BATCH_STATUS_FILE = str(PJTEST_ROOT / "data" / "batch_status.json")
+DEFAULT_LOG_FILE = str(PJTEST_ROOT / "logs" / "daily_runner.log")
+DEFAULT_BATCH_SNAPSHOT_DIR = str(PJTEST_ROOT / "data" / "batch_snapshots")
 DEFAULT_ZIP_DIR = "/home/xshare/zhouwei_runcache/GalaxCore/zip"
 DEFAULT_TASK_SUBMIT_INTERVAL_SECONDS = 30.0
 

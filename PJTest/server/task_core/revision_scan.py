@@ -13,7 +13,7 @@ def default_taskctl_path():
     value = os.environ.get("PJTEST_TASKCTL")
     if value:
         return value
-    local = Path(__file__).resolve().parent / "taskctl.py"
+    local = Path(__file__).resolve().parents[1] / "taskctl.py"
     return str(local if local.is_file() else Path.cwd() / "taskctl.py")
 
 

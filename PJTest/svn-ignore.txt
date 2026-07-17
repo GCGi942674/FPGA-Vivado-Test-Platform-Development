@@ -1,0 +1,5 @@
+data
+logs
+pending_reports
+tmp
+worker_slots

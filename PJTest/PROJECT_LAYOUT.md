@@ -21,7 +21,7 @@ Stable entry points:
 
 - `server/scheduler.py`: HTTP scheduler service.
 - `server/taskctl.py`: task administration CLI.
-- `server/clock_task.py`: scheduled batch entry point.
+- `server/clock_task.py`: scheduled daily task entry point.
 - `server/find_first_fail.py`: revision-scan compatibility entry point.
 
 Implementation packages:

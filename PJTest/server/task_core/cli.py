@@ -1024,18 +1024,44 @@ def cmd_delete(args):
 
         cur.execute(
             """
-            SELECT COUNT(*) AS running_count
-            FROM task_examples
-            WHERE task_id = ?
-              AND status = 'running'
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM task_examples
+                    WHERE task_id = ?
+                      AND status = 'running'
+                ) AS running_examples,
+                (
+                    SELECT COUNT(*)
+                    FROM task_attempts
+                    WHERE task_id = ?
+                      AND status = 'running'
+                ) AS running_attempts,
+                (
+                    SELECT COUNT(*)
+                    FROM workers
+                    WHERE current_task_id = ?
+                      AND status IN ('running', 'reporting')
+                ) AS active_workers
             """,
-            (args.task_id,),
+            (args.task_id, args.task_id, args.task_id),
         )
-        running_count = cur.fetchone()["running_count"]
+        active = cur.fetchone()
+        running_examples = int(active["running_examples"] or 0)
+        running_attempts = int(active["running_attempts"] or 0)
+        active_workers = int(active["active_workers"] or 0)
 
-        if running_count > 0 and not args.force:
+        if running_examples or running_attempts or active_workers:
             conn.rollback()
-            print("Task has running examples. Use --force to delete it anyway.")
+            print("Refusing to delete a task with active worker assignments.")
+            print(
+                "running_examples=%d running_attempts=%d active_workers=%d"
+                % (running_examples, running_attempts, active_workers)
+            )
+            print(
+                "Run 'taskctl.py cancel %s', wait for it to finish canceling, "
+                "then delete it." % args.task_id
+            )
             return
 
         insert_event(
@@ -3279,7 +3305,11 @@ def build_parser():
 
     p_delete = sub.add_parser("delete", help="delete a task")
     p_delete.add_argument("task_id", help="task id")
-    p_delete.add_argument("--force", action="store_true", help="delete running task too")
+    p_delete.add_argument(
+        "--force",
+        action="store_true",
+        help="reserved for compatibility; active assignments are never deleted",
+    )
     p_delete.set_defaults(func=cmd_delete)
 
     p_stat = sub.add_parser("stat", help="show task aggregate statistics")

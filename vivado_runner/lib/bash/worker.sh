@@ -30,6 +30,17 @@ remove_case_artifacts() {
           "$case_dir/.run_ret"
 }
 
+is_result_artifact_pass() {
+    case "$CASE_REASON" in
+        CHECKSUM_COMPARE_PASS|REPORT_UTILIZATION_COMPARE_PASS|RPX_COMPARE_PASS)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 build_case_status_dir() {
     local case_dir="$1"
     local rel
@@ -100,7 +111,10 @@ run_one_case() {
     elif [ "$ret_code" -ne 0 ]; then
         judge_case_result "$case_dir" "$case_log_file"
 
-        if [ "$CASE_STATUS" = "PASS" ]; then
+        # These compare modules define their result exclusively through the
+        # freshly generated mis_* artifact. Preserve the raw process return
+        # code in result.env, but do not let it override an authoritative PASS.
+        if [ "$CASE_STATUS" = "PASS" ] && ! is_result_artifact_pass; then
             CASE_STATUS="FAIL"
             CASE_REASON="NON_ZERO_EXIT_WITH_PASS_SIGNATURE"
         elif [ "$CASE_REASON" = "UNKNOWN" ] || [ "$CASE_REASON" = "PASS" ]; then

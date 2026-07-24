@@ -1407,6 +1407,11 @@ def _finish_attempt_once(data):
         exit_code = 124
         raw_exit_code = 124
         timed_out = 1
+    elif status == "success":
+        # Keep successful examples consistent even when an authoritative
+        # comparison artifact passed but the internal tool returned non-zero.
+        exit_code = 0
+        timed_out = 0
 
     conn = get_conn()
     cur = conn.cursor()
@@ -1462,9 +1467,11 @@ def _finish_attempt_once(data):
 
         cur.execute(
             """
-            SELECT *
-            FROM task_examples
-            WHERE example_id = ?
+            SELECT e.*, t.status AS task_status
+            FROM task_examples e
+            JOIN tasks t
+              ON t.task_id = e.task_id
+            WHERE e.example_id = ?
             """,
             (example_id,),
         )
@@ -1486,6 +1493,7 @@ def _finish_attempt_once(data):
 
         retry_count = int(example["retry_count"] or 0)
         max_retry = int(example["max_retry"] or 0)
+        cancel_requested = example["task_status"] in ("canceling", "canceled")
 
         cur.execute(
             """
@@ -1522,7 +1530,62 @@ def _finish_attempt_once(data):
         final_example_status = status
         requeued = False
 
-        if infra_error:
+        if infra_error and cancel_requested:
+            final_example_status = "canceled"
+            cancel_message = (
+                "task cancellation finalized after infra failure: %s"
+                % (message or infra_reason)
+            )
+
+            cur.execute(
+                """
+                UPDATE task_examples
+                SET status = 'canceled',
+                    assigned_worker = ?,
+                    current_attempt_id = ?,
+                    updated_at = ?,
+                    finished_at = ?,
+                    exit_code = ?,
+                    raw_exit_code = ?,
+                    failed_step = 'worker_infra',
+                    failed_reason = ?,
+                    infra_reason = ?,
+                    message = ?,
+                    log_file = ?,
+                    log_tail = ?,
+                    run_log_dir = ?,
+                    report_dir = ?
+                WHERE example_id = ?
+                """,
+                (
+                    worker_name,
+                    attempt_id,
+                    now,
+                    now,
+                    exit_code,
+                    raw_exit_code,
+                    infra_reason,
+                    infra_reason,
+                    cancel_message,
+                    log_file,
+                    log_tail,
+                    run_log_dir,
+                    report_dir,
+                    example_id,
+                ),
+            )
+
+            insert_event(
+                cur,
+                task_id,
+                example_id,
+                attempt_id,
+                worker_name,
+                "example_canceled",
+                cancel_message,
+            )
+
+        elif infra_error:
             final_example_status = "pending"
             requeued = True
 
@@ -1572,7 +1635,11 @@ def _finish_attempt_once(data):
                 "Example requeued after infra failure: %s" % (infra_reason or message or "infra_error"),
             )
 
-        elif status in ("failed", "timeout") and retry_count < max_retry:
+        elif (
+            not cancel_requested
+            and status in ("failed", "timeout")
+            and retry_count < max_retry
+        ):
             new_retry_count = retry_count + 1
             final_example_status = "pending"
             requeued = True
@@ -1756,12 +1823,20 @@ def requeue_or_fail_stale_example(
     reason,
     detail,
 ):
-    """Requeue or fail one running example whose assignment was lost."""
+    """Resolve one running example whose worker assignment was lost."""
     now = local_now()
     retry_count = int(example["retry_count"] or 0)
     max_retry = int(example["max_retry"] or 0)
     attempt_id = example["current_attempt_id"]
-    attempt_status = "assignment_lost" if reason == "assignment_superseded" else "worker_lost"
+    cancel_requested = example["task_status"] in ("canceling", "canceled")
+    if cancel_requested:
+        attempt_status = "canceled"
+    else:
+        attempt_status = (
+            "assignment_lost"
+            if reason == "assignment_superseded"
+            else "worker_lost"
+        )
 
     if attempt_id:
         cur.execute(
@@ -1776,12 +1851,43 @@ def requeue_or_fail_stale_example(
             (
                 attempt_status,
                 now,
-                detail,
+                (
+                    "task cancellation finalized lost assignment: %s" % detail
+                    if cancel_requested
+                    else detail
+                ),
                 attempt_id,
             ),
         )
 
-    if retry_count < max_retry:
+    if cancel_requested:
+        message = "Task cancellation finalized stale assignment: %s" % detail
+        cur.execute(
+            """
+            UPDATE task_examples
+            SET status = 'canceled',
+                assigned_worker = ?,
+                updated_at = ?,
+                finished_at = ?,
+                exit_code = NULL,
+                raw_exit_code = NULL,
+                failed_step = NULL,
+                failed_reason = NULL,
+                infra_reason = NULL,
+                message = ?
+            WHERE example_id = ?
+              AND status = 'running'
+            """,
+            (
+                worker_name,
+                now,
+                now,
+                message,
+                example["example_id"],
+            ),
+        )
+        event_name = "example_canceled"
+    elif retry_count < max_retry:
         new_retry_count = retry_count + 1
         cur.execute(
             """
@@ -2961,6 +3067,7 @@ def _reconcile_once_without_retry(worker_timeout):
                 SELECT
                     e.example_id,
                     e.task_id,
+                    t.status AS task_status,
                     e.retry_count,
                     e.max_retry,
                     e.current_attempt_id,
@@ -2970,12 +3077,14 @@ def _reconcile_once_without_retry(worker_timeout):
                     w.current_example_id AS worker_example_id,
                     w.current_attempt_id AS worker_attempt_id
                 FROM task_examples e
+                JOIN tasks t
+                    ON t.task_id = e.task_id
                 LEFT JOIN workers w
                     ON w.worker_name = e.assigned_worker
                 WHERE e.status = 'running'
                   AND (
                       w.worker_name IS NULL
-                      OR w.status = 'offline'
+                      OR w.status NOT IN ('running', 'reporting')
                       OR (
                           w.status IN ('running', 'reporting')
                           AND NOT (
@@ -3006,6 +3115,12 @@ def _reconcile_once_without_retry(worker_timeout):
                 elif example["worker_status"] == "offline":
                     reason = "worker_offline"
                     detail = "worker %s is offline" % worker_name
+                elif example["worker_status"]:
+                    reason = "worker_not_running"
+                    detail = "worker %s status is %s" % (
+                        worker_name,
+                        example["worker_status"],
+                    )
                 else:
                     reason = "worker_missing"
                     detail = "worker record is missing for %s" % worker_name

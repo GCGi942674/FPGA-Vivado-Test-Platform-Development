@@ -1363,8 +1363,17 @@ def classify_result(exit_code, timed_out, result_env, raw_exit_code=None):
     else:
         status = "failed"
 
-    report_exit_code = 124 if status == "timeout" else exit_code
-    if status != "timeout" and ret_code is not None:
+    if status == "timeout":
+        report_exit_code = 124
+    elif status == "success":
+        # Artifact-authoritative compare modules may pass even when their
+        # underlying tool returns non-zero. Keep RET_CODE in the message and
+        # case_ret_code, while preserving the success/exit-code invariant.
+        report_exit_code = 0
+    else:
+        report_exit_code = exit_code
+
+    if status == "failed" and ret_code is not None:
         try:
             report_exit_code = int(ret_code)
         except Exception:

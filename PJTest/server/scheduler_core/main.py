@@ -3062,6 +3062,9 @@ def _reconcile_once_without_retry(worker_timeout):
             )
 
         if REQUEUE_STALE_RUNNING:
+            # An idle worker may be restarting and flushing a saved report.
+            # Active tasks wait for recovery or heartbeat timeout; canceling
+            # tasks can settle the orphan immediately.
             cur.execute(
                 """
                 SELECT
@@ -3084,14 +3087,18 @@ def _reconcile_once_without_retry(worker_timeout):
                 WHERE e.status = 'running'
                   AND (
                       w.worker_name IS NULL
-                      OR w.status NOT IN ('running', 'reporting')
+                      OR w.status = 'offline'
                       OR (
                           w.status IN ('running', 'reporting')
-                          AND NOT (
-                              w.current_task_id = e.task_id
-                              AND w.current_example_id = e.example_id
-                              AND w.current_attempt_id = e.current_attempt_id
+                          AND (
+                              COALESCE(w.current_task_id, '') != COALESCE(e.task_id, '')
+                              OR COALESCE(w.current_example_id, '') != COALESCE(e.example_id, '')
+                              OR COALESCE(w.current_attempt_id, '') != COALESCE(e.current_attempt_id, '')
                           )
+                      )
+                      OR (
+                          t.status IN ('canceling', 'canceled')
+                          AND w.status NOT IN ('running', 'reporting')
                       )
                   )
                 ORDER BY e.id

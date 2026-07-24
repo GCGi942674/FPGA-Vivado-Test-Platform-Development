@@ -2580,11 +2580,12 @@ def fetch_stale_examples(cur, task_id=None):
         LEFT JOIN workers w
             ON w.worker_name = e.assigned_worker
         WHERE e.status = 'running'
-          AND NOT (
-              w.status IN ('running', 'reporting')
-              AND w.current_task_id = e.task_id
-              AND w.current_example_id = e.example_id
-              AND w.current_attempt_id = e.current_attempt_id
+          AND (
+              w.worker_name IS NULL
+              OR w.status NOT IN ('running', 'reporting')
+              OR COALESCE(w.current_task_id, '') != COALESCE(e.task_id, '')
+              OR COALESCE(w.current_example_id, '') != COALESCE(e.example_id, '')
+              OR COALESCE(w.current_attempt_id, '') != COALESCE(e.current_attempt_id, '')
           )
     """
     params = []

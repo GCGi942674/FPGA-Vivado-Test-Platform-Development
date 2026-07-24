@@ -89,6 +89,7 @@ judge_case_result() {
             CASE_REASON="TIMING_SUMMARY_MISSING"
             return 0
         fi
+        compare_artifacts_passed=1
     fi
 
     # checksum compare

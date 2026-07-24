@@ -32,7 +32,7 @@ remove_case_artifacts() {
 
 is_result_artifact_pass() {
     case "$CASE_REASON" in
-        CHECKSUM_COMPARE_PASS|REPORT_UTILIZATION_COMPARE_PASS|RPX_COMPARE_PASS)
+        CHECKSUM_COMPARE_PASS|REPORT_UTILIZATION_COMPARE_PASS|RPX_COMPARE_PASS|COMPARE_ARTIFACTS_PASS)
             return 0
             ;;
         *)

@@ -12,6 +12,7 @@ judge_case_result() {
     CASE_STATUS="FAIL"
     CASE_REASON="UNKNOWN"
     CASE_STAGE="none"
+    local compare_artifacts_passed=0
 
     if [ ! -f "$log_file" ]; then
         CASE_REASON="MISSING_LOG"
@@ -47,6 +48,7 @@ judge_case_result() {
             CASE_REASON="BGN_RESULT_MISSING"
             return 0
         fi
+        compare_artifacts_passed=1
     fi
 
     if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "bit_cmp"; then
@@ -60,6 +62,7 @@ judge_case_result() {
             CASE_REASON="BIT_RESULT_MISSING"
             return 0
         fi
+        compare_artifacts_passed=1
     fi
 
     if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "msk_cmp"; then
@@ -73,6 +76,7 @@ judge_case_result() {
             CASE_REASON="MSK_RESULT_MISSING"
             return 0
         fi
+        compare_artifacts_passed=1
     fi
 
     if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "report_timing_summary"; then
@@ -172,6 +176,16 @@ judge_case_result() {
         CASE_STATUS="PASS"
         CASE_REASON="RPX_COMPARE_PASS"
         CASE_STAGE="rpx_cmp"
+        return 0
+    fi
+
+    # BGN/BIT/MSK compare modules have already validated their completion
+    # markers and empty mismatch artifacts. They do not require the generic
+    # Runtime signature used by ordinary non-compare flows.
+    if [ "$compare_artifacts_passed" -eq 1 ]; then
+        CASE_STATUS="PASS"
+        CASE_REASON="COMPARE_ARTIFACTS_PASS"
+        CASE_STAGE="compare"
         return 0
     fi
 

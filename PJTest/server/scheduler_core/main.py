@@ -3302,17 +3302,53 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             cur = conn.cursor()
             try:
                 cur.execute("BEGIN IMMEDIATE")
-                upsert_worker(
-                    cur,
-                    worker_name=worker_name,
-                    hostname=hostname,
-                    status="idle",
-                    task_id=None,
-                    example_id=None,
-                    attempt_id=None,
-                    capabilities=capabilities,
-                    message="registered",
+                cur.execute(
+                    """
+                    SELECT current_task_id, current_example_id,
+                           current_attempt_id, status
+                    FROM workers
+                    WHERE worker_name = ?
+                    """,
+                    (worker_name,),
                 )
+                existing = cur.fetchone()
+
+                if existing and existing["current_attempt_id"]:
+                    # A restart/register request must not erase an assignment
+                    # that may still be running or waiting to report.
+                    cur.execute(
+                        """
+                        UPDATE workers
+                        SET hostname = COALESCE(?, hostname),
+                            capabilities_json = COALESCE(?, capabilities_json),
+                            last_seen_at = ?,
+                            updated_at = ?,
+                            message = ?
+                        WHERE worker_name = ?
+                        """,
+                        (
+                            hostname,
+                            json.dumps(capabilities, ensure_ascii=False, sort_keys=True)
+                            if capabilities is not None else None,
+                            local_now(),
+                            local_now(),
+                            "registered; preserved active assignment %s"
+                            % existing["current_attempt_id"],
+                            worker_name,
+                        ),
+                    )
+                else:
+                    upsert_worker(
+                        cur,
+                        worker_name=worker_name,
+                        hostname=hostname,
+                        status="idle",
+                        task_id=None,
+                        example_id=None,
+                        attempt_id=None,
+                        capabilities=capabilities,
+                        message="registered",
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -3348,16 +3384,83 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             cur = conn.cursor()
             try:
                 cur.execute("BEGIN IMMEDIATE")
-                upsert_worker(
-                    cur,
-                    worker_name=worker_name,
-                    hostname=hostname,
-                    status=status,
-                    task_id=task_id,
-                    example_id=example_id,
-                    attempt_id=attempt_id,
-                    message=message,
+                cur.execute(
+                    """
+                    SELECT current_task_id, current_example_id,
+                           current_attempt_id
+                    FROM workers
+                    WHERE worker_name = ?
+                    """,
+                    (worker_name,),
                 )
+                existing = cur.fetchone()
+                current_attempt_id = existing["current_attempt_id"] if existing else None
+                incoming_ids = (task_id, example_id, attempt_id)
+                incoming_has_assignment = any(value is not None for value in incoming_ids)
+                assignment_matches = (
+                    existing is not None
+                    and incoming_ids == (
+                        existing["current_task_id"],
+                        existing["current_example_id"],
+                        existing["current_attempt_id"],
+                    )
+                )
+
+                if current_attempt_id and not assignment_matches:
+                    # Heartbeats are asynchronous.  A request captured while
+                    # the worker was on the previous attempt can arrive after
+                    # the scheduler has claimed a new one.  Preserve the
+                    # scheduler's current assignment and only refresh liveness.
+                    cur.execute(
+                        """
+                        UPDATE workers
+                        SET hostname = COALESCE(?, hostname),
+                            last_seen_at = ?,
+                            updated_at = ?,
+                            message = ?
+                        WHERE worker_name = ?
+                        """,
+                        (
+                            hostname,
+                            local_now(),
+                            local_now(),
+                            "ignored stale heartbeat assignment=%s current=%s"
+                            % (attempt_id or "-", current_attempt_id),
+                            worker_name,
+                        ),
+                    )
+                elif not current_attempt_id and incoming_has_assignment:
+                    # Do not resurrect an already-finished assignment from a
+                    # delayed heartbeat after the report cleared the worker.
+                    cur.execute(
+                        """
+                        UPDATE workers
+                        SET hostname = COALESCE(?, hostname),
+                            last_seen_at = ?,
+                            updated_at = ?,
+                            message = ?
+                        WHERE worker_name = ?
+                        """,
+                        (
+                            hostname,
+                            local_now(),
+                            local_now(),
+                            "ignored stale heartbeat assignment=%s"
+                            % (attempt_id or "-"),
+                            worker_name,
+                        ),
+                    )
+                else:
+                    upsert_worker(
+                        cur,
+                        worker_name=worker_name,
+                        hostname=hostname,
+                        status=status,
+                        task_id=task_id,
+                        example_id=example_id,
+                        attempt_id=attempt_id,
+                        message=message,
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()

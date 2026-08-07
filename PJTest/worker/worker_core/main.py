@@ -84,6 +84,10 @@ SLOT_SVN_URL = os.environ.get(
 SVN_COMMAND_TIMEOUT = int(os.environ.get("PJTEST_SVN_COMMAND_TIMEOUT", "0"))
 CLEAN_AFTER_RUN = os.environ.get("PJTEST_CLEAN_AFTER_RUN", "1") != "0"
 CLEAN_TIMEOUT = int(os.environ.get("PJTEST_CLEAN_TIMEOUT", "600"))
+PROCESS_TERM_GRACE_SEC = int(os.environ.get(
+    "PJTEST_PROCESS_TERM_GRACE_SEC",
+    "30",
+))
 FLOW_CONFIG_IGNORE_KEYS = set(
     item.strip()
     for item in os.environ.get("PJTEST_FLOW_CONFIG_IGNORE_KEYS", "enable_copy").split(",")
@@ -432,7 +436,11 @@ def kill_active_processes(reason):
             except Exception:
                 pass
 
-    time.sleep(3)
+    deadline = time.time() + max(PROCESS_TERM_GRACE_SEC, 0)
+    while time.time() < deadline:
+        if all(proc.poll() is not None for _key, proc in items):
+            break
+        time.sleep(0.2)
 
     for (worker_name, label), proc in items:
         if proc.poll() is None:
@@ -1024,6 +1032,70 @@ def slot_has_valid_checkout(path):
     return status["svn_dir"] and status["test2_dir"] and status["run_sh"]
 
 
+def find_stale_slot_galaxcore_pids(slot_root_path):
+    """Find GalaxCore processes whose executable belongs to one worker slot."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+
+    slot_root_text = str(Path(slot_root_path).expanduser().resolve())
+    prefix = slot_root_text.rstrip(os.sep) + os.sep
+    found = []
+
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            exe_path = os.readlink(str(entry / "exe"))
+        except (OSError, IOError):
+            continue
+
+        if exe_path.endswith(" (deleted)"):
+            exe_path = exe_path[:-10]
+        if os.path.basename(exe_path).lower() != "galaxcore":
+            continue
+        if exe_path == slot_root_text or exe_path.startswith(prefix):
+            found.append(pid)
+
+    return sorted(found)
+
+
+def terminate_stale_slot_galaxcore_processes(slot_root_path, log=None):
+    """Reap orphaned GalaxCore processes before reusing a dedicated slot."""
+    pids = find_stale_slot_galaxcore_pids(slot_root_path)
+    if not pids:
+        return []
+
+    log_line(log, "terminate stale slot GalaxCore pids=%s" % ",".join(str(pid) for pid in pids))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    deadline = time.time() + min(max(PROCESS_TERM_GRACE_SEC, 0), 10)
+    remaining = set(pids)
+    while remaining and time.time() < deadline:
+        for pid in list(remaining):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                remaining.discard(pid)
+        if remaining:
+            time.sleep(0.2)
+
+    for pid in sorted(remaining):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    return pids
+
+
 def svn_cleanup(path, log=None):
     """Run svn cleanup for a working-copy path."""
     if not shutil.which("svn"):
@@ -1132,10 +1204,16 @@ def prepare_task_for_slot(task, worker_name, slot_root, log=None):
     slot_task = dict(task)
     slot_task["work_root"] = str(slot_test2)
     slot_task["install_root"] = str(slot_root_path)
-    slot_task["cmd"] = "cd %s && ./run.sh %s" % (
-        shlex_quote(str(slot_test2)),
-        shlex_quote(str(slot_task["target_arg"])),
-    )
+    command_parts = [
+        "cd %s && ./run.sh %s" % (
+            shlex_quote(str(slot_test2)),
+            shlex_quote(str(slot_task["target_arg"])),
+        )
+    ]
+    max_time = slot_task.get("max_time")
+    if max_time is not None and int(max_time) > 0:
+        command_parts.append("--timeout %d" % int(max_time))
+    slot_task["cmd"] = " ".join(command_parts)
     log_line(log, "slot work_root: %s" % slot_task["work_root"])
     log_line(log, "slot install_root: %s" % slot_task["install_root"])
     return slot_task
@@ -1666,17 +1744,27 @@ def build_shell_argv(task, shell_name, worker_name):
 
 
 def kill_process_group(proc):
-    """Terminate and then kill a subprocess process group."""
+    """Terminate a run.sh group and allow its trap to reap nested case groups.
+
+    run.sh starts each case in a separate session so it can enforce per-case
+    timeouts.  Its TERM trap needs time to terminate those nested groups.  A
+    fixed three-second delay could SIGKILL run.sh midway through that cleanup,
+    orphaning GalaxCore processes that continued writing deleted run logs.
+    """
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        time.sleep(3)
     except Exception:
         pass
 
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except Exception:
-        pass
+    deadline = time.time() + max(PROCESS_TERM_GRACE_SEC, 0)
+    while proc.poll() is None and time.time() < deadline:
+        time.sleep(0.2)
+
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def run_command(task, shell_name, log, worker_name):
@@ -1684,6 +1772,11 @@ def run_command(task, shell_name, log, worker_name):
     timeout = task.get("max_time")
     if timeout is not None:
         timeout = int(timeout)
+        # run.sh applies max_time to the inner case.  Keep the outer watchdog
+        # slightly longer so run.sh can write TIMEOUT result.env and reap the
+        # GalaxCore process before the worker escalates termination.
+        if timeout > 0:
+            timeout += max(PROCESS_TERM_GRACE_SEC, 0)
 
     env = os.environ.copy()
     env.update(build_runtime_env(task, worker_name))
@@ -1798,6 +1891,14 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
                 )
                 slot_task["_pjtest_run_lock_held"] = True
                 slot_task["_pjtest_run_lock_file"] = slot_lock_file
+
+                # A worker killed before run.sh finished its TERM trap may
+                # leave GalaxCore alive in the dedicated slot.  Reap that
+                # exact slot executable before replacing it or deleting run.
+                terminate_stale_slot_galaxcore_processes(
+                    slot_task["install_root"],
+                    log=log,
+                )
 
                 if getattr(args, "verbose_console", False):
                     console_line(worker_name, "install zip")

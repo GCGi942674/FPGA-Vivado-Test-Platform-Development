@@ -88,6 +88,32 @@ run_one_case() {
 
     (
         cd "$case_dir" || exit 127
+
+        if [ "${MAX_CASE_LOG_MB:-0}" -gt 0 ]; then
+            local max_log_bytes command_rc
+            max_log_bytes=$((MAX_CASE_LOG_MB * 1024 * 1024))
+
+            # Bound only stdout/stderr.  RLIMIT_FSIZE is intentionally not
+            # used because it would also cap legitimate bitstream artifacts.
+            set +e
+            if [ -x "$GALAXCORE_BIN" ]; then
+                "$GALAXCORE_BIN" "$(basename "$run_tcl")" "${FLOW_ARGS[@]}" 2>&1 \
+                    | head -c "$max_log_bytes" > run
+            else
+                bash "$(basename "$run_tcl")" 2>&1 \
+                    | head -c "$max_log_bytes" > run
+            fi
+            command_rc=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$(wc -c < run)" -ge "$max_log_bytes" ]; then
+                printf '\n[ERROR] run log reached MAX_CASE_LOG_MB=%s; output was capped\n' \
+                    "$MAX_CASE_LOG_MB" >> run
+                [ "$command_rc" -ne 0 ] || command_rc=153
+            fi
+            exit "$command_rc"
+        fi
+
         if [ -x "$GALAXCORE_BIN" ]; then
             "$GALAXCORE_BIN" "$(basename "$run_tcl")" "${FLOW_ARGS[@]}" > run 2>&1
         else

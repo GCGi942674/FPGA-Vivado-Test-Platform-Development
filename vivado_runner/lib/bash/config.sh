@@ -114,6 +114,7 @@ load_flow_config() {
 validate_runtime_config() {
     case "$BG_MAX" in ''|*[!0-9]*) log_error "Invalid BG_MAX: $BG_MAX"; exit 1 ;; esac
     case "$TIME_LIMIT" in ''|*[!0-9]*) log_error "Invalid TIME_LIMIT: $TIME_LIMIT"; exit 1 ;; esac
+    case "$MAX_CASE_LOG_MB" in ''|*[!0-9]*) log_error "Invalid MAX_CASE_LOG_MB: $MAX_CASE_LOG_MB"; exit 1 ;; esac
     GALAXCORE_BIN=$(normalize_path "$GALAXCORE_BIN") || { log_error "Invalid GalaxCore path: $GALAXCORE_BIN"; exit 1; }
     REPORT_DST_DIR=$(normalize_path "$REPORT_DST_DIR") || { log_error "Invalid report destination: $REPORT_DST_DIR"; exit 1; }
     mkdir -p "$REPORT_DST_DIR" || { log_error "Cannot create report destination: $REPORT_DST_DIR"; exit 1; }

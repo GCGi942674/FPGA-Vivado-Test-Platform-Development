@@ -27,7 +27,8 @@ remove_case_artifacts() {
           "$case_dir/.run_reason" \
           "$case_dir/.run_runtime" \
           "$case_dir/.run_stage" \
-          "$case_dir/.run_ret"
+          "$case_dir/.run_ret" \
+          "$case_dir/.run_log_limit"
 }
 
 is_result_artifact_pass() {
@@ -39,6 +40,95 @@ is_result_artifact_pass() {
             return 1
             ;;
     esac
+}
+
+run_case_with_log_watchdog() {
+    local run_tcl="$1"
+    local max_log_bytes command_pid command_rc current_size log_limit_hit=0
+
+    max_log_bytes=$((MAX_CASE_LOG_MB * 1024 * 1024))
+
+    # Give the case its own process group.  The watchdog and signal handler can
+    # then terminate GalaxCore and every child it started without touching the
+    # runner process group.
+    if [ -x "$GALAXCORE_BIN" ]; then
+        setsid "$GALAXCORE_BIN" "$(basename "$run_tcl")" "${FLOW_ARGS[@]}" > run 2>&1 &
+    else
+        setsid bash "$(basename "$run_tcl")" > run 2>&1 &
+    fi
+    command_pid=$!
+
+    watched_case_is_running() {
+        local process_state
+
+        kill -0 "$command_pid" 2>/dev/null || return 1
+        process_state=$(ps -p "$command_pid" -o stat= 2>/dev/null | awk '{print $1}')
+        [ -n "$process_state" ] || return 1
+
+        case "$process_state" in
+            Z*) return 1 ;;
+        esac
+
+        return 0
+    }
+
+    stop_case_process_group() {
+        kill -TERM -- "-$command_pid" 2>/dev/null || true
+
+        local wait_count=0
+        while watched_case_is_running && [ "$wait_count" -lt 10 ]; do
+            sleep 0.1
+            wait_count=$((wait_count + 1))
+        done
+
+        if watched_case_is_running; then
+            kill -KILL -- "-$command_pid" 2>/dev/null || true
+        fi
+    }
+
+    on_watched_case_interrupt() {
+        stop_case_process_group
+        wait "$command_pid" 2>/dev/null || true
+        exit 130
+    }
+
+    trap 'on_watched_case_interrupt' INT TERM
+
+    while watched_case_is_running; do
+        if [ -f run ]; then
+            current_size=$(wc -c < run)
+            if [ "$current_size" -ge "$max_log_bytes" ]; then
+                log_limit_hit=1
+                stop_case_process_group
+                break
+            fi
+        fi
+        sleep 0.2
+    done
+
+    set +e
+    wait "$command_pid"
+    command_rc=$?
+    set -e
+    trap - INT TERM
+
+    # The process may finish between two polls.  Enforce the limit against the
+    # final file as well so a short, fast burst cannot escape the watchdog.
+    if [ "$log_limit_hit" -eq 0 ] && [ -f run ]; then
+        current_size=$(wc -c < run)
+        if [ "$current_size" -ge "$max_log_bytes" ]; then
+            log_limit_hit=1
+        fi
+    fi
+
+    if [ "$log_limit_hit" -eq 1 ]; then
+        : > .run_log_limit
+        printf '\n[ERROR] run log reached MAX_CASE_LOG_MB=%s; process was terminated\n' \
+            "$MAX_CASE_LOG_MB" >> run
+        return 153
+    fi
+
+    return "$command_rc"
 }
 
 build_case_status_dir() {
@@ -90,28 +180,13 @@ run_one_case() {
         cd "$case_dir" || exit 127
 
         if [ "${MAX_CASE_LOG_MB:-0}" -gt 0 ]; then
-            local max_log_bytes command_rc
-            max_log_bytes=$((MAX_CASE_LOG_MB * 1024 * 1024))
-
-            # Bound only stdout/stderr.  RLIMIT_FSIZE is intentionally not
-            # used because it would also cap legitimate bitstream artifacts.
-            set +e
-            if [ -x "$GALAXCORE_BIN" ]; then
-                "$GALAXCORE_BIN" "$(basename "$run_tcl")" "${FLOW_ARGS[@]}" 2>&1 \
-                    | head -c "$max_log_bytes" > run
-            else
-                bash "$(basename "$run_tcl")" 2>&1 \
-                    | head -c "$max_log_bytes" > run
-            fi
-            command_rc=${PIPESTATUS[0]}
-            set -e
-
-            if [ "$(wc -c < run)" -ge "$max_log_bytes" ]; then
-                printf '\n[ERROR] run log reached MAX_CASE_LOG_MB=%s; output was capped\n' \
-                    "$MAX_CASE_LOG_MB" >> run
-                [ "$command_rc" -ne 0 ] || command_rc=153
-            fi
-            exit "$command_rc"
+            # GalaxCore must write run directly because checksum_cmp reads the
+            # file while the case is still running.  A `GalaxCore | head > run`
+            # pipeline lets the reader outrun the separate writer on a busy
+            # host.  Monitor the directly-written file instead and terminate
+            # the whole case process group if it reaches the configured limit.
+            run_case_with_log_watchdog "$run_tcl"
+            exit $?
         fi
 
         if [ -x "$GALAXCORE_BIN" ]; then
@@ -130,7 +205,11 @@ run_one_case() {
     end_ts=$(date '+%s')
     runtime_sec=$((end_ts - start_ts))
 
-    if [ "$ret_code" -eq 124 ] || [ "$ret_code" -eq 137 ] || [ "$ret_code" -eq 143 ] || [ "$ret_code" -eq 130 ]; then
+    if [ "$ret_code" -eq 153 ] && [ -f "$case_dir/.run_log_limit" ]; then
+        CASE_STATUS="FAIL"
+        CASE_REASON="LOG_SIZE_LIMIT"
+        CASE_STAGE="log_limit"
+    elif [ "$ret_code" -eq 124 ] || [ "$ret_code" -eq 137 ] || [ "$ret_code" -eq 143 ] || [ "$ret_code" -eq 130 ]; then
         CASE_STATUS="TIMEOUT"
         CASE_REASON="PROCESS_KILLED"
         CASE_STAGE="timeout"

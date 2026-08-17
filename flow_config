@@ -1,3 +1,9 @@
+# read_edif
+read_edif 0
+
+# read_xdc
+read_xdc 0
+
 # report_timing_summary
 report_timing_summary 0
 

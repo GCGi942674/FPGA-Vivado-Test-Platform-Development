@@ -1,6 +1,8 @@
 # flow_config keys
 
 Supported keys:
+- read_edif
+- read_xdc
 - report_timing_summary
 - opt_design
 - place_design
@@ -13,4 +15,8 @@ Supported keys:
 - bit_cmp
 - msk_cmp
 - bgn_cmp
+- dcp_cmp
+- checksum_cmp
+- report_utilization
+- rpx_cmp
 - enable_copy

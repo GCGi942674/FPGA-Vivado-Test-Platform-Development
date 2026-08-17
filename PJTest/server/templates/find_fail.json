@@ -20,6 +20,8 @@
   },
 
   "flow_config": {
+    "read_edif": 0,
+    "read_xdc": 0,
     "report_timing_summary": 0,
     "opt_design": 0,
     "place_design": 1,

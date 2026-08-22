@@ -694,6 +694,25 @@ find /home/user3/PJTest/pending_reports -name '*.json' -type f -print
 
 如果这里长期有文件，说明某些结果还没有成功回传 scheduler。
 
+### 11.1 失败证据保留
+
+诊断偶发失败时，可以在 worker 启动前开启：
+
+```csh
+setenv PJTEST_PRESERVE_FAILURE_EVIDENCE 1
+setenv PJTEST_FAILURE_EVIDENCE_MAX_FILE_MB 32
+```
+
+worker 会在执行后清理之前，将失败 case 的原始日志、BGN 比较文件、
+`result.env`、配置哈希、GalaxCore 哈希、SVN 状态及系统负载保存到：
+
+```text
+logs/<date>/<worker>/<task>/<example>/<attempt>/evidence/
+```
+
+该功能默认关闭。单个文件超过上限时只保留文件头和文件尾，证据收集失败
+不会改变原始 case 的测试结果。
+
 ---
 
 ## 12. Worker 执行时注入的环境变量

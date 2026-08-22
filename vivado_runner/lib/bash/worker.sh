@@ -42,19 +42,35 @@ is_result_artifact_pass() {
     esac
 }
 
-run_case_with_log_watchdog() {
+run_case_with_bounded_log() {
     local run_tcl="$1"
-    local max_log_bytes command_pid command_rc current_size log_limit_hit=0
+    local max_log_bytes command_pid command_rc logger_pid logger_rc fifo_path
+    local filter_script="$PROJECT_ROOT/lib/python/bounded_run_log.py"
 
     max_log_bytes=$((MAX_CASE_LOG_MB * 1024 * 1024))
+    fifo_path=".run_output_${BASHPID}_${RANDOM}.fifo"
+    rm -f "$fifo_path"
+    mkfifo "$fifo_path" || return 154
 
-    # Give the case its own process group.  The watchdog and signal handler can
-    # then terminate GalaxCore and every child it started without touching the
-    # runner process group.
+    local filter_args=(
+        "$filter_script"
+        --output run
+        --limit-bytes "$max_log_bytes"
+        --limit-marker .run_log_limit
+    )
+    if [ "${SUPPRESS_PIN_REDEFINITION:-1}" -eq 1 ]; then
+        filter_args+=(--suppress-pin-redefinition)
+    fi
+
+    python3 "${filter_args[@]}" < "$fifo_path" &
+    logger_pid=$!
+
+    # GalaxCore has its own process group, while the logger keeps reading until
+    # EOF even after the retained run log reaches its configured size.
     if [ -x "$GALAXCORE_BIN" ]; then
-        setsid "$GALAXCORE_BIN" "$(basename "$run_tcl")" "${FLOW_ARGS[@]}" > run 2>&1 &
+        setsid "$GALAXCORE_BIN" "$(basename "$run_tcl")" "${FLOW_ARGS[@]}" > "$fifo_path" 2>&1 &
     else
-        setsid bash "$(basename "$run_tcl")" > run 2>&1 &
+        setsid bash "$(basename "$run_tcl")" > "$fifo_path" 2>&1 &
     fi
     command_pid=$!
 
@@ -89,43 +105,26 @@ run_case_with_log_watchdog() {
     on_watched_case_interrupt() {
         stop_case_process_group
         wait "$command_pid" 2>/dev/null || true
+        kill -TERM "$logger_pid" 2>/dev/null || true
+        wait "$logger_pid" 2>/dev/null || true
+        rm -f "$fifo_path"
         exit 130
     }
 
     trap 'on_watched_case_interrupt' INT TERM
 
-    while watched_case_is_running; do
-        if [ -f run ]; then
-            current_size=$(wc -c < run)
-            if [ "$current_size" -ge "$max_log_bytes" ]; then
-                log_limit_hit=1
-                stop_case_process_group
-                break
-            fi
-        fi
-        sleep 0.2
-    done
-
     set +e
     wait "$command_pid"
     command_rc=$?
+    wait "$logger_pid"
+    logger_rc=$?
     set -e
     trap - INT TERM
+    rm -f "$fifo_path"
 
-    # The process may finish between two polls.  Enforce the limit against the
-    # final file as well so a short, fast burst cannot escape the watchdog.
-    if [ "$log_limit_hit" -eq 0 ] && [ -f run ]; then
-        current_size=$(wc -c < run)
-        if [ "$current_size" -ge "$max_log_bytes" ]; then
-            log_limit_hit=1
-        fi
-    fi
-
-    if [ "$log_limit_hit" -eq 1 ]; then
-        : > .run_log_limit
-        printf '\n[ERROR] run log reached MAX_CASE_LOG_MB=%s; process was terminated\n' \
-            "$MAX_CASE_LOG_MB" >> run
-        return 153
+    if [ "$logger_rc" -ne 0 ]; then
+        printf '\n[ERROR] RUN_LOG_CAPTURE_FAILED: logger_rc=%s\n' "$logger_rc" >> run
+        return 154
     fi
 
     return "$command_rc"
@@ -179,13 +178,10 @@ run_one_case() {
     (
         cd "$case_dir" || exit 127
 
-        if [ "${MAX_CASE_LOG_MB:-0}" -gt 0 ]; then
-            # GalaxCore must write run directly because checksum_cmp reads the
-            # file while the case is still running.  A `GalaxCore | head > run`
-            # pipeline lets the reader outrun the separate writer on a busy
-            # host.  Monitor the directly-written file instead and terminate
-            # the whole case process group if it reaches the configured limit.
-            run_case_with_log_watchdog "$run_tcl"
+        if [ "${MAX_CASE_LOG_MB:-0}" -gt 0 ] || [ "${SUPPRESS_PIN_REDEFINITION:-1}" -eq 1 ]; then
+            # The logger writes run continuously for checksum_cmp, suppresses
+            # known log storms, and keeps draining after the retained log cap.
+            run_case_with_bounded_log "$run_tcl"
             exit $?
         fi
 
@@ -205,10 +201,14 @@ run_one_case() {
     end_ts=$(date '+%s')
     runtime_sec=$((end_ts - start_ts))
 
-    if [ "$ret_code" -eq 153 ] && [ -f "$case_dir/.run_log_limit" ]; then
+    if [ -f "$case_dir/.run_log_limit" ]; then
         CASE_STATUS="FAIL"
-        CASE_REASON="LOG_SIZE_LIMIT"
+        CASE_REASON="LOG_LIMIT_REACHED"
         CASE_STAGE="log_limit"
+    elif [ "$ret_code" -eq 154 ]; then
+        CASE_STATUS="FAIL"
+        CASE_REASON="RUN_LOG_CAPTURE_FAILED"
+        CASE_STAGE="log_capture"
     elif [ "$ret_code" -eq 124 ] || [ "$ret_code" -eq 137 ] || [ "$ret_code" -eq 143 ] || [ "$ret_code" -eq 130 ]; then
         CASE_STATUS="TIMEOUT"
         CASE_REASON="PROCESS_KILLED"

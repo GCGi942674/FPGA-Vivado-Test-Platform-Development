@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -84,6 +85,13 @@ SLOT_SVN_URL = os.environ.get(
 SVN_COMMAND_TIMEOUT = int(os.environ.get("PJTEST_SVN_COMMAND_TIMEOUT", "0"))
 CLEAN_AFTER_RUN = os.environ.get("PJTEST_CLEAN_AFTER_RUN", "1") != "0"
 CLEAN_TIMEOUT = int(os.environ.get("PJTEST_CLEAN_TIMEOUT", "600"))
+PRESERVE_FAILURE_EVIDENCE = (
+    os.environ.get("PJTEST_PRESERVE_FAILURE_EVIDENCE", "0") != "0"
+)
+FAILURE_EVIDENCE_MAX_FILE_MB = max(
+    1,
+    int(os.environ.get("PJTEST_FAILURE_EVIDENCE_MAX_FILE_MB", "32")),
+)
 PROCESS_TERM_GRACE_SEC = int(os.environ.get(
     "PJTEST_PROCESS_TERM_GRACE_SEC",
     "30",
@@ -95,6 +103,8 @@ FLOW_CONFIG_IGNORE_KEYS = set(
 )
 
 _slot_prepare_lock = threading.Lock()
+_evidence_hash_lock = threading.Lock()
+_evidence_hash_cache = {}
 
 DEFAULT_SCHEDULER_URL = (
     os.environ.get("SCHEDULER_URL")
@@ -1304,6 +1314,238 @@ def tail_text(path, max_lines=300, max_chars=16000):
     return text
 
 
+def sha256_file_cached(path):
+    """Return a cached SHA256 for a file that is immutable during one run."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+
+    stat_result = path.stat()
+    cache_key = (str(path.resolve()), stat_result.st_size, stat_result.st_mtime)
+    with _evidence_hash_lock:
+        cached = _evidence_hash_cache.get(cache_key)
+    if cached:
+        return cached
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    value = digest.hexdigest()
+
+    with _evidence_hash_lock:
+        _evidence_hash_cache[cache_key] = value
+    return value
+
+
+def sha256_directory_cached(path):
+    """Return a stable content hash for one slot-local directory."""
+    path = Path(path)
+    if not path.is_dir():
+        return None
+
+    cache_key = ("directory", str(path.resolve()))
+    with _evidence_hash_lock:
+        cached = _evidence_hash_cache.get(cache_key)
+    if cached:
+        return cached
+
+    digest = hashlib.sha256()
+    for current_root, dirnames, filenames in os.walk(str(path)):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            file_path = Path(current_root) / filename
+            if not file_path.is_file():
+                continue
+            relative = os.path.relpath(str(file_path), str(path))
+            digest.update(relative.replace(os.sep, "/").encode("utf-8", "replace"))
+            digest.update(b"\0")
+            file_hash = sha256_file_cached(file_path)
+            digest.update(str(file_hash or "unreadable").encode("ascii", "replace"))
+            digest.update(b"\n")
+    value = digest.hexdigest()
+
+    with _evidence_hash_lock:
+        _evidence_hash_cache[cache_key] = value
+    return value
+
+
+def read_small_text(path, max_chars=65536):
+    """Read a small system/status file without failing evidence capture."""
+    try:
+        with open(str(path), "r", encoding="utf-8", errors="replace") as stream:
+            return stream.read(max_chars)
+    except Exception:
+        return None
+
+
+def run_capture_text(argv, timeout=10):
+    """Run a short read-only metadata command."""
+    try:
+        output = subprocess.check_output(
+            argv,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            universal_newlines=True,
+        )
+        return output.strip()
+    except Exception as exc:
+        return "ERROR: %s" % exc
+
+
+def copy_evidence_file(source, evidence_dir, destination_name=None):
+    """Copy one artifact, bounding a very large file to head and tail data."""
+    source = Path(source)
+    if not source.is_file():
+        return None
+
+    destination_name = destination_name or source.name
+    destination = Path(evidence_dir) / destination_name
+    max_bytes = FAILURE_EVIDENCE_MAX_FILE_MB * 1024 * 1024
+    size = source.stat().st_size
+
+    if size <= max_bytes:
+        shutil.copy2(str(source), str(destination))
+        return {
+            "source": str(source),
+            "saved": str(destination),
+            "source_size": size,
+            "truncated": False,
+        }
+
+    destination = destination.with_name(destination.name + ".head_tail")
+    head_bytes = min(2 * 1024 * 1024, max_bytes // 2)
+    tail_bytes = max_bytes - head_bytes
+    separator = (
+        "\n\n[PJTEST EVIDENCE TRUNCATED: source_size=%d bytes]\n\n" % size
+    ).encode("ascii")
+
+    with source.open("rb") as input_stream, destination.open("wb") as output_stream:
+        output_stream.write(input_stream.read(head_bytes))
+        output_stream.write(separator)
+        input_stream.seek(max(0, size - tail_bytes))
+        shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+
+    return {
+        "source": str(source),
+        "saved": str(destination),
+        "source_size": size,
+        "truncated": True,
+    }
+
+
+def resolve_case_directory(task):
+    """Return the slot-local case directory for a dispatched run.tcl."""
+    work_root = Path(task["work_root"]).resolve()
+    target = Path(str(task.get("target_arg") or task.get("run_tcl_path") or ""))
+    target = target.resolve() if target.is_absolute() else (work_root / target).resolve()
+    return target.parent if target.name == "run.tcl" else target
+
+
+def preserve_failure_evidence(
+    task,
+    worker_name,
+    log_dir,
+    status,
+    exit_code,
+    raw_exit_code,
+    timed_out,
+    message,
+    result_env_path,
+    result_env,
+    log,
+):
+    """Archive failure evidence before clean.sh removes case artifacts."""
+    evidence_dir = Path(log_dir) / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    case_dir = resolve_case_directory(task)
+    work_root = Path(task["work_root"]).resolve()
+    install_root = Path(task.get("install_root") or work_root.parent).resolve()
+    target_binary, flow_dir = resolve_install_targets(install_root)
+
+    artifact_names = [
+        "run",
+        "result_bgn.log",
+        "output.bgn",
+        "output_cmp.bgn",
+        "golden_cmp.bgn",
+        "mis_bit.txt",
+        "mis_msk.txt",
+        "mis_checksum.txt",
+        "mis_rpx.txt",
+        ".run_status",
+        ".run_reason",
+        ".run_runtime",
+        ".run_stage",
+        ".run_ret",
+        ".run_log_limit",
+    ]
+    copied = []
+    for name in artifact_names:
+        item = copy_evidence_file(case_dir / name, evidence_dir, name)
+        if item:
+            copied.append(item)
+
+    if result_env_path:
+        item = copy_evidence_file(result_env_path, evidence_dir, "result.env")
+        if item:
+            copied.append(item)
+    item = copy_evidence_file(work_root / "flow_config", evidence_dir, "flow_config")
+    if item:
+        copied.append(item)
+    run_tcl = Path(str(task.get("target_arg") or task.get("run_tcl_path") or ""))
+    run_tcl = run_tcl.resolve() if run_tcl.is_absolute() else (work_root / run_tcl).resolve()
+    item = copy_evidence_file(run_tcl, evidence_dir, "run.tcl")
+    if item:
+        copied.append(item)
+
+    manifest = {
+        "captured_at": local_now(),
+        "hostname": socket.gethostname(),
+        "worker_name": worker_name,
+        "task_id": task.get("task_id"),
+        "example_id": task.get("example_id"),
+        "attempt_id": task.get("attempt_id"),
+        "revision": task.get("revision"),
+        "zip_path": task.get("zip_path") or task.get("galaxcore_zip_path"),
+        "target_arg": task.get("target_arg"),
+        "case_dir": str(case_dir),
+        "status": status,
+        "exit_code": exit_code,
+        "raw_exit_code": raw_exit_code,
+        "timed_out": bool(timed_out),
+        "message": message,
+        "result_env": result_env or {},
+        "galaxcore_path": str(target_binary),
+        "galaxcore_sha256": sha256_file_cached(target_binary),
+        "run_tcl_sha256": sha256_file_cached(run_tcl),
+        "flow_config_sha256": sha256_file_cached(work_root / "flow_config"),
+        "flow_dir": str(flow_dir),
+        "flow_dir_exists": flow_dir.is_dir(),
+        "flow_dir_sha256": sha256_directory_cached(flow_dir),
+        "slot_svnversion": run_capture_text(["svnversion", str(install_root)]),
+        "test2_svnversion": run_capture_text(["svnversion", str(work_root)]),
+        "cpu_count": os.cpu_count(),
+        "loadavg": read_small_text("/proc/loadavg"),
+        "meminfo": read_small_text("/proc/meminfo"),
+        "copied_artifacts": copied,
+    }
+    manifest_path = evidence_dir / "evidence_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+
+    log_line(
+        log,
+        "failure evidence saved: %s artifacts=%d" % (evidence_dir, len(copied)),
+        worker_name=worker_name,
+    )
+    return str(evidence_dir)
+
+
 def parse_env_file(path):
     """Parse vivado_runner result.env key/value output."""
     result = {}
@@ -1978,6 +2220,34 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
                         result_env.get("STATUS") or status,
                         result_env.get("REASON") or infra_reason or "-",
                     ))
+
+                if (
+                    PRESERVE_FAILURE_EVIDENCE
+                    and status != "success"
+                    and infra_reason != "slot_busy"
+                ):
+                    try:
+                        preserve_failure_evidence(
+                            slot_task,
+                            worker_name,
+                            log_dir,
+                            status,
+                            exit_code,
+                            raw_exit_code,
+                            timed_out,
+                            message,
+                            result_env_path,
+                            result_env,
+                            log,
+                        )
+                    except Exception as exc:
+                        # Evidence collection is diagnostic only.  Never turn
+                        # the original case result into a worker failure.
+                        log.write("[%s] failure evidence capture failed: %s\n" % (
+                            local_now(),
+                            exc,
+                        ))
+                        log.flush()
 
                 if infra_reason == "slot_busy":
                     log.write("[%s] clean.sh skipped because slot is busy\n" % local_now())
@@ -2880,6 +3150,8 @@ def run_configuration_check(args):
     )
     reporter.info("clean after run", str(int(CLEAN_AFTER_RUN)))
     reporter.info("clean timeout", str(CLEAN_TIMEOUT))
+    reporter.info("preserve failures", str(int(PRESERVE_FAILURE_EVIDENCE)))
+    reporter.info("evidence max file", "%sMB" % FAILURE_EVIDENCE_MAX_FILE_MB)
     reporter.info("update test2", str(int(bool(args.update_test2))))
     reporter.info("recheckout slots", str(int(bool(args.recheckout_slots))))
     reporter.info("tmux slots", str(int(bool(args.tmux_slots))))

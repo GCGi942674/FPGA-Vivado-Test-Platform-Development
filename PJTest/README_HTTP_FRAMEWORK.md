@@ -1119,6 +1119,39 @@ MESSAGE
 
 ---
 
+### 17.6 导出统一回归列表
+
+第一阶段回归分析不修改 worker、HTTP 协议或现有 `find`。中心节点从
+SQLite 的已完成任务中生成两个只读汇总文件：
+
+```bash
+cd /home/user3/PJTest
+./taskctl.py regression-export
+```
+
+默认输出到：
+
+```text
+<report_root>/regression/regression_cases.tsv
+<report_root>/regression/regression_summary.txt
+```
+
+临时指定目录：
+
+```bash
+./taskctl.py regression-export --out /tmp/pjtest-regression
+```
+
+其中：
+
+```text
+regression_cases.tsv    完整的当前状态、边界和严重度汇总
+regression_summary.txt  兼容 s<通过版本> / f<失败版本> 的简化视图
+```
+
+两个文件都是从数据库重新生成的派生视图，不允许作为新的事实源手工
+回写。详细字段和状态规则见 `server/docs/regression_export.md`。
+
 ## 18. 取消和删除任务
 
 ### 18.1 安全取消

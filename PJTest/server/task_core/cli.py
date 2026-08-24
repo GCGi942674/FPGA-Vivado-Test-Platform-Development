@@ -634,6 +634,36 @@ def cmd_find(args):
     print("Inspect         : ./taskctl.py show %s" % task_id)
     print("Examples        : ./taskctl.py examples %s" % task_id)
 
+
+def cmd_regression_export(args):
+    """Generate the phase-one regression summary from the SQLite truth source."""
+    from regression_core import export_regression_reports
+
+    output_dir = (
+        Path(args.out).expanduser().resolve()
+        if args.out
+        else SHARE_REPORT_DIR / "regression"
+    )
+    result = export_regression_reports(
+        DB_PATH,
+        output_dir,
+        connect_timeout_sec=DB_CONNECT_TIMEOUT_SEC,
+        busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
+    )
+
+    print("Regression export completed")
+    print("Database         : %s" % DB_PATH)
+    print("Terminal rows    : %d" % result["terminal_rows"])
+    print("Terminal attempts: %d" % result["terminal_attempts"])
+    print("Observations     : %d" % result["loaded_observations"])
+    print("Regression cases : %d" % result["case_count"])
+    print(
+        "Skipped revision: %d"
+        % result["skipped_non_numeric_revision"]
+    )
+    print("Full TSV         : %s" % result["full_path"])
+    print("Simple summary   : %s" % result["summary_path"])
+
 def format_short(text, width):
     """Return full text for table display.
 
@@ -3256,6 +3286,16 @@ def build_parser():
     p_find.add_argument("--max-retry", type=int, help="retry count per revision")
     p_find.add_argument("--max-time", type=int, help="timeout seconds per revision")
     p_find.set_defaults(func=cmd_find)
+
+    p_regression_export = sub.add_parser(
+        "regression-export",
+        help="generate read-only regression summary files from SQLite",
+    )
+    p_regression_export.add_argument(
+        "--out",
+        help="output directory, default: <report_root>/regression",
+    )
+    p_regression_export.set_defaults(func=cmd_regression_export)
 
     p_list = sub.add_parser("list", help="list recent tasks")
     p_list.add_argument("--status", help="filter by task status")

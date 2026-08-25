@@ -2,7 +2,30 @@
 
 check_runtime_signature() {
     local run_log="$1"
-    grep -q "$KW_RUNTIME" "$run_log"
+
+    # A case is complete only when the last non-empty GalaxCore output line is
+    # exactly "Runtime: <seconds>".  Merely finding Runtime somewhere in the
+    # log can accept a process that continued writing errors afterwards.
+    LC_ALL=C awk '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line ~ /[^[:space:]]/) {
+                last = line
+            }
+        }
+        END {
+            if (last ~ /^Runtime:[[:space:]]*[0-9]+[[:space:]]*$/) {
+                exit 0
+            }
+            exit 1
+        }
+    ' "$run_log"
+}
+
+flow_arg_enabled() {
+    local module="$1"
+    printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx -- "$module"
 }
 
 judge_case_result() {
@@ -24,7 +47,19 @@ judge_case_result() {
         return 0
     fi
 
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "dcp_cmp"; then
+    # Runtime must be the final non-empty output line before any result
+    # artifact is trusted.  Comparison files alone cannot prove that the
+    # GalaxCore process completed normally.
+    if ! check_runtime_signature "$log_file"; then
+        if grep -q "$KW_RUNTIME" "$log_file"; then
+            CASE_REASON="RUNTIME_NOT_FINAL"
+        else
+            CASE_REASON="RUNTIME_MISSING"
+        fi
+        return 0
+    fi
+
+    if flow_arg_enabled "dcp_cmp"; then
         if grep -Eq "$KW_DCP_FAIL" "$log_file"; then
             CASE_REASON="DCP_COMPARE_FAIL"
             CASE_STAGE=$(extract_dcp_stage "$log_file")
@@ -37,49 +72,52 @@ judge_case_result() {
         fi
     fi
 
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "bgn_cmp"; then
-        grep -q "$KW_BGN_FINISH" "$log_file" || { CASE_REASON="BGN_TRANSLATE_MISSING"; return 0; }
-        if [ -e "$case_dir/result_bgn.log" ]; then
-            if [ -s "$case_dir/result_bgn.log" ]; then
-                CASE_REASON="BGN_COMPARE_FAIL"
+    # BGN/BIT/MSK comparison is meaningful only as part of write_bitstream.
+    # With a valid final Runtime line, the fresh result artifacts are the
+    # source of truth: missing means unfinished, non-empty means mismatch,
+    # and empty means pass.
+    if flow_arg_enabled "write_bitstream"; then
+        if flow_arg_enabled "bgn_cmp"; then
+            if [ -e "$case_dir/result_bgn.log" ]; then
+                if [ -s "$case_dir/result_bgn.log" ]; then
+                    CASE_REASON="BGN_COMPARE_FAIL"
+                    return 0
+                fi
+            else
+                CASE_REASON="BGN_RESULT_MISSING"
                 return 0
             fi
-        else
-            CASE_REASON="BGN_RESULT_MISSING"
-            return 0
+            compare_artifacts_passed=1
         fi
-        compare_artifacts_passed=1
-    fi
 
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "bit_cmp"; then
-        grep -q "$KW_WRITE_BIT_FINISH" "$log_file" || { CASE_REASON="WRITE_BIT_MISSING"; return 0; }
-        if [ -e "$case_dir/mis_bit.txt" ]; then
-            if [ -s "$case_dir/mis_bit.txt" ]; then
-                CASE_REASON="BIT_COMPARE_FAIL"
+        if flow_arg_enabled "bit_cmp"; then
+            if [ -e "$case_dir/mis_bit.txt" ]; then
+                if [ -s "$case_dir/mis_bit.txt" ]; then
+                    CASE_REASON="BIT_COMPARE_FAIL"
+                    return 0
+                fi
+            else
+                CASE_REASON="BIT_RESULT_MISSING"
                 return 0
             fi
-        else
-            CASE_REASON="BIT_RESULT_MISSING"
-            return 0
+            compare_artifacts_passed=1
         fi
-        compare_artifacts_passed=1
-    fi
 
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "msk_cmp"; then
-        grep -q "$KW_WRITE_BIT_FINISH" "$log_file" || { CASE_REASON="WRITE_BIT_MISSING"; return 0; }
-        if [ -e "$case_dir/mis_msk.txt" ]; then
-            if [ -s "$case_dir/mis_msk.txt" ]; then
-                CASE_REASON="MSK_COMPARE_FAIL"
+        if flow_arg_enabled "msk_cmp"; then
+            if [ -e "$case_dir/mis_msk.txt" ]; then
+                if [ -s "$case_dir/mis_msk.txt" ]; then
+                    CASE_REASON="MSK_COMPARE_FAIL"
+                    return 0
+                fi
+            else
+                CASE_REASON="MSK_RESULT_MISSING"
                 return 0
             fi
-        else
-            CASE_REASON="MSK_RESULT_MISSING"
-            return 0
+            compare_artifacts_passed=1
         fi
-        compare_artifacts_passed=1
     fi
 
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "report_timing_summary"; then
+    if flow_arg_enabled "report_timing_summary"; then
         if [ -e "$case_dir/mis_timing_summary.txt" ]; then
             if [ -s "$case_dir/mis_timing_summary.txt" ]; then
                 CASE_REASON="TIMING_SUMMARY_FAIL"
@@ -101,7 +139,7 @@ judge_case_result() {
     #   empty     -> checksum compare passed
     #
     # mis_checksum.txt is the only trusted result artifact.
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "checksum_cmp"; then
+    if flow_arg_enabled "checksum_cmp"; then
 
         local checksum_file="$case_dir/mis_checksum.txt"
 
@@ -131,7 +169,7 @@ judge_case_result() {
     #   missing   -> utilization compare flow unfinished
     #   non-empty -> utilization compare failed
     #   empty     -> utilization compare passed
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "report_utilization"; then
+    if flow_arg_enabled "report_utilization"; then
 
         local utilization_file="$case_dir/mis_report_utilization.txt"
 
@@ -158,7 +196,7 @@ judge_case_result() {
     #   missing   -> rpx compare flow unfinished
     #   non-empty -> rpx compare failed
     #   empty     -> rpx compare passed
-    if printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx "rpx_cmp"; then
+    if flow_arg_enabled "rpx_cmp"; then
 
         local rpx_file="$case_dir/mis_rpx.txt"
 
@@ -180,9 +218,8 @@ judge_case_result() {
         return 0
     fi
 
-    # BGN/BIT/MSK compare modules have already validated their completion
-    # markers and empty mismatch artifacts. They do not require the generic
-    # Runtime signature used by ordinary non-compare flows.
+    # Runtime was validated before the result files, so empty comparison
+    # artifacts now represent a complete successful run.
     if [ "$compare_artifacts_passed" -eq 1 ]; then
         CASE_STATUS="PASS"
         CASE_REASON="COMPARE_ARTIFACTS_PASS"
@@ -190,12 +227,8 @@ judge_case_result() {
         return 0
     fi
 
-    if check_runtime_signature "$log_file"; then
-        CASE_STATUS="PASS"
-        CASE_REASON="PASS"
-    else
-        CASE_REASON="RUNTIME_MISSING"
-    fi
+    CASE_STATUS="PASS"
+    CASE_REASON="PASS"
 }
 
 extract_dcp_stage() {

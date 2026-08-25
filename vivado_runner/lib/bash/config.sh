@@ -91,6 +91,17 @@ load_flow_config() {
     ENABLE_COPY_FROM_FLOW=0
 
     for key in read_edif read_xdc report_timing_summary opt_design place_design place_design_from_syn phys_opt_design route_design route_design_from_place write_checkpoint write_bitstream bit_cmp msk_cmp bgn_cmp checksum_cmp report_utilization rpx_cmp dcp_cmp; do
+        case "$key" in
+            bit_cmp|msk_cmp|bgn_cmp)
+                if ! is_enabled "write_bitstream"; then
+                    if is_enabled "$key"; then
+                        log_warn "$key ignored because write_bitstream is disabled"
+                    fi
+                    continue
+                fi
+                ;;
+        esac
+
         if is_enabled "$key"; then
             FLOW_ARGS+=("$key")
             append_enabled_module "$key"

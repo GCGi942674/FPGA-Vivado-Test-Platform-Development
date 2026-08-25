@@ -83,18 +83,6 @@ def main():
             elif remaining > 0:
                 run_log.write(line[:remaining])
 
-        if suppressed_lines:
-            summary = (
-                f"\n[INFO] suppressed_pin_redefinition_lines={suppressed_lines}\n"
-            ).encode("ascii")
-            accepted_bytes += len(summary)
-            tail.add(summary)
-            remaining = args.limit_bytes - run_log.tell()
-            if unlimited:
-                run_log.write(summary)
-            elif remaining > 0:
-                run_log.write(summary[:remaining])
-
         if not unlimited and accepted_bytes > args.limit_bytes:
             notice = (
                 "\n[ERROR] LOG_LIMIT_REACHED: filtered run log exceeded "

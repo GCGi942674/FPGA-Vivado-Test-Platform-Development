@@ -12,6 +12,7 @@ from .identity import build_test_identity
 NUMERIC_REVISION_RE = re.compile(r"^\d+$")
 TERMINAL_TASK_STATUSES = ("success", "failed")
 TERMINAL_EXAMPLE_STATUSES = ("success", "failed", "timeout")
+DEFAULT_REGRESSION_SUITE = "daily_regression"
 
 STATE_SEVERITY = {
     "OPEN": 80,
@@ -87,8 +88,8 @@ def _observation_status(example_status, infra_reason):
     return mapping.get(str(example_status or "").strip().lower(), "UNKNOWN")
 
 
-def load_observations(conn):
-    """Load comparable terminal example results from completed tasks."""
+def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE):
+    """Load comparable terminal results from completed regression-suite tasks."""
     task_placeholders = ",".join("?" for _ in TERMINAL_TASK_STATUSES)
     example_placeholders = ",".join("?" for _ in TERMINAL_EXAMPLE_STATUSES)
     query = """
@@ -108,9 +109,10 @@ def load_observations(conn):
         JOIN tasks AS t ON t.task_id = e.task_id
         WHERE t.status IN (%s)
           AND e.status IN (%s)
+          AND t.suite = ?
         ORDER BY t.id, e.id
     """ % (task_placeholders, example_placeholders)
-    params = TERMINAL_TASK_STATUSES + TERMINAL_EXAMPLE_STATUSES
+    params = TERMINAL_TASK_STATUSES + TERMINAL_EXAMPLE_STATUSES + (suite,)
     rows = conn.execute(query, params).fetchall()
 
     attempt_query = """
@@ -126,6 +128,7 @@ def load_observations(conn):
         WHERE t.status IN (%s)
           AND e.status IN (%s)
           AND a.status IN (%s)
+          AND t.suite = ?
         ORDER BY a.id
     """ % (
         task_placeholders,
@@ -136,6 +139,7 @@ def load_observations(conn):
         TERMINAL_TASK_STATUSES
         + TERMINAL_EXAMPLE_STATUSES
         + TERMINAL_EXAMPLE_STATUSES
+        + (suite,)
     )
     attempts_by_example = defaultdict(list)
     for attempt in conn.execute(attempt_query, attempt_params).fetchall():

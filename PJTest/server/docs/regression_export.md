@@ -1,8 +1,8 @@
 # PJTest regression export
 
 `regression-export` is the phase-one regression index. It reads completed
-PJTest results from SQLite and atomically regenerates two read-only files. It
-does not change worker behavior, task scheduling, or revision-scan behavior.
+`daily_regression` task results from SQLite and atomically regenerates two
+read-only files. Manual and other task suites are excluded.
 
 ## Usage
 
@@ -30,10 +30,16 @@ regression_cases.tsv
 regression_summary.txt
 ```
 
-`regression_cases.tsv` contains the machine-readable and human-readable current
-summary. `regression_summary.txt` keeps the requested compact `sREV/fREV`
-display. Both files are derived views; SQLite remains the source of truth and
-the files must not be edited as task input.
+`regression_cases.tsv` contains case/template, regression boundaries, latest
+result, and update time. `regression_summary.txt` keeps only case/template and
+the compact `sREV/fREV` display. Internal identity hashes, state, and severity
+are deliberately omitted. Both files are derived views; SQLite remains the
+source of truth and the files must not be edited as task input.
+
+The daily task submitter marks every task configured in `task.yaml` with
+`suite=daily_regression`. When one of those tasks becomes terminal, the
+scheduler asynchronously regenerates both files. The final nightly task to
+finish therefore publishes the complete nightly view.
 
 ## Test identity
 

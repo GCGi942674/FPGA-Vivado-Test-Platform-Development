@@ -121,6 +121,7 @@ class ExportTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY,
                 task_id TEXT UNIQUE,
                 template_name TEXT,
+                suite TEXT,
                 revision TEXT,
                 work_root TEXT,
                 flow_config_json TEXT,
@@ -153,19 +154,20 @@ class ExportTests(unittest.TestCase):
             """
         )
         tasks = [
-            (1, "task_good", "route", "100", "/work/test2", "{}", "success"),
-            (2, "task_bad", "route", "110", "/work/test2", "{}", "failed"),
-            (3, "task_active", "route", "120", "/work/test2", "{}", "running"),
-            (4, "task_text", "route", "latest", "/work/test2", "{}", "failed"),
-            (5, "task_infra", "route", "120", "/work/test2", "{}", "failed"),
+            (1, "task_good", "route", "daily_regression", "100", "/work/test2", "{}", "success"),
+            (2, "task_bad", "route", "daily_regression", "110", "/work/test2", "{}", "failed"),
+            (3, "task_active", "route", "daily_regression", "120", "/work/test2", "{}", "running"),
+            (4, "task_text", "route", "daily_regression", "latest", "/work/test2", "{}", "failed"),
+            (5, "task_infra", "route", "daily_regression", "120", "/work/test2", "{}", "failed"),
+            (6, "task_manual", "route", "night_build", "130", "/work/test2", "{}", "failed"),
         ]
         for row in tasks:
             conn.execute(
                 """
                 INSERT INTO tasks (
-                    id, task_id, template_name, revision, work_root,
+                    id, task_id, template_name, suite, revision, work_root,
                     flow_config_json, status, created_at, updated_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '2026-08-24', '2026-08-24', '2026-08-24')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '2026-08-24', '2026-08-24', '2026-08-24')
                 """,
                 row,
             )
@@ -175,6 +177,7 @@ class ExportTests(unittest.TestCase):
             (3, "ex_active", "task_active", "case/run.tcl", None, "failed", None),
             (4, "ex_text", "task_text", "other/run.tcl", None, "failed", None),
             (5, "ex_infra", "task_infra", "case/run.tcl", None, "failed", "slot_busy"),
+            (6, "ex_manual", "task_manual", "case/run.tcl", None, "failed", None),
         ]
         for row in examples:
             conn.execute(
@@ -205,15 +208,19 @@ class ExportTests(unittest.TestCase):
             ) as stream:
                 rows = list(csv.DictReader(stream, delimiter="\t"))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["STATE"], "INCONCLUSIVE")
             self.assertEqual(rows[0]["LAST_GOOD"], "100")
             self.assertEqual(rows[0]["FIRST_BAD"], "110")
             self.assertEqual(rows[0]["LATEST_STATUS"], "INFRA_ERROR")
+            self.assertNotIn("TEST_KEY", rows[0])
+            self.assertNotIn("CONFIG_HASH", rows[0])
+            self.assertNotIn("SEVERITY", rows[0])
+            self.assertNotIn("STATE", rows[0])
 
             summary = (out_dir / "regression_summary.txt").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("s100\tf110\tINCONCLUSIVE", summary)
+            self.assertIn("s100\tf110", summary)
+            self.assertNotIn("STATE", summary.splitlines()[0])
 
     def test_attempt_conflict_is_exported_as_flaky(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -242,7 +249,6 @@ class ExportTests(unittest.TestCase):
                 "r", encoding="utf-8", newline=""
             ) as stream:
                 rows = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(rows[0]["STATE"], "INCONCLUSIVE")
             self.assertEqual(rows[0]["LATEST_STATUS"], "INFRA_ERROR")
 
             # Remove the later infrastructure-only revision so r110 becomes latest.
@@ -256,7 +262,6 @@ class ExportTests(unittest.TestCase):
                 "r", encoding="utf-8", newline=""
             ) as stream:
                 rows = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(rows[0]["STATE"], "FLAKY")
             self.assertEqual(rows[0]["LATEST_STATUS"], "FLAKY")
 
 

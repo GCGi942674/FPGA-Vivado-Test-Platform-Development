@@ -10,22 +10,22 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .analyzer import analyze_observations, load_observations
+from .analyzer import (
+    DEFAULT_REGRESSION_SUITE,
+    analyze_observations,
+    load_observations,
+)
 
 
 TSV_COLUMNS = [
-    "TEST_KEY",
     "CASE_PATH",
     "TEMPLATE",
-    "CONFIG_HASH",
-    "STATE",
     "LAST_GOOD",
     "FIRST_BAD",
     "LAST_BAD",
     "FIRST_FIXED",
     "LATEST_REVISION",
     "LATEST_STATUS",
-    "SEVERITY",
     "UPDATED_AT",
 ]
 
@@ -108,24 +108,20 @@ def _full_rows(cases):
     yield TSV_COLUMNS
     for item in cases:
         yield [
-            item.test_key,
             item.case_path,
             item.template_name,
-            item.config_hash,
-            item.state,
             _display(item.last_good),
             _display(item.first_bad),
             _display(item.last_bad),
             _display(item.first_fixed),
             item.latest_revision,
             item.latest_status,
-            item.severity,
             item.updated_at,
         ]
 
 
 def _summary_rows(cases):
-    yield ["CASE_PATH", "TEMPLATE", "S_VERSION", "F_VERSION", "STATE"]
+    yield ["CASE_PATH", "TEMPLATE", "S_VERSION", "F_VERSION"]
     for item in cases:
         success_version = "s%s" % item.last_good if item.last_good is not None else "s-"
         fail_version = "f%s" % item.first_bad if item.first_bad is not None else "f-"
@@ -134,7 +130,6 @@ def _summary_rows(cases):
             item.template_name,
             success_version,
             fail_version,
-            item.state,
         ]
 
 
@@ -143,6 +138,7 @@ def export_regression_reports(
     output_dir,
     connect_timeout_sec=60,
     busy_timeout_ms=60000,
+    suite=DEFAULT_REGRESSION_SUITE,
 ):
     """Analyze the current database and generate both phase-one reports."""
     db_path = Path(db_path)
@@ -164,7 +160,7 @@ def export_regression_reports(
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=%d" % max(1, int(busy_timeout_ms)))
         try:
-            observations, stats = load_observations(conn)
+            observations, stats = load_observations(conn, suite=suite)
         finally:
             conn.close()
 
@@ -175,6 +171,7 @@ def export_regression_reports(
     result = dict(stats)
     result.update({
         "case_count": len(cases),
+        "suite": suite,
         "full_path": str(full_path),
         "summary_path": str(summary_path),
     })

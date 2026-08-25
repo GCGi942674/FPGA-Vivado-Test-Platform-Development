@@ -460,7 +460,7 @@ def cmd_add(args):
     target_dir = args.target_dir or DEFAULT_TARGET_DIR
 
     work_root = template.get("work_root", DEFAULT_WORK_ROOT)
-    suite = template.get("suite", DEFAULT_SUITE)
+    suite = getattr(args, "suite", None) or template.get("suite", DEFAULT_SUITE)
     priority = get_int_value(args.priority, template, "priority", DEFAULT_PRIORITY)
     max_retry = get_int_value(args.max_retry, template, "max_retry", DEFAULT_MAX_RETRY)
     max_time = get_int_value(args.max_time, template, "max_time", DEFAULT_MAX_TIME)
@@ -653,6 +653,7 @@ def cmd_regression_export(args):
 
     print("Regression export completed")
     print("Database         : %s" % DB_PATH)
+    print("Task suite       : %s" % result["suite"])
     print("Terminal rows    : %d" % result["terminal_rows"])
     print("Terminal attempts: %d" % result["terminal_attempts"])
     print("Observations     : %d" % result["loaded_observations"])
@@ -2240,6 +2241,7 @@ def cmd_apply(args):
         task_args.target_dir = target
         task_args.revision = entry.get("revision")  # None selects the latest revision.
         task_args.name = entry.get("name")
+        task_args.suite = entry.get("suite")
         task_args.priority = entry.get("priority")
         task_args.max_retry = entry.get("max_retry")
         task_args.max_time = entry.get("max_time")
@@ -3270,6 +3272,7 @@ def build_parser():
         help="fixed revision number; omit or use latest for scheduler-resolved latest zip",
     )
     p_add.add_argument("--name", help="task display name")
+    p_add.add_argument("--suite", help="task suite/source marker")
     p_add.add_argument("--priority", type=int, help="priority, default from template")
     p_add.add_argument("--max-retry", type=int, help="retry count per example")
     p_add.add_argument("--max-time", type=int, help="timeout seconds per example")

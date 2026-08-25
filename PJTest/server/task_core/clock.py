@@ -300,6 +300,7 @@ def submit_tasks(task_list, revision, interval_seconds=None):
                 option_map = (
                     ("revision", "--revision"),
                     ("name", "--name"),
+                    ("suite", "--suite"),
                     ("priority", "--priority"),
                     ("max_retry", "--max-retry"),
                     ("max_time", "--max-time"),

@@ -1,9 +1,20 @@
 tasks:
-  - template: place 
-    target: .
+  - template: report_utilization
+    target: /home/user3/workspace/galaxcore/galaxcore/test2/runlist
+    suite: daily_regression
 
-  - template: route
-    target: .
+  - template: report_timing_summary
+    target: /home/user3/workspace/galaxcore/galaxcore/test2/runlist
+    suite: daily_regression
 
-  - template: checksum
-    target: .
+  - template: route_design_from_place
+    target: /home/user3/workspace/galaxcore/galaxcore/test2/runlist
+    suite: daily_regression
+
+  - template: route_design
+    target: /home/user3/workspace/galaxcore/galaxcore/test2/runlist
+    suite: daily_regression
+
+  - template: place_design
+    target: /home/user3/workspace/galaxcore/galaxcore/test2/runlist
+    suite: daily_regression

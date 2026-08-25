@@ -2772,6 +2772,48 @@ def write_share_reports_for_task(task_id):
         return False
 
 
+def refresh_regression_reports_for_task(task_id):
+    """Refresh regression views after one daily regression task is terminal."""
+    try:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT suite, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row or row["suite"] != "daily_regression":
+            return False
+        if row["status"] not in ("success", "failed"):
+            return False
+
+        from regression_core import export_regression_reports
+
+        result = export_regression_reports(
+            DB_PATH,
+            REPORT_ROOT / "regression",
+            connect_timeout_sec=DB_CONNECT_TIMEOUT_SEC,
+            busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
+        )
+        log_scheduler(
+            "INFO",
+            "regression reports refreshed task=%s suite=%s cases=%d"
+            % (task_id, result["suite"], result["case_count"]),
+            task_id=task_id,
+            also_stdout=False,
+        )
+        return True
+    except Exception as exc:
+        log_exception(
+            "failed to refresh regression reports for %s" % task_id,
+            exc,
+            task_id=task_id,
+        )
+        return False
+
+
 def enqueue_share_report(task_id):
     """Queue one coalesced report refresh without blocking an HTTP request."""
     if not task_id:
@@ -2843,6 +2885,9 @@ def report_writer_loop(stop_event):
 
         try:
             write_share_reports_for_task(task_id)
+            # Keep the nightly regression view independent from task-report
+            # generation failures. This helper performs its own error logging.
+            refresh_regression_reports_for_task(task_id)
         finally:
             requeue = False
             with REPORT_QUEUE_STATE_LOCK:

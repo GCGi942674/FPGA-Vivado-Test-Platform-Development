@@ -1132,8 +1132,8 @@ cd /home/user3/PJTest
 默认输出到：
 
 ```text
-<report_root>/regression/regression_cases.tsv
-<report_root>/regression/regression_summary.txt
+<report_root>/Summary/regression_cases.tsv
+<report_root>/Summary/regression_summary.txt
 ```
 
 临时指定目录：
@@ -1145,8 +1145,8 @@ cd /home/user3/PJTest
 其中：
 
 ```text
-regression_cases.tsv    完整的当前状态、边界和严重度汇总
-regression_summary.txt  兼容 s<通过版本> / f<失败版本> 的简化视图
+regression_cases.tsv    案例、模板、版本边界、最新结果和更新时间
+regression_summary.txt  案例、模板及 s<通过版本> / f<失败版本> 简化视图
 ```
 
 两个文件都是从数据库重新生成的派生视图，不允许作为新的事实源手工

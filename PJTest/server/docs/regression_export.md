@@ -14,7 +14,7 @@ cd /home/user3/PJTest
 The default output directory is:
 
 ```text
-<report_root>/regression/
+<report_root>/Summary/
 ```
 
 An alternate output directory can be selected for inspection:

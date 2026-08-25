@@ -642,7 +642,7 @@ def cmd_regression_export(args):
     output_dir = (
         Path(args.out).expanduser().resolve()
         if args.out
-        else SHARE_REPORT_DIR / "regression"
+        else SHARE_REPORT_DIR / REPORT_SUMMARY_DIR_NAME
     )
     result = export_regression_reports(
         DB_PATH,
@@ -3296,7 +3296,7 @@ def build_parser():
     )
     p_regression_export.add_argument(
         "--out",
-        help="output directory, default: <report_root>/regression",
+        help="output directory, default: <report_root>/<summary_dir_name>",
     )
     p_regression_export.set_defaults(func=cmd_regression_export)
 

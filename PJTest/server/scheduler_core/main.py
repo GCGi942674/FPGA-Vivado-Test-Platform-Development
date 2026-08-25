@@ -2793,7 +2793,7 @@ def refresh_regression_reports_for_task(task_id):
 
         result = export_regression_reports(
             DB_PATH,
-            REPORT_ROOT / "regression",
+            REPORT_ROOT / REPORT_SUMMARY_DIR_NAME,
             connect_timeout_sec=DB_CONNECT_TIMEOUT_SEC,
             busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
         )

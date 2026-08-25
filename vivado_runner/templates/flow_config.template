@@ -8,6 +8,7 @@ phys_opt_design 0
 route_design 0
 route_design_from_place 0
 write_checkpoint 0
+shape_cmp 0
 write_bitstream 1
 bit_cmp 1
 msk_cmp 1

@@ -9,6 +9,8 @@ KW_RUNTIME='Runtime:'
 KW_FATAL_ERROR='FATAL|Segmentation fault'
 KW_DCP_FAIL='DCP_FAIL'
 KW_DCP_PASS='DCP_PASS'
+KW_DCP_SHAPE_FAIL='DCP Shape Compare FAIL'
+KW_DCP_SHAPE_PASS='DCP Shape Compare PASS'
 
 # shellcheck source=../lib/bash/judge.sh
 source "$PROJECT_ROOT/lib/bash/judge.sh"
@@ -90,5 +92,35 @@ FLOW_ARGS=(bgn_cmp bit_cmp msk_cmp)
 printf 'Runtime: 73\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result compares_ignored_without_write PASS PASS
+
+new_case shape_compare_fail
+FLOW_ARGS=(read_edif read_xdc write_checkpoint shape_cmp)
+printf '\033[31mDCP Shape Compare FAIL : DIFFERENT\033[0m\nRuntime: 34\n' > "$RUN_LOG"
+judge_case_result "$CASE_DIR" "$RUN_LOG"
+assert_result shape_compare_fail FAIL DCP_SHAPE_COMPARE_FAIL
+
+new_case shape_compare_pass
+FLOW_ARGS=(read_edif read_xdc write_checkpoint shape_cmp)
+printf '\033[32mDCP Shape Compare PASS : SAME\033[0m\nRuntime: 34\n' > "$RUN_LOG"
+judge_case_result "$CASE_DIR" "$RUN_LOG"
+assert_result shape_compare_pass PASS DCP_SHAPE_COMPARE_PASS
+
+new_case shape_compare_result_missing
+FLOW_ARGS=(read_edif read_xdc write_checkpoint shape_cmp)
+printf 'Runtime: 34\n' > "$RUN_LOG"
+judge_case_result "$CASE_DIR" "$RUN_LOG"
+assert_result shape_compare_result_missing FAIL DCP_SHAPE_RESULT_MISSING
+
+new_case shape_compare_flow_config_invalid
+FLOW_ARGS=(read_edif write_checkpoint shape_cmp)
+printf 'DCP Shape Compare PASS : SAME\nRuntime: 34\n' > "$RUN_LOG"
+judge_case_result "$CASE_DIR" "$RUN_LOG"
+assert_result shape_compare_flow_config_invalid FAIL DCP_SHAPE_FLOW_CONFIG_INVALID
+
+new_case shape_marker_ignored_without_shape_cmp
+FLOW_ARGS=(read_edif read_xdc write_checkpoint)
+printf 'DCP Shape Compare FAIL : DIFFERENT\nRuntime: 34\n' > "$RUN_LOG"
+judge_case_result "$CASE_DIR" "$RUN_LOG"
+assert_result shape_marker_ignored_without_shape_cmp PASS PASS
 
 printf 'All judge tests passed.\n'

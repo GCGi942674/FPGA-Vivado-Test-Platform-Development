@@ -28,6 +28,38 @@ flow_arg_enabled() {
     printf '%s\n' "${FLOW_ARGS[@]}" | grep -qx -- "$module"
 }
 
+judge_shape_compare_result() {
+    local log_file="$1"
+    local shape_result
+
+    CASE_STAGE="shape_cmp"
+
+    if ! flow_arg_enabled "read_edif" ||
+       ! flow_arg_enabled "read_xdc" ||
+       ! flow_arg_enabled "write_checkpoint"; then
+        CASE_REASON="DCP_SHAPE_FLOW_CONFIG_INVALID"
+        return 0
+    fi
+
+    # Use the last marker if the tool emitted more than one comparison result.
+    # ANSI color escapes around the marker do not affect these matches.
+    shape_result=$(grep -E "$KW_DCP_SHAPE_PASS|$KW_DCP_SHAPE_FAIL" "$log_file" | tail -n 1 || true)
+
+    if printf '%s\n' "$shape_result" | grep -Eq "$KW_DCP_SHAPE_FAIL"; then
+        CASE_REASON="DCP_SHAPE_COMPARE_FAIL"
+        return 0
+    fi
+
+    if printf '%s\n' "$shape_result" | grep -Eq "$KW_DCP_SHAPE_PASS"; then
+        CASE_STATUS="PASS"
+        CASE_REASON="DCP_SHAPE_COMPARE_PASS"
+        return 0
+    fi
+
+    CASE_REASON="DCP_SHAPE_RESULT_MISSING"
+    return 0
+}
+
 judge_case_result() {
     local case_dir="$1"
     local log_file="$2"
@@ -56,6 +88,13 @@ judge_case_result() {
         else
             CASE_REASON="RUNTIME_MISSING"
         fi
+        return 0
+    fi
+
+    # Runtime proves only that GalaxCore completed. An explicitly enabled
+    # shape_cmp flow must still honor the shape PASS/FAIL marker in run.
+    if flow_arg_enabled "shape_cmp"; then
+        judge_shape_compare_result "$log_file"
         return 0
     fi
 

@@ -28,6 +28,9 @@ route_design_from_place 0
 # write checkpoint
 write_checkpoint 0
 
+# DCP shape compare (requires read_edif, read_xdc and write_checkpoint)
+shape_cmp 0
+
 # write output.bit
 write_bitstream 1
   # bit compare

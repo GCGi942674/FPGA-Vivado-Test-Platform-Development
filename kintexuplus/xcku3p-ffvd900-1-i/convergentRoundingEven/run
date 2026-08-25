@@ -1,0 +1,172 @@
+route_design checksum_cmp
+==== params ====
+design_name = convergentRoundingEven
+device_name = xcku3p-ffvd900-1-i
+family_name = kintexuplus
+read_edif = 0
+read_xdc = 0
+opt_design = 0
+place_design = 0
+place_design_from_syn = 0
+report_utilization = 0
+phys_opt_design = 0
+route_design = 1
+route_design_from_place = 0
+report_timing_summary = 0
+write_bitstream = 0
+report_bgn_only = 0
+bgn_cmp = 0
+bit_cmp = 0
+msk_cmp = 0
+readback_cmp = 0
+write_checkpoint = 0
+dcp_cmp = 0
+checksum_cmp = 1
+rpx_cmp = 0
+input_dcp = golden_physopt.dcp
+cmp_golden_dcp = 
+================
+Svn Version : 17799
+Build Time  : 2026-08-24 15:44:38
+set_device xcku3p-ffvd900-1-i
+loading xcku3p-ffvd900-1-i
+set_device finish!
+
+read_checkpoint /home/xiaonan/Share/scripts/public/testcase/vivado2/kintexuplus/xcku3p-ffvd900-1-i/convergentRoundingEven/golden_physopt.dcp
+read_xn convergentRoundingEven.xn
+read_xn finish!
+
+read_shape convergentRoundingEven.shape
+read_shape finish!
+
+read_phys_db files
+read_phys_db files finish
+
+Multithreading enabled for route_design using a maximum of 4 CPUs
+Routing
+Phase 1 Build RT Design
+Checksum: PlaceDB: 66d97261 ConstDB: 0 ShapeSum: 298fedc RouteDB: c4f7a156
+Post Restoration Checksum: NetGraph: 71496317 | NumContArr: d226a1de | Constraints: 49480c72 | Timing: 0
+Phase 1 Build RT Design |  Checksum: 18cb81167
+
+Phase 2 Router Initialization
+
+Phase 2.1 Fix Topology Constraints
+Phase 2.1 Fix Topology Constraints |  Checksum: 18cb81167
+
+Phase 2.2 Pre Route Cleanup
+
+Phase 2.2 Pre Route Cleanup |  Checksum: 18cb81167
+
+Phase 2.3 Global Clock Net Routing
+ Number of Nodes with overlaps = 0
+Phase 2.3 Global Clock Net Routing |  Checksum: 14e19123b
+
+
+
+Router Utilization Summary
+  Global Vertical Routing Utilization    = 0 %
+  Global Horizontal Routing Utilization  = 0 %
+  Routable Net Status*
+  *Does not include unroutable nets such as driverless and loadless.
+  Run report_route_status for detailed report.
+  Number of Failed Nets               = 92
+    (Failed Nets is the sum of unrouted and partially routed nets)
+  Number of Unrouted Nets             = 92
+  Number of Partially Routed Nets     = 0
+  Number of Node Overlaps             = 0
+
+Phase 2 Router Initialization |  Checksum: 14e19123b
+
+Phase 3 Initial Routing
+Phase 3.1 Global Routing
+Phase 3.1 Global Routing |  Checksum: 14e19123b
+
+Phase 3 Initial Routing |  Checksum: 15cae4778
+
+Phase 4 Rip-up And Reroute
+Phase 4.1 Global Iteration 0
+ Number of Nodes with overlaps = 0
+Phase 4.1 Global Iteration 0 |  Checksum: 1b4414de6
+
+Phase 4 Rip-up And Reroute |  Checksum: 1b4414de6
+
+Phase 5 Delay and Skew Optimization
+Phase 5 Delay and Skew Optimization |  Checksum: 1b4414de6
+
+Phase 6 Post Hold Fix
+1.14Phase 6.1 Hold Fix Iter
+Phase 6.1 Hold Fix Iter |  Checksum: 1b4414de6
+
+Phase 6 Post Hold Fix |  Checksum: 1b4414de6
+
+Phase 7 Route finalize
+
+Router Utilization Summary
+  Global Vertical Routing Utilization    = 0.041728 %
+  Global Horizontal Routing Utilization  = 0.0130343 %
+  Routable Net Status*
+  *Does not include unroutable nets such as driverless and loadless.
+  Run report_route_status for detailed report.
+  Number of Failed Nets               = 0
+    (Failed Nets is the sum of unrouted and partially routed nets)
+  Number of Unrouted Nets             = 0
+  Number of Partially Routed Nets     = 0
+  Number of Node Overlaps             = 0
+
+
+--GLOBAL Congestion:
+Utilization threshold used for congestion level computation: 0.85
+Congestion Report
+North Dir 1x1 Area, Max Cong = 39.4366%, No Congested Regions.
+South Dir 1x1 Area, Max Cong = 5.6872%, No Congested Regions.
+East Dir 1x1 Area, Max Cong = 23.0769%, No Congested Regions.
+West Dir 1x1 Area, Max Cong = 11.5385%, No Congested Regions.
+
+------------------------------
+Reporting congestion hotspots
+------------------------------
+Direction: North
+----------------
+Congested clusters found at Level 0
+Effective congestion level: 0 Aspect Ratio: 1 Sparse Ratio: 0
+Direction: South
+----------------
+Congested clusters found at Level 0
+Effective congestion level: 0 Aspect Ratio: 1 Sparse Ratio: 0
+Direction: East
+---------------
+Congested clusters found at Level 0
+Effective congestion level: 0 Aspect Ratio: 1 Sparse Ratio: 0
+Direction: West
+----------------
+Congested clusters found at Level 0
+Effective congestion level: 0 Aspect Ratio: 1 Sparse Ratio: 0
+
+Phase 7 Route finalize |  Checksum: 1b4414de6
+
+Phase 8 Verifying routed nets
+
+
+ Verification completed successfully
+Phase 8 Verifying routed nets |  Checksum: 1b4414de6
+
+Phase 9 Depositing Routes
+Phase 9 Depositing Routes |  Checksum: 1b4414de6
+
+Phase 10 Resolve XTalk
+Phase 10 Resolve XTalk |  Checksum: 1b4414de6
+
+ 
+Time taken to check if laguna hold fix is required (in secs): 0
+Skip PhysOpt in Router because non-negative WNS value: 1e+30 .
+Phase 11 Post-Route Event Processing
+Phase 11 Post-Route Event Processing | Checksum:        0
+
+
+Routing Is Done.
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+Compare Checksum: /home/xiaonan/Share/scripts/public/testcase/vivado2/kintexuplus/xcku3p-ffvd900-1-i/convergentRoundingEven/golden_routed.log run
+Checksum all right! 
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+Runtime: 43

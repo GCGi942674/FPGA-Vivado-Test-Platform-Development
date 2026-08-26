@@ -233,26 +233,40 @@ def read_cmd_output(cmd):
 # ================= SVN =================
 
 def get_head():
+    # Use XML instead of `--show-item` so this also works with SVN 1.7.x.
     output = read_cmd_output([
-        "svn", "info", SVN_URL,
-        "--show-item", "revision",
+        "svn", "info", "--xml", SVN_URL,
     ])
     if not output:
         return -1
+
     try:
-        return int(output.strip())
-    except ValueError:
+        root = ET.fromstring(output)
+        entry = root.find(".//entry")
+        if entry is None:
+            return -1
+        return int(entry.get("revision"))
+    except (ET.ParseError, TypeError, ValueError):
         return -1
 
 
 def get_author(rev):
+    # SVN 1.7.x exposes the author in the XML commit node.
     output = read_cmd_output([
-        "svn", "info", "-r", str(rev), SVN_URL,
-        "--show-item", "last-changed-author",
+        "svn", "info", "--xml", "-r", str(rev), SVN_URL,
     ])
     if not output:
         return "unknown"
-    return output.strip() or "unknown"
+
+    try:
+        root = ET.fromstring(output)
+        author = root.find(".//commit/author")
+        if author is not None and author.text:
+            return author.text.strip() or "unknown"
+    except ET.ParseError:
+        pass
+
+    return "unknown"
 
 
 def svn_clean():

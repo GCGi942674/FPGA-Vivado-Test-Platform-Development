@@ -658,12 +658,15 @@ def cmd_regression_export(args):
     print("Terminal attempts: %d" % result["terminal_attempts"])
     print("Observations     : %d" % result["loaded_observations"])
     print("Regression cases : %d" % result["case_count"])
+    print("Modules          : %d" % result["module_count"])
     print(
         "Skipped revision: %d"
         % result["skipped_non_numeric_revision"]
     )
-    print("Full TSV         : %s" % result["full_path"])
-    print("Simple summary   : %s" % result["summary_path"])
+    for path in result["summary_paths"]:
+        print("Summary          : %s" % path)
+    for path in result["removed_paths"]:
+        print("Removed obsolete : %s" % path)
 
 def format_short(text, width):
     """Return full text for table display.

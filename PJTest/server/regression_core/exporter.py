@@ -4,6 +4,7 @@
 
 import csv
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -17,23 +18,9 @@ from .analyzer import (
 )
 
 
-TSV_COLUMNS = [
-    "CASE_PATH",
-    "TEMPLATE",
-    "LAST_GOOD",
-    "FIRST_BAD",
-    "LAST_BAD",
-    "FIRST_FIXED",
-    "LATEST_REVISION",
-    "LATEST_STATUS",
-    "UPDATED_AT",
-]
-
 LOCK_STALE_SECONDS = 3600
-
-
-def _display(value):
-    return "" if value is None else str(value)
+SUMMARY_PREFIX = "Regression_Summary_"
+LEGACY_FILENAMES = ("regression_cases.tsv", "regression_summary.txt")
 
 
 @contextmanager
@@ -104,33 +91,60 @@ def _atomic_write_rows(path, delimiter, rows):
         raise
 
 
-def _full_rows(cases):
-    yield TSV_COLUMNS
-    for item in cases:
-        yield [
-            item.case_path,
-            item.template_name,
-            _display(item.last_good),
-            _display(item.first_bad),
-            _display(item.last_bad),
-            _display(item.first_fixed),
-            item.latest_revision,
-            item.latest_status,
-            item.updated_at,
-        ]
-
-
 def _summary_rows(cases):
-    yield ["CASE_PATH", "TEMPLATE", "S_VERSION", "F_VERSION"]
+    yield ["CASE_PATH", "S_VERSION", "F_VERSION"]
     for item in cases:
         success_version = "s%s" % item.last_good if item.last_good is not None else "s-"
         fail_version = "f%s" % item.first_bad if item.first_bad is not None else "f-"
         yield [
             item.case_path,
-            item.template_name,
             success_version,
             fail_version,
         ]
+
+
+def _summary_filename(template_name):
+    """Return a safe and predictable per-template summary filename."""
+    component = re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        str(template_name or "").strip(),
+    ).strip("._-")
+    if not component:
+        component = "unknown"
+    return "%s%s.txt" % (SUMMARY_PREFIX, component)
+
+
+def _group_cases_by_template(cases):
+    grouped = {}
+    filename_owners = {}
+    for item in cases:
+        template_name = str(item.template_name or "")
+        filename = _summary_filename(template_name)
+        owner = filename_owners.get(filename.lower())
+        if owner is not None and owner != template_name:
+            raise ValueError(
+                "template names map to the same summary file: %r and %r"
+                % (owner, template_name)
+            )
+        filename_owners[filename.lower()] = template_name
+        grouped.setdefault(template_name, []).append(item)
+    return grouped
+
+
+def _remove_obsolete_outputs(output_dir, expected_names):
+    """Remove legacy and stale module summaries after new files are published."""
+    removed = []
+    candidates = [output_dir / name for name in LEGACY_FILENAMES]
+    candidates.extend(output_dir.glob("%s*.txt" % SUMMARY_PREFIX))
+    for path in candidates:
+        if path.name in expected_names or not path.is_file():
+            continue
+        path.unlink()
+        removed.append(str(path))
+    if removed:
+        _fsync_directory(output_dir)
+    return removed
 
 
 def export_regression_reports(
@@ -140,16 +154,13 @@ def export_regression_reports(
     busy_timeout_ms=60000,
     suite=DEFAULT_REGRESSION_SUITE,
 ):
-    """Analyze the current database and generate both phase-one reports."""
+    """Analyze daily results and generate one compact summary per template."""
     db_path = Path(db_path)
     output_dir = Path(output_dir)
     if not db_path.is_file():
         raise FileNotFoundError("PJTest database not found: %s" % db_path)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    full_path = output_dir / "regression_cases.tsv"
-    summary_path = output_dir / "regression_summary.txt"
-
     with export_lock(output_dir):
         uri = db_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(
@@ -165,14 +176,23 @@ def export_regression_reports(
             conn.close()
 
         cases = analyze_observations(observations)
-        _atomic_write_rows(full_path, "\t", _full_rows(cases))
-        _atomic_write_rows(summary_path, "\t", _summary_rows(cases))
+        grouped = _group_cases_by_template(cases)
+        summary_paths = []
+        expected_names = set()
+        for template_name in sorted(grouped):
+            filename = _summary_filename(template_name)
+            path = output_dir / filename
+            _atomic_write_rows(path, "\t", _summary_rows(grouped[template_name]))
+            summary_paths.append(str(path))
+            expected_names.add(filename)
+        removed_paths = _remove_obsolete_outputs(output_dir, expected_names)
 
     result = dict(stats)
     result.update({
         "case_count": len(cases),
+        "module_count": len(grouped),
         "suite": suite,
-        "full_path": str(full_path),
-        "summary_path": str(summary_path),
+        "summary_paths": summary_paths,
+        "removed_paths": removed_paths,
     })
     return result

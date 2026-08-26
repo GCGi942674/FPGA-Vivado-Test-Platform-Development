@@ -192,7 +192,7 @@ class ExportTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    def test_export_uses_terminal_numeric_results_and_writes_both_files(self):
+    def test_export_writes_only_the_route_module_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db_path = root / "task_queue.db"
@@ -201,28 +201,25 @@ class ExportTests(unittest.TestCase):
 
             result = export_regression_reports(db_path, out_dir)
             self.assertEqual(result["case_count"], 1)
+            self.assertEqual(result["module_count"], 1)
             self.assertEqual(result["skipped_non_numeric_revision"], 1)
 
-            with (out_dir / "regression_cases.tsv").open(
+            with (out_dir / "Regression_Summary_route.txt").open(
                 "r", encoding="utf-8", newline=""
             ) as stream:
                 rows = list(csv.DictReader(stream, delimiter="\t"))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["LAST_GOOD"], "100")
-            self.assertEqual(rows[0]["FIRST_BAD"], "110")
-            self.assertEqual(rows[0]["LATEST_STATUS"], "INFRA_ERROR")
-            self.assertNotIn("TEST_KEY", rows[0])
-            self.assertNotIn("CONFIG_HASH", rows[0])
-            self.assertNotIn("SEVERITY", rows[0])
-            self.assertNotIn("STATE", rows[0])
-
-            summary = (out_dir / "regression_summary.txt").read_text(
-                encoding="utf-8"
+            self.assertEqual(rows[0]["CASE_PATH"], "case/run.tcl")
+            self.assertEqual(rows[0]["S_VERSION"], "s100")
+            self.assertEqual(rows[0]["F_VERSION"], "f110")
+            self.assertEqual(
+                set(rows[0]),
+                set(["CASE_PATH", "S_VERSION", "F_VERSION"]),
             )
-            self.assertIn("s100\tf110", summary)
-            self.assertNotIn("STATE", summary.splitlines()[0])
+            self.assertFalse((out_dir / "regression_cases.tsv").exists())
+            self.assertFalse((out_dir / "regression_summary.txt").exists())
 
-    def test_attempt_conflict_is_exported_as_flaky(self):
+    def test_attempt_conflict_is_loaded_into_module_summary_analysis(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             db_path = root / "task_queue.db"
@@ -244,12 +241,8 @@ class ExportTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            export_regression_reports(db_path, out_dir)
-            with (out_dir / "regression_cases.tsv").open(
-                "r", encoding="utf-8", newline=""
-            ) as stream:
-                rows = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(rows[0]["LATEST_STATUS"], "INFRA_ERROR")
+            result = export_regression_reports(db_path, out_dir)
+            self.assertEqual(result["terminal_attempts"], 2)
 
             # Remove the later infrastructure-only revision so r110 becomes latest.
             conn = sqlite3.connect(str(db_path))
@@ -258,11 +251,66 @@ class ExportTests(unittest.TestCase):
             conn.commit()
             conn.close()
             export_regression_reports(db_path, out_dir)
-            with (out_dir / "regression_cases.tsv").open(
+            with (out_dir / "Regression_Summary_route.txt").open(
                 "r", encoding="utf-8", newline=""
             ) as stream:
                 rows = list(csv.DictReader(stream, delimiter="\t"))
-            self.assertEqual(rows[0]["LATEST_STATUS"], "FLAKY")
+            self.assertEqual(rows[0]["S_VERSION"], "s100")
+            self.assertEqual(rows[0]["F_VERSION"], "f-")
+
+    def test_export_splits_modules_and_removes_obsolete_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "task_queue.db"
+            out_dir = root / "out"
+            self._create_database(db_path)
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, task_id, template_name, suite, revision, work_root,
+                    flow_config_json, status, created_at, updated_at, finished_at
+                ) VALUES (7, 'task_place', 'place_design', 'daily_regression',
+                          '100', '/work/test2', '{}', 'success',
+                          '2026-08-24', '2026-08-24', '2026-08-24')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO task_examples (
+                    id, example_id, task_id, run_tcl_path, revision, status,
+                    infra_reason, updated_at, finished_at
+                ) VALUES (7, 'ex_place', 'task_place', 'place/run.tcl', NULL,
+                          'success', NULL, '2026-08-24', '2026-08-24')
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            out_dir.mkdir()
+            (out_dir / "regression_cases.tsv").write_text("old", encoding="utf-8")
+            (out_dir / "regression_summary.txt").write_text("old", encoding="utf-8")
+            (out_dir / "Regression_Summary_removed.txt").write_text(
+                "old", encoding="utf-8"
+            )
+
+            result = export_regression_reports(db_path, out_dir)
+            self.assertEqual(result["module_count"], 2)
+            self.assertEqual(
+                set(Path(path).name for path in result["summary_paths"]),
+                set([
+                    "Regression_Summary_place_design.txt",
+                    "Regression_Summary_route.txt",
+                ]),
+            )
+            self.assertTrue(
+                (out_dir / "Regression_Summary_place_design.txt").is_file()
+            )
+            self.assertFalse((out_dir / "regression_cases.tsv").exists())
+            self.assertFalse((out_dir / "regression_summary.txt").exists())
+            self.assertFalse(
+                (out_dir / "Regression_Summary_removed.txt").exists()
+            )
 
 
 if __name__ == "__main__":

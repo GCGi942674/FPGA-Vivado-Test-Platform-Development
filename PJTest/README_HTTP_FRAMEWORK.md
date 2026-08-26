@@ -1122,7 +1122,7 @@ MESSAGE
 ### 17.6 导出统一回归列表
 
 第一阶段回归分析不修改 worker、HTTP 协议或现有 `find`。中心节点从
-SQLite 的已完成任务中生成两个只读汇总文件：
+SQLite 的已完成定时任务中按模块生成只读汇总文件：
 
 ```bash
 cd /home/user3/PJTest
@@ -1132,8 +1132,10 @@ cd /home/user3/PJTest
 默认输出到：
 
 ```text
-<report_root>/Summary/regression_cases.tsv
-<report_root>/Summary/regression_summary.txt
+<report_root>/Summary/Regression_Summary_place_design.txt
+<report_root>/Summary/Regression_Summary_report_timing_summary.txt
+<report_root>/Summary/Regression_Summary_route_design.txt
+<report_root>/Summary/Regression_Summary_route_design_from_place.txt
 ```
 
 临时指定目录：
@@ -1142,15 +1144,15 @@ cd /home/user3/PJTest
 ./taskctl.py regression-export --out /tmp/pjtest-regression
 ```
 
-其中：
+每个文件只包含：
 
 ```text
-regression_cases.tsv    案例、模板、版本边界、最新结果和更新时间
-regression_summary.txt  案例、模板及 s<通过版本> / f<失败版本> 简化视图
+CASE_PATH    S_VERSION    F_VERSION
 ```
 
-两个文件都是从数据库重新生成的派生视图，不允许作为新的事实源手工
-回写。详细字段和状态规则见 `server/docs/regression_export.md`。
+模块名记录在文件名中，不再生成 case 明细表和总 summary。所有文件都
+是从数据库重新生成的派生视图，不允许作为新的事实源手工回写。详细
+规则见 `server/docs/regression_export.md`。
 
 ## 18. 取消和删除任务
 

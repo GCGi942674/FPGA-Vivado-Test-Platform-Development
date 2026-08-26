@@ -1136,6 +1136,7 @@ cd /home/user3/PJTest
 <report_root>/Summary/Regression_Summary_report_timing_summary.txt
 <report_root>/Summary/Regression_Summary_route_design.txt
 <report_root>/Summary/Regression_Summary_route_design_from_place.txt
+<report_root>/Summary/Regression.txt
 ```
 
 临时指定目录：
@@ -1153,6 +1154,16 @@ CASE_PATH    S_VERSION    F_VERSION
 模块名记录在文件名中，不再生成 case 明细表和总 summary。所有文件都
 是从数据库重新生成的派生视图，不允许作为新的事实源手工回写。详细
 规则见 `server/docs/regression_export.md`。
+
+`Regression.txt` 是最近两个 nightly 日期的总回退表，只记录前一晚为
+PASS、后一晚为 FAIL 的可比 case；即使两晚 revision 相同也可以比较。
+字段为：
+
+```text
+CASE_PATH    TEMPLATE    S_VERSION    F_VERSION
+```
+
+超时、FLAKY、基础设施错误以及任一晚缺失的 case 不进入确定回退表。
 
 ## 18. 取消和删除任务
 

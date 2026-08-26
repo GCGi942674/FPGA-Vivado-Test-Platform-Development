@@ -17,13 +17,21 @@ if str(SERVER_DIR) not in sys.path:
 from regression_core.analyzer import (  # noqa: E402
     Observation,
     aggregate_revision_status,
+    analyze_latest_nightly_regressions,
     analyze_observations,
 )
 from regression_core.exporter import export_regression_reports  # noqa: E402
 from regression_core.identity import build_test_identity  # noqa: E402
 
 
-def observation(test_key, revision, status, path="case/run.tcl", template="route"):
+def observation(
+    test_key,
+    revision,
+    status,
+    path="case/run.tcl",
+    template="route",
+    run_date="2026-08-24",
+):
     return Observation(
         test_key=test_key,
         case_path=path,
@@ -31,6 +39,7 @@ def observation(test_key, revision, status, path="case/run.tcl", template="route
         config_hash="cfg",
         revision=revision,
         status=status,
+        run_date=run_date,
         updated_at="2026-08-24 10:%02d:00" % (revision % 60),
     )
 
@@ -111,6 +120,44 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(item.last_bad, 140)
         self.assertIsNone(item.first_fixed)
 
+    def test_latest_nightly_regression_requires_previous_pass_and_current_fail(self):
+        rows = [
+            observation("regressed", 100, "PASS", "regressed/run.tcl", "route", "2026-08-23"),
+            observation("regressed", 110, "FAIL", "regressed/run.tcl", "route", "2026-08-24"),
+            observation("stable", 100, "PASS", "stable/run.tcl", "place", "2026-08-23"),
+            observation("stable", 110, "PASS", "stable/run.tcl", "place", "2026-08-24"),
+            observation("new_fail", 110, "FAIL", "new/run.tcl", "route", "2026-08-24"),
+            observation("timeout", 100, "PASS", "timeout/run.tcl", "route", "2026-08-23"),
+            observation("timeout", 110, "TIMEOUT", "timeout/run.tcl", "route", "2026-08-24"),
+            observation(
+                "same_revision_regressed",
+                110,
+                "PASS",
+                "same/run.tcl",
+                "route",
+                "2026-08-23",
+            ),
+            observation(
+                "same_revision_regressed",
+                110,
+                "FAIL",
+                "same/run.tcl",
+                "route",
+                "2026-08-24",
+            ),
+        ]
+
+        result, previous_run_date, current_run_date = (
+            analyze_latest_nightly_regressions(rows)
+        )
+        self.assertEqual(previous_run_date, "2026-08-23")
+        self.assertEqual(current_run_date, "2026-08-24")
+        self.assertEqual(len(result), 2)
+        by_path = dict((item.case_path, item) for item in result)
+        self.assertEqual(by_path["regressed/run.tcl"].template_name, "route")
+        self.assertEqual(by_path["same/run.tcl"].success_revision, 110)
+        self.assertEqual(by_path["same/run.tcl"].fail_revision, 110)
+
 
 class ExportTests(unittest.TestCase):
     def _create_database(self, path):
@@ -154,12 +201,12 @@ class ExportTests(unittest.TestCase):
             """
         )
         tasks = [
-            (1, "task_good", "route", "daily_regression", "100", "/work/test2", "{}", "success"),
-            (2, "task_bad", "route", "daily_regression", "110", "/work/test2", "{}", "failed"),
-            (3, "task_active", "route", "daily_regression", "120", "/work/test2", "{}", "running"),
-            (4, "task_text", "route", "daily_regression", "latest", "/work/test2", "{}", "failed"),
-            (5, "task_infra", "route", "daily_regression", "120", "/work/test2", "{}", "failed"),
-            (6, "task_manual", "route", "night_build", "130", "/work/test2", "{}", "failed"),
+            (1, "task_good", "route", "daily_regression", "100", "/work/test2", "{}", "success", "2026-08-23"),
+            (2, "task_bad", "route", "daily_regression", "110", "/work/test2", "{}", "failed", "2026-08-24"),
+            (3, "task_active", "route", "daily_regression", "120", "/work/test2", "{}", "running", "2026-08-25"),
+            (4, "task_text", "route", "daily_regression", "latest", "/work/test2", "{}", "failed", "2026-08-24"),
+            (5, "task_infra", "route", "daily_regression", "120", "/work/test2", "{}", "failed", "2026-08-25"),
+            (6, "task_manual", "route", "night_build", "130", "/work/test2", "{}", "failed", "2026-08-25"),
         ]
         for row in tasks:
             conn.execute(
@@ -167,7 +214,7 @@ class ExportTests(unittest.TestCase):
                 INSERT INTO tasks (
                     id, task_id, template_name, suite, revision, work_root,
                     flow_config_json, status, created_at, updated_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '2026-08-24', '2026-08-24', '2026-08-24')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-08-24', '2026-08-24')
                 """,
                 row,
             )
@@ -218,6 +265,29 @@ class ExportTests(unittest.TestCase):
             )
             self.assertFalse((out_dir / "regression_cases.tsv").exists())
             self.assertFalse((out_dir / "regression_summary.txt").exists())
+            with (out_dir / "Regression.txt").open(
+                "r", encoding="utf-8", newline=""
+            ) as stream:
+                nightly_rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(nightly_rows, [])
+            self.assertEqual(result["previous_run_date"], "2026-08-24")
+            self.assertEqual(result["current_run_date"], "2026-08-25")
+
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("DELETE FROM task_examples WHERE example_id = 'ex_infra'")
+            conn.execute("DELETE FROM tasks WHERE task_id = 'task_infra'")
+            conn.commit()
+            conn.close()
+            result = export_regression_reports(db_path, out_dir)
+            with (out_dir / "Regression.txt").open(
+                "r", encoding="utf-8", newline=""
+            ) as stream:
+                nightly_rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(result["nightly_regression_count"], 1)
+            self.assertEqual(nightly_rows[0]["CASE_PATH"], "case/run.tcl")
+            self.assertEqual(nightly_rows[0]["TEMPLATE"], "route")
+            self.assertEqual(nightly_rows[0]["S_VERSION"], "s100")
+            self.assertEqual(nightly_rows[0]["F_VERSION"], "f110")
 
     def test_attempt_conflict_is_loaded_into_module_summary_analysis(self):
         with tempfile.TemporaryDirectory() as temp_dir:

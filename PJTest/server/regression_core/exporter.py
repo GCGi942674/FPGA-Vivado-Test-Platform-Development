@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .analyzer import (
     DEFAULT_REGRESSION_SUITE,
+    analyze_latest_nightly_regressions,
     analyze_observations,
     load_observations,
 )
@@ -20,6 +21,7 @@ from .analyzer import (
 
 LOCK_STALE_SECONDS = 3600
 SUMMARY_PREFIX = "Regression_Summary_"
+NIGHTLY_REGRESSION_FILENAME = "Regression.txt"
 LEGACY_FILENAMES = ("regression_cases.tsv", "regression_summary.txt")
 
 
@@ -103,6 +105,17 @@ def _summary_rows(cases):
         ]
 
 
+def _nightly_regression_rows(regressions):
+    yield ["CASE_PATH", "TEMPLATE", "S_VERSION", "F_VERSION"]
+    for item in regressions:
+        yield [
+            item.case_path,
+            item.template_name,
+            "s%s" % item.success_revision,
+            "f%s" % item.fail_revision,
+        ]
+
+
 def _summary_filename(template_name):
     """Return a safe and predictable per-template summary filename."""
     component = re.sub(
@@ -176,6 +189,9 @@ def export_regression_reports(
             conn.close()
 
         cases = analyze_observations(observations)
+        nightly_regressions, previous_run_date, current_run_date = (
+            analyze_latest_nightly_regressions(observations)
+        )
         grouped = _group_cases_by_template(cases)
         summary_paths = []
         expected_names = set()
@@ -185,12 +201,22 @@ def export_regression_reports(
             _atomic_write_rows(path, "\t", _summary_rows(grouped[template_name]))
             summary_paths.append(str(path))
             expected_names.add(filename)
+        nightly_regression_path = output_dir / NIGHTLY_REGRESSION_FILENAME
+        _atomic_write_rows(
+            nightly_regression_path,
+            "\t",
+            _nightly_regression_rows(nightly_regressions),
+        )
         removed_paths = _remove_obsolete_outputs(output_dir, expected_names)
 
     result = dict(stats)
     result.update({
         "case_count": len(cases),
         "module_count": len(grouped),
+        "nightly_regression_count": len(nightly_regressions),
+        "previous_run_date": previous_run_date,
+        "current_run_date": current_run_date,
+        "nightly_regression_path": str(nightly_regression_path),
         "suite": suite,
         "summary_paths": summary_paths,
         "removed_paths": removed_paths,

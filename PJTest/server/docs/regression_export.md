@@ -33,16 +33,36 @@ Regression_Summary_route_design.txt
 Regression_Summary_route_design_from_place.txt
 ```
 
+The exporter also writes one combined nightly regression file:
+
+```text
+Regression.txt
+```
+
 Each file contains only `CASE_PATH`, `S_VERSION`, and `F_VERSION`. The template
 is encoded in the filename. Detailed case tables, internal identity hashes,
 state, severity, and a combined summary are deliberately omitted. All files are
 derived views; SQLite remains the source of truth and the files must not be
 edited as task input.
 
+`Regression.txt` compares the latest two task submission dates present in
+completed `daily_regression` results. It contains only cases that were `PASS`
+on the previous nightly run and `FAIL` on the current nightly run:
+
+```text
+CASE_PATH  TEMPLATE  S_VERSION  F_VERSION
+```
+
+A case missing from either night is not comparable. `TIMEOUT`, `FLAKY`,
+`INCONCLUSIVE`, and infrastructure-only outcomes are not reported as confirmed
+nightly regressions. Both nights must contain exactly one numeric revision for
+that case; the two revisions may be equal. With fewer than two nightly dates,
+the file contains only its header.
+
 The daily task submitter marks every task configured in `task.yaml` with
 `suite=daily_regression`. When one of those tasks becomes terminal, the
 scheduler asynchronously regenerates all module files. The final nightly task to
-finish therefore publishes the complete nightly view.
+finish therefore publishes the complete nightly view and `Regression.txt`.
 
 ## Test identity
 

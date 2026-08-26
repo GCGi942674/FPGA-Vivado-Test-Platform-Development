@@ -43,6 +43,7 @@ class Observation:
     config_hash: str
     revision: int
     status: str
+    run_date: str
     updated_at: str
 
 
@@ -68,6 +69,15 @@ class RegressionCase:
     latest_status: str
     severity: int
     updated_at: str
+
+
+@dataclass(frozen=True)
+class NightlyRegression:
+    test_key: str
+    case_path: str
+    template_name: str
+    success_revision: int
+    fail_revision: int
 
 
 def _parse_revision(value):
@@ -103,6 +113,7 @@ def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE):
                      t.created_at, '') AS observation_time,
             t.template_name,
             t.revision AS task_revision,
+            t.created_at AS task_created_at,
             t.work_root,
             t.flow_config_json
         FROM task_examples AS e
@@ -188,6 +199,7 @@ def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE):
                 config_hash=config_hash,
                 revision=revision,
                 status=status,
+                run_date=str(row["task_created_at"] or "")[:10],
                 updated_at=str(updated_at or ""),
             ))
 
@@ -320,3 +332,55 @@ def analyze_observations(observations):
         item.test_key,
     ))
     return cases
+
+
+def analyze_latest_nightly_regressions(observations):
+    """Return PASS-to-FAIL transitions between the latest two nightly dates."""
+    run_dates = sorted(set(
+        item.run_date
+        for item in observations
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", item.run_date or "")
+    ))
+    if len(run_dates) < 2:
+        return [], None, run_dates[-1] if run_dates else None
+
+    previous_run_date = run_dates[-2]
+    current_run_date = run_dates[-1]
+    regressions = []
+    grouped = defaultdict(lambda: defaultdict(list))
+    identities = {}
+
+    for observation in observations:
+        identities[observation.test_key] = observation
+        grouped[observation.test_key][observation.run_date].append(observation)
+
+    for test_key, by_date in grouped.items():
+        previous_rows = by_date.get(previous_run_date, [])
+        current_rows = by_date.get(current_run_date, [])
+        if not previous_rows or not current_rows:
+            continue
+        if aggregate_revision_status(item.status for item in previous_rows) != "PASS":
+            continue
+        if aggregate_revision_status(item.status for item in current_rows) != "FAIL":
+            continue
+
+        previous_revisions = set(item.revision for item in previous_rows)
+        current_revisions = set(item.revision for item in current_rows)
+        if len(previous_revisions) != 1 or len(current_revisions) != 1:
+            continue
+
+        identity = identities[test_key]
+        regressions.append(NightlyRegression(
+            test_key=identity.test_key,
+            case_path=identity.case_path,
+            template_name=identity.template_name,
+            success_revision=next(iter(previous_revisions)),
+            fail_revision=next(iter(current_revisions)),
+        ))
+
+    regressions.sort(key=lambda item: (
+        item.template_name,
+        item.case_path,
+        item.test_key,
+    ))
+    return regressions, previous_run_date, current_run_date

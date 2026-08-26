@@ -660,11 +660,20 @@ def cmd_regression_export(args):
     print("Regression cases : %d" % result["case_count"])
     print("Modules          : %d" % result["module_count"])
     print(
+        "Nightly dates    : %s -> %s"
+        % (
+            result["previous_run_date"] or "-",
+            result["current_run_date"] or "-",
+        )
+    )
+    print("Nightly regressions: %d" % result["nightly_regression_count"])
+    print(
         "Skipped revision: %d"
         % result["skipped_non_numeric_revision"]
     )
     for path in result["summary_paths"]:
         print("Summary          : %s" % path)
+    print("Nightly regression: %s" % result["nightly_regression_path"])
     for path in result["removed_paths"]:
         print("Removed obsolete : %s" % path)
 

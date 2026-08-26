@@ -2799,12 +2799,15 @@ def refresh_regression_reports_for_task(task_id):
         )
         log_scheduler(
             "INFO",
-            "regression reports refreshed task=%s suite=%s modules=%d cases=%d"
+            "regression reports refreshed task=%s suite=%s modules=%d cases=%d nightly_regressions=%d dates=%s->%s"
             % (
                 task_id,
                 result["suite"],
                 result["module_count"],
                 result["case_count"],
+                result["nightly_regression_count"],
+                result["previous_run_date"] or "-",
+                result["current_run_date"] or "-",
             ),
             task_id=task_id,
             also_stdout=False,

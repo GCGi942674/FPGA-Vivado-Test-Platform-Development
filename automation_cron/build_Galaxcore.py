@@ -651,7 +651,7 @@ def clean_old_zips():
 STATUS_WIDTH = 7
 REV_WIDTH = 8
 AUTHOR_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_AUTHOR_WIDTH", "16"))
-REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "120"))
+REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "28"))
 REVISION_TIME_WIDTH = int(os.environ.get(
     "GALAXCORE_MK_FAIL_REVISION_TIME_WIDTH",
     "19",

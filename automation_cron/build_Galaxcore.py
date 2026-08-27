@@ -87,7 +87,7 @@ NO_MAKE_CLEAN_WHITELIST_FILE = Path(os.environ.get(
     str(Path(__file__).absolute().parent / "no_make_clean_whitelist.txt"),
 )).expanduser()
 
-MAX_BIN_KEEP = int(os.environ.get("GALAXCORE_MAX_BIN_KEEP", "150"))
+MAX_BIN_KEEP = int(os.environ.get("GALAXCORE_MAX_BIN_KEEP", "600"))
 ZIP_PREFIX = os.environ.get("GALAXCORE_ZIP_PREFIX", "GalaxCore")
 POLL_INTERVAL = int(os.environ.get("GALAXCORE_POLL_INTERVAL", "2"))
 IDLE_SLEEP = int(os.environ.get("GALAXCORE_IDLE_SLEEP", "1"))
@@ -529,7 +529,7 @@ def run_submit_test():
 
 
 def summarize_submit_output(output):
-    """Extract concrete submit failure cases for the mk_fail reason column."""
+    """Extract concrete submit failure details for the debug log."""
     lines = []
     for raw_line in strip_ansi(output).splitlines():
         line = raw_line.strip()
@@ -1172,13 +1172,10 @@ def build_revision(rev):
         detail = summarize_submit_output(submit_output)
         ci_log(f"FAIL r{rev} submit_failed")
         ci_debug(f"submit failed for r{rev}: {submit_reason}: {detail}")
-        failure_case = detail
-        if detail == "no submit output":
-            failure_case = submit_reason
         record_failure(
             rev,
             author,
-            failure_case,
+            "submit_failed",
             revision_time,
         )
         return False

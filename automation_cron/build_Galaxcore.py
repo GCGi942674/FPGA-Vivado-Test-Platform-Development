@@ -442,17 +442,29 @@ def summarize_submit_output(output):
     if not lines:
         return "no submit output"
 
+    specific_case_lines = []
     failure_lines = []
     case_lines = []
     for line in lines:
         lower = line.lower()
+        if (
+            lower.startswith("write ")
+            and any(
+                marker in lower
+                for marker in (" crash", " fail", " error", " timeout")
+            )
+        ):
+            specific_case_lines.append(line)
+
         has_failure = "fail" in lower or "error" in lower
         if has_failure:
             failure_lines.append(line)
             if "elapsed time" not in lower:
                 case_lines.append(line)
 
-    if case_lines:
+    if specific_case_lines:
+        selected = specific_case_lines[-3:]
+    elif case_lines:
         selected = case_lines[-3:]
     elif failure_lines:
         selected = failure_lines[-3:]
@@ -530,7 +542,7 @@ def clean_old_zips():
 STATUS_WIDTH = 7
 REV_WIDTH = 8
 AUTHOR_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_AUTHOR_WIDTH", "16"))
-REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "80"))
+REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "120"))
 REVISION_TIME_WIDTH = int(os.environ.get(
     "GALAXCORE_MK_FAIL_REVISION_TIME_WIDTH",
     "19",
@@ -637,21 +649,18 @@ def line_reason(line):
     """Extract the normalized reason field from one mk_fail record."""
     stripped = line.strip()
 
-    # Current fixed-column format with the SVN revision-time column.
-    reason_start = (
-        STATUS_WIDTH + 2 + REV_WIDTH + 2 + AUTHOR_WIDTH + 2
+    # Current format: reason, SVN revision time, then [build record time].
+    current_with_revision_time = re.match(
+        r"^(?:Success|SUCCESS|FAIL)\s+"
+        r"r\d+\s+"
+        r"\S+\s+"
+        r"(.*?)\s+"
+        r"(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}|unknown)\s+"
+        r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*$",
+        stripped,
     )
-    timestamp_start = (
-        reason_start + REASON_WIDTH + 2 + REVISION_TIME_WIDTH + 2
-    )
-    if (
-        len(stripped) > timestamp_start
-        and re.match(
-            r"^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]$",
-            stripped[timestamp_start:],
-        )
-    ):
-        return stripped[reason_start:reason_start + REASON_WIDTH].strip()
+    if current_with_revision_time:
+        return current_with_revision_time.group(1).strip()
 
     # Current aligned format:
     # FAIL  r15456  author  submit_failed  [2026-06-22 19:41:41]
@@ -676,20 +685,15 @@ def line_reason(line):
 
 def is_current_mk_fail_record(line):
     """Return whether a line already contains the revision-time column."""
-    stripped = line.strip()
-    reason_start = (
-        STATUS_WIDTH + 2 + REV_WIDTH + 2 + AUTHOR_WIDTH + 2
-    )
-    timestamp_start = (
-        reason_start + REASON_WIDTH + 2 + REVISION_TIME_WIDTH + 2
-    )
-    return (
-        len(stripped) > timestamp_start
-        and re.match(
-            r"^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]$",
-            stripped[timestamp_start:],
-        ) is not None
-    )
+    return re.match(
+        r"^(?:Success|SUCCESS|FAIL)\s+"
+        r"r\d+\s+"
+        r"\S+\s+"
+        r".*?\s+"
+        r"(?:\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}|unknown)\s+"
+        r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*$",
+        line.strip(),
+    ) is not None
 
 
 def parse_old_mk_fail_record(line):

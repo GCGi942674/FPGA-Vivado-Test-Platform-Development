@@ -55,7 +55,7 @@ BIN_SRC = Path(os.environ.get(
 # Set GALAXCORE_BIN_DST if the actual directory still uses the old name.
 BIN_DST = Path(os.environ.get(
     "GALAXCORE_BIN_DST",
-    "/home/xiaonan/Share/zw_cache/GalaxCore_bin",
+    "/home/xshare/zhouwei_runcache/GalaxCore",
 )).expanduser()
 
 ZIP_DIR = Path(os.environ.get(
@@ -71,11 +71,11 @@ MK_FAIL_FILE = Path(os.environ.get(
 # Current checkpoint file name: last_version
 LAST_VERSION_FILE = Path(os.environ.get(
     "GALAXCORE_LAST_VERSION_FILE",
-    str(BIN_DST / "last_version"),
+    str(Path.cwd() / "last_version"),
 )).expanduser()
 
 # Legacy C++ checkpoint file name: last_revision.txt
-LEGACY_LAST_REVISION_FILE = BIN_DST / "last_revision.txt"
+LEGACY_LAST_REVISION_FILE = LAST_VERSION_FILE.parent / "last_revision.txt"
 
 SVN_URL = os.environ.get(
     "GALAXCORE_SVN_URL",
@@ -86,10 +86,6 @@ MAX_BIN_KEEP = int(os.environ.get("GALAXCORE_MAX_BIN_KEEP", "150"))
 ZIP_PREFIX = os.environ.get("GALAXCORE_ZIP_PREFIX", "GalaxCore")
 POLL_INTERVAL = int(os.environ.get("GALAXCORE_POLL_INTERVAL", "2"))
 IDLE_SLEEP = int(os.environ.get("GALAXCORE_IDLE_SLEEP", "1"))
-IDLE_LOG_INTERVAL = int(os.environ.get(
-    "GALAXCORE_IDLE_LOG_INTERVAL",
-    "300",
-))
 QUIET_CMD_OUTPUT = os.environ.get("GALAXCORE_QUIET", "1") != "0"
 VERBOSE_OUTPUT = os.environ.get("GALAXCORE_VERBOSE", "0") == "1"
 
@@ -1491,27 +1487,34 @@ def main():
 
         if head <= local:
             wait_start = time.time()
-            last_idle_log = wait_start
-            ci_log(f"Idle | local={local} head={head}")
+            current_head = head
+            interactive_output = sys.stdout.isatty()
 
             while running:
                 current_head = get_head()
                 if current_head > local:
                     break
 
-                current_time = time.time()
-                if (
-                    IDLE_LOG_INTERVAL > 0
-                    and current_time - last_idle_log >= IDLE_LOG_INTERVAL
-                ):
-                    elapsed = int(current_time - wait_start)
-                    ci_log(
-                        f"Idle | local={local} head={current_head} "
-                        f"wait={elapsed}s"
+                if interactive_output:
+                    elapsed = int(time.time() - wait_start)
+                    print(
+                        f"\r[CI] Idle | local={local} "
+                        f"head={current_head} wait={elapsed}s",
+                        end="",
+                        flush=True,
                     )
-                    last_idle_log = current_time
 
                 time.sleep(IDLE_SLEEP)
+
+            elapsed = int(time.time() - wait_start)
+            final_idle_line = (
+                f"[CI] Idle | local={local} "
+                f"head={current_head} final_wait={elapsed}s"
+            )
+            if interactive_output:
+                print(f"\r{final_idle_line}", flush=True)
+            else:
+                print(final_idle_line, flush=True)
             continue
 
         ci_log(f"update detected {local} -> {head}")

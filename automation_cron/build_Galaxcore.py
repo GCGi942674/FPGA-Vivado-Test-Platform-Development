@@ -415,6 +415,18 @@ def classify_no_make_clean(changed_paths, paths_available, rules):
     return not unmatched_paths, unmatched_paths
 
 
+def changes_are_add_delete_only(changed_paths, paths_available):
+    """Return whether every changed path is an SVN add or delete."""
+    if not paths_available or not changed_paths:
+        return False
+
+    actions = {
+        str(item.get("action", "?")).strip().upper()
+        for item in changed_paths
+    }
+    return bool(actions) and actions.issubset({"A", "D"})
+
+
 def svn_clean():
     run_in_workdir(["svn", "revert", "-R", "."])
     run_in_workdir(["svn", "cleanup"])
@@ -1104,18 +1116,34 @@ def build_revision(rev):
     # 3. Recovery after the first build failure:
     #    make clean -> cmake . -> bd -> mk
     if not mk_ok:
+        add_delete_only = changes_are_add_delete_only(
+            changed_paths,
+            changed_paths_available,
+        )
         whitelist_rules = load_no_make_clean_whitelist()
-        skip_clean, unmatched_paths = classify_no_make_clean(
+        whitelist_skip_clean, unmatched_paths = classify_no_make_clean(
             changed_paths,
             changed_paths_available,
             whitelist_rules,
         )
 
-        if skip_clean:
+        if add_delete_only or whitelist_skip_clean:
+            if add_delete_only:
+                actions = sorted({
+                    str(item.get("action", "?")).strip().upper()
+                    for item in changed_paths
+                })
+                skip_reason = "all changed path actions are {}".format(
+                    "/".join(actions)
+                )
+            else:
+                skip_reason = (
+                    f"all {len(changed_paths)} changed path(s) "
+                    "matched whitelist"
+                )
             ci_log(
                 f"r{rev} first mk failed; skip make clean "
-                f"because all {len(changed_paths)} changed path(s) "
-                "matched whitelist"
+                f"because {skip_reason}"
             )
             record_failure(
                 rev,

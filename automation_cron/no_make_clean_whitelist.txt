@@ -1,0 +1,14 @@
+# GalaxCore no-make-clean whitelist
+#
+# One absolute SVN repository path per line, exactly as reported by:
+#   svn log --xml -v -r REVISION SVN_URL
+#
+# Exact file rule:
+# /galaxcore/README.md
+#
+# Recursive directory rule (must end with '/'):
+# /galaxcore/doc/
+#
+# The make-clean recovery is skipped only when the SVN path query succeeds,
+# at least one changed path exists, and every changed path matches a rule.
+# Keep this file empty (comments do not count) to preserve the normal recovery.

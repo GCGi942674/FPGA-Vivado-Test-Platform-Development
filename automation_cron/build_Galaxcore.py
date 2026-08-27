@@ -82,6 +82,11 @@ SVN_URL = os.environ.get(
     "http://192.168.10.10/svn/galaxcore/galaxcore",
 )
 
+NO_MAKE_CLEAN_WHITELIST_FILE = Path(os.environ.get(
+    "GALAXCORE_NO_MAKE_CLEAN_WHITELIST_FILE",
+    str(Path(__file__).absolute().parent / "no_make_clean_whitelist.txt"),
+)).expanduser()
+
 MAX_BIN_KEEP = int(os.environ.get("GALAXCORE_MAX_BIN_KEEP", "150"))
 ZIP_PREFIX = os.environ.get("GALAXCORE_ZIP_PREFIX", "GalaxCore")
 POLL_INTERVAL = int(os.environ.get("GALAXCORE_POLL_INTERVAL", "2"))
@@ -295,10 +300,10 @@ def format_svn_time(value):
     return " ".join(text.split())
 
 
-def get_revision_metadata(rev):
-    """Return (author, server-local SVN commit time) for one revision."""
+def get_revision_details(rev):
+    """Return author, commit time, changed paths, and path-query status."""
     output = read_cmd_output([
-        "svn", "log", "--xml", "-r", str(rev), SVN_URL,
+        "svn", "log", "--xml", "-v", "-r", str(rev), SVN_URL,
     ])
     if output:
         try:
@@ -309,13 +314,105 @@ def get_revision_metadata(rev):
                 date_text = logentry.findtext("date") or ""
                 author = author_text.strip() or "unknown"
                 revision_time = format_svn_time(date_text)
-                return author, revision_time
+                paths_node = logentry.find("paths")
+                changed_paths = []
+                if paths_node is not None:
+                    for path_node in paths_node.findall("path"):
+                        changed_path = (path_node.text or "").strip()
+                        if not changed_path:
+                            continue
+                        changed_paths.append({
+                            "action": path_node.get("action") or "?",
+                            "kind": path_node.get("kind") or "unknown",
+                            "path": changed_path,
+                        })
+                return (
+                    author,
+                    revision_time,
+                    changed_paths,
+                    paths_node is not None,
+                )
         except ET.ParseError:
             pass
 
-    # Preserve the previous author lookup if `svn log` is temporarily
-    # unavailable, while making the missing revision time explicit.
-    return get_author(rev), "unknown"
+    # Preserve the previous author lookup if `svn log -v` is temporarily
+    # unavailable. An unavailable path list must never skip clean recovery.
+    return get_author(rev), "unknown", [], False
+
+
+def get_revision_metadata(rev):
+    """Return (author, server-local SVN commit time) for one revision."""
+    author, revision_time, _, _ = get_revision_details(rev)
+    return author, revision_time
+
+
+def load_no_make_clean_whitelist():
+    """Load exact SVN paths and recursive directory rules from the whitelist."""
+    if not NO_MAKE_CLEAN_WHITELIST_FILE.is_file():
+        return []
+
+    try:
+        lines = NO_MAKE_CLEAN_WHITELIST_FILE.read_text(
+            encoding="utf-8",
+        ).splitlines()
+    except Exception as exc:
+        ci_debug(
+            "failed to read no-make-clean whitelist {}: {}".format(
+                NO_MAKE_CLEAN_WHITELIST_FILE,
+                exc,
+            )
+        )
+        return []
+
+    rules = []
+    for line_number, raw_line in enumerate(lines, 1):
+        rule = raw_line.strip()
+        if not rule or rule.startswith("#"):
+            continue
+        if not rule.startswith("/") or "\\" in rule:
+            ci_debug(
+                "ignore invalid whitelist rule line {}: {}".format(
+                    line_number,
+                    rule,
+                )
+            )
+            continue
+        if rule not in rules:
+            rules.append(rule)
+
+    return rules
+
+
+def path_matches_no_make_clean_whitelist(path, rules):
+    """Match one absolute SVN path against exact-file/directory rules."""
+    normalized_path = str(path).strip()
+    for rule in rules:
+        if rule.endswith("/"):
+            directory = rule.rstrip("/")
+            if (
+                normalized_path == directory
+                or normalized_path.startswith(rule)
+            ):
+                return True
+        elif normalized_path == rule:
+            return True
+    return False
+
+
+def classify_no_make_clean(changed_paths, paths_available, rules):
+    """Return (skip_clean, unmatched_paths) using all-path whitelist logic."""
+    if not paths_available or not changed_paths or not rules:
+        return False, [item.get("path", "") for item in changed_paths]
+
+    unmatched_paths = [
+        item.get("path", "")
+        for item in changed_paths
+        if not path_matches_no_make_clean_whitelist(
+            item.get("path", ""),
+            rules,
+        )
+    ]
+    return not unmatched_paths, unmatched_paths
 
 
 def svn_clean():
@@ -968,10 +1065,24 @@ def record_success(rev, author, revision_time=""):
 def build_revision(rev):
     ci_log(f"build r{rev}")
 
-    author, revision_time = get_revision_metadata(rev)
+    (
+        author,
+        revision_time,
+        changed_paths,
+        changed_paths_available,
+    ) = get_revision_details(rev)
     ci_debug(
         f"r{rev} author={author} revision_time={revision_time}"
     )
+    for changed_item in changed_paths:
+        ci_debug(
+            "r{} changed {} {} ({})".format(
+                rev,
+                changed_item.get("action", "?"),
+                changed_item.get("path", ""),
+                changed_item.get("kind", "unknown"),
+            )
+        )
 
     svn_clean()
 
@@ -993,6 +1104,48 @@ def build_revision(rev):
     # 3. Recovery after the first build failure:
     #    make clean -> cmake . -> bd -> mk
     if not mk_ok:
+        whitelist_rules = load_no_make_clean_whitelist()
+        skip_clean, unmatched_paths = classify_no_make_clean(
+            changed_paths,
+            changed_paths_available,
+            whitelist_rules,
+        )
+
+        if skip_clean:
+            ci_log(
+                f"r{rev} first mk failed; skip make clean "
+                f"because all {len(changed_paths)} changed path(s) "
+                "matched whitelist"
+            )
+            record_failure(
+                rev,
+                author,
+                "mk_failed_clean_skipped",
+                revision_time,
+            )
+            return False
+
+        if not changed_paths_available:
+            ci_debug(
+                f"r{rev} changed paths unavailable; keep clean recovery"
+            )
+        elif not changed_paths:
+            ci_debug(
+                f"r{rev} changed paths empty; keep clean recovery"
+            )
+        elif not whitelist_rules:
+            ci_debug(
+                f"r{rev} no-make-clean whitelist empty; "
+                "keep clean recovery"
+            )
+        else:
+            ci_debug(
+                "r{} paths outside no-make-clean whitelist: {}".format(
+                    rev,
+                    ", ".join(unmatched_paths),
+                )
+            )
+
         ci_log(
             f"r{rev} first mk failed; "
             "run make clean -> cmake . -> bd -> mk"
@@ -1291,6 +1444,23 @@ def run_config_check():
     reporter.info("SUBMIT_TEST_DIR", str(submit_dir))
     reporter.info("SVN_URL", str(SVN_URL))
 
+    whitelist_rules = load_no_make_clean_whitelist()
+    if NO_MAKE_CLEAN_WHITELIST_FILE.is_file():
+        reporter.info(
+            "no-clean whitelist",
+            "{} (rules={})".format(
+                NO_MAKE_CLEAN_WHITELIST_FILE,
+                len(whitelist_rules),
+            ),
+        )
+    else:
+        reporter.warn(
+            "no-clean whitelist",
+            "missing; clean recovery remains enabled: {}".format(
+                NO_MAKE_CLEAN_WHITELIST_FILE,
+            ),
+        )
+
     if work_dir.is_dir():
         reporter.ok("WORK_DIR exists", str(work_dir))
     elif work_dir.exists():
@@ -1437,6 +1607,14 @@ def print_startup():
     ci_debug(f"SUBMIT_TEST_SCRIPT={SUBMIT_TEST_SCRIPT}")
     ci_debug(f"MK_FAIL_FILE={MK_FAIL_FILE}")
     ci_debug(f"LAST_VERSION_FILE={LAST_VERSION_FILE}")
+    ci_debug(
+        f"NO_MAKE_CLEAN_WHITELIST_FILE="
+        f"{NO_MAKE_CLEAN_WHITELIST_FILE}"
+    )
+    ci_debug(
+        f"NO_MAKE_CLEAN_WHITELIST_RULES="
+        f"{len(load_no_make_clean_whitelist())}"
+    )
     ci_debug(f"Starting version: r{load_last_version()}")
 
 

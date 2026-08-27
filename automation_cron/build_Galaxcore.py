@@ -25,6 +25,7 @@ Main workflow:
 """
 
 import argparse
+import calendar
 import os
 import re
 import shutil
@@ -85,6 +86,10 @@ MAX_BIN_KEEP = int(os.environ.get("GALAXCORE_MAX_BIN_KEEP", "150"))
 ZIP_PREFIX = os.environ.get("GALAXCORE_ZIP_PREFIX", "GalaxCore")
 POLL_INTERVAL = int(os.environ.get("GALAXCORE_POLL_INTERVAL", "2"))
 IDLE_SLEEP = int(os.environ.get("GALAXCORE_IDLE_SLEEP", "1"))
+IDLE_LOG_INTERVAL = int(os.environ.get(
+    "GALAXCORE_IDLE_LOG_INTERVAL",
+    "300",
+))
 QUIET_CMD_OUTPUT = os.environ.get("GALAXCORE_QUIET", "1") != "0"
 VERBOSE_OUTPUT = os.environ.get("GALAXCORE_VERBOSE", "0") == "1"
 
@@ -269,6 +274,54 @@ def get_author(rev):
     return "unknown"
 
 
+def format_svn_time(value):
+    """Convert an SVN UTC timestamp to server-local display time."""
+    text = str(value).strip()
+    if not text:
+        return "unknown"
+
+    if text.endswith("Z"):
+        utc_text = text[:-1]
+        for date_format in (
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                utc_time = datetime.strptime(utc_text, date_format)
+                timestamp = calendar.timegm(utc_time.utctimetuple())
+                timestamp += utc_time.microsecond / 1000000.0
+                local_time = datetime.fromtimestamp(timestamp)
+                return local_time.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+
+    # Keep an unexpected SVN date visible instead of losing the metadata.
+    return " ".join(text.split())
+
+
+def get_revision_metadata(rev):
+    """Return (author, server-local SVN commit time) for one revision."""
+    output = read_cmd_output([
+        "svn", "log", "--xml", "-r", str(rev), SVN_URL,
+    ])
+    if output:
+        try:
+            root = ET.fromstring(output)
+            logentry = root.find(".//logentry")
+            if logentry is not None:
+                author_text = logentry.findtext("author") or ""
+                date_text = logentry.findtext("date") or ""
+                author = author_text.strip() or "unknown"
+                revision_time = format_svn_time(date_text)
+                return author, revision_time
+        except ET.ParseError:
+            pass
+
+    # Preserve the previous author lookup if `svn log` is temporarily
+    # unavailable, while making the missing revision time explicit.
+    return get_author(rev), "unknown"
+
+
 def svn_clean():
     run_in_workdir(["svn", "revert", "-R", "."])
     run_in_workdir(["svn", "cleanup"])
@@ -383,7 +436,7 @@ def run_submit_test():
 
 
 def summarize_submit_output(output):
-    """Keep the most useful submit_test.sh failure lines for mk_fail."""
+    """Extract concrete submit failure cases for the mk_fail reason column."""
     lines = []
     for raw_line in strip_ansi(output).splitlines():
         line = raw_line.strip()
@@ -393,14 +446,22 @@ def summarize_submit_output(output):
     if not lines:
         return "no submit output"
 
-    interesting = []
-    patterns = ["fail", "error", "elapsed time", "case"]
+    failure_lines = []
+    case_lines = []
     for line in lines:
         lower = line.lower()
-        if any(pattern in lower for pattern in patterns):
-            interesting.append(line)
+        has_failure = "fail" in lower or "error" in lower
+        if has_failure:
+            failure_lines.append(line)
+            if "elapsed time" not in lower:
+                case_lines.append(line)
 
-    selected = interesting[-3:] if interesting else lines[-3:]
+    if case_lines:
+        selected = case_lines[-3:]
+    elif failure_lines:
+        selected = failure_lines[-3:]
+    else:
+        selected = lines[-3:]
     return " | ".join(selected)[:240]
 
 
@@ -466,14 +527,36 @@ def clean_old_zips():
 # ================= MK_FAIL STATE FILE =================
 
 # mk_fail display format, newest records at the top:
-# Success  r14773  author_name     ok                    [2026-06-01 16:00:57]
-# FAIL     r14775  author_name     mk_failed             [2026-06-01 17:20:57]
-# FAIL     r14774  author_name     submit_failed: ...    [2026-06-01 16:20:57]
+# Success  r14773  author_name  ok           2026-06-01 15:55:00  [2026-06-01 16:00:57]
+# FAIL     r14775  author_name  mk_failed    2026-06-01 17:15:00  [2026-06-01 17:20:57]
+# FAIL     r14774  author_name  case_a FAIL  2026-06-01 16:15:00  [2026-06-01 16:20:57]
 
 STATUS_WIDTH = 7
 REV_WIDTH = 8
 AUTHOR_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_AUTHOR_WIDTH", "16"))
-REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "28"))
+REASON_WIDTH = int(os.environ.get("GALAXCORE_MK_FAIL_REASON_WIDTH", "80"))
+REVISION_TIME_WIDTH = int(os.environ.get(
+    "GALAXCORE_MK_FAIL_REVISION_TIME_WIDTH",
+    "19",
+))
+
+
+def normalize_record_text(value, fallback):
+    """Convert arbitrary command/SVN text into one mk_fail line column."""
+    text = " ".join(strip_ansi(str(value)).split())
+    return text or fallback
+
+
+def fit_record_column(value, width, fallback):
+    """Fit one value into an exact-width column for stable parsing."""
+    text = normalize_record_text(value, fallback)
+    if width <= 0:
+        return ""
+    if len(text) > width:
+        if width <= 3:
+            return text[:width]
+        text = text[:width - 3] + "..."
+    return text.ljust(width)
 
 
 def make_record(
@@ -482,13 +565,15 @@ def make_record(
     author,
     zip_name,
     reason="",
+    revision_time="",
+    recorded_at=None,
 ):
     """
     Create one aligned mk_fail record.
 
     Required format:
-        Success  r14773  author_name     [2026-06-01 16:00:57]
-        FAIL     r14775  author_name     [2026-06-01 17:20:57]
+        Success  r14773  author  ok       2026-06-01 15:55:00  [2026-06-01 16:00:57]
+        FAIL     r14775  author  case_x   2026-06-01 17:15:00  [2026-06-01 17:20:57]
 
     Notes:
     - `zip_name` is kept in the function argument for compatibility with the
@@ -496,8 +581,13 @@ def make_record(
     """
     del zip_name
 
-    safe_author = str(author).strip() or "unknown"
-    safe_reason = str(reason).strip() or "ok"
+    safe_author = fit_record_column(author, AUTHOR_WIDTH, "unknown")
+    safe_reason = fit_record_column(reason, REASON_WIDTH, "ok")
+    safe_revision_time = fit_record_column(
+        revision_time,
+        REVISION_TIME_WIDTH,
+        "unknown",
+    )
 
     # User-facing status text: Success on success, FAIL on failure.
     if status.upper() == "SUCCESS":
@@ -507,16 +597,13 @@ def make_record(
 
     rev_text = "r{}".format(rev)
 
-    return "{:<{sw}}  {:<{rw}}  {:<{aw}}  {:<{mw}}  [{}]".format(
-        status_text,
-        rev_text,
+    return "{}  {}  {}  {}  {}  [{}]".format(
+        status_text.ljust(STATUS_WIDTH),
+        rev_text.ljust(REV_WIDTH),
         safe_author,
         safe_reason,
-        now(),
-        sw=STATUS_WIDTH,
-        rw=REV_WIDTH,
-        aw=AUTHOR_WIDTH,
-        mw=REASON_WIDTH,
+        safe_revision_time,
+        recorded_at or now(),
     ).rstrip()
 
 
@@ -554,6 +641,22 @@ def line_reason(line):
     """Extract the normalized reason field from one mk_fail record."""
     stripped = line.strip()
 
+    # Current fixed-column format with the SVN revision-time column.
+    reason_start = (
+        STATUS_WIDTH + 2 + REV_WIDTH + 2 + AUTHOR_WIDTH + 2
+    )
+    timestamp_start = (
+        reason_start + REASON_WIDTH + 2 + REVISION_TIME_WIDTH + 2
+    )
+    if (
+        len(stripped) > timestamp_start
+        and re.match(
+            r"^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]$",
+            stripped[timestamp_start:],
+        )
+    ):
+        return stripped[reason_start:reason_start + REASON_WIDTH].strip()
+
     # Current aligned format:
     # FAIL  r15456  author  submit_failed  [2026-06-22 19:41:41]
     current_match = re.match(
@@ -573,6 +676,98 @@ def line_reason(line):
         return legacy_match.group(1).strip()
 
     return None
+
+
+def is_current_mk_fail_record(line):
+    """Return whether a line already contains the revision-time column."""
+    stripped = line.strip()
+    reason_start = (
+        STATUS_WIDTH + 2 + REV_WIDTH + 2 + AUTHOR_WIDTH + 2
+    )
+    timestamp_start = (
+        reason_start + REASON_WIDTH + 2 + REVISION_TIME_WIDTH + 2
+    )
+    return (
+        len(stripped) > timestamp_start
+        and re.match(
+            r"^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]$",
+            stripped[timestamp_start:],
+        ) is not None
+    )
+
+
+def parse_old_mk_fail_record(line):
+    """Parse the previous aligned format without a revision-time column."""
+    match = re.match(
+        r"^(Success|SUCCESS|FAIL)\s+"
+        r"r(\d+)\s+"
+        r"(\S+)\s+"
+        r"(.*?)\s+"
+        r"\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]\s*$",
+        line.strip(),
+    )
+    if not match:
+        return None
+
+    return {
+        "status": match.group(1),
+        "revision": int(match.group(2)),
+        "author": match.group(3),
+        "reason": match.group(4).strip() or "ok",
+        "recorded_at": match.group(5),
+    }
+
+
+def upgrade_mk_fail_records():
+    """Backfill SVN revision times into parseable old mk_fail records."""
+    old_lines = read_nonempty_lines(MK_FAIL_FILE)
+    if not old_lines:
+        return 0
+
+    metadata_cache = {}
+    new_lines = []
+    upgraded_count = 0
+
+    for line in old_lines:
+        if is_current_mk_fail_record(line):
+            new_lines.append(line)
+            continue
+
+        old_record = parse_old_mk_fail_record(line)
+        if old_record is None:
+            new_lines.append(line)
+            continue
+
+        revision = old_record["revision"]
+        if revision not in metadata_cache:
+            metadata_cache[revision] = get_revision_metadata(revision)
+
+        metadata_author, revision_time = metadata_cache[revision]
+        if revision_time == "unknown":
+            # Keep the original line and retry on a future startup when SVN is
+            # available instead of replacing it with incomplete information.
+            new_lines.append(line)
+            continue
+
+        author = old_record["author"]
+        if author == "unknown" and metadata_author != "unknown":
+            author = metadata_author
+
+        new_lines.append(make_record(
+            old_record["status"],
+            revision,
+            author,
+            zip_name_for_rev(revision),
+            old_record["reason"],
+            revision_time,
+            old_record["recorded_at"],
+        ))
+        upgraded_count += 1
+
+    if upgraded_count:
+        write_lines(MK_FAIL_FILE, new_lines)
+
+    return upgraded_count
 
 
 def collapse_active_failure_streak(fail_lines, success_revision):
@@ -617,7 +812,7 @@ def collapse_active_failure_streak(fail_lines, success_revision):
     return [earliest_streak_line] + fail_lines[streak_end:]
 
 
-def update_mk_fail_success(rev, author, zip_name):
+def update_mk_fail_success(rev, author, zip_name, revision_time=""):
     """
     Write latest success as line 1.
     Keep failure records below it, newest first.
@@ -648,11 +843,24 @@ def update_mk_fail_success(rev, author, zip_name):
         previous_success_revision,
     )
 
-    success_line = make_record("SUCCESS", rev, author, zip_name, "ok")
+    success_line = make_record(
+        "SUCCESS",
+        rev,
+        author,
+        zip_name,
+        "ok",
+        revision_time,
+    )
     write_lines(MK_FAIL_FILE, [success_line] + fail_lines)
 
 
-def update_mk_fail_failure(rev, author, zip_name, reason):
+def update_mk_fail_failure(
+    rev,
+    author,
+    zip_name,
+    reason,
+    revision_time="",
+):
     """
     Keep latest success at line 1 and failures below it, newest groups first.
 
@@ -720,6 +928,7 @@ def update_mk_fail_failure(rev, author, zip_name, reason):
             author,
             zip_name,
             new_reason,
+            revision_time,
         )
         fail_lines = [new_fail_line] + fail_lines
 
@@ -733,23 +942,36 @@ def update_mk_fail_failure(rev, author, zip_name, reason):
 
 # ================= BUILD FLOW =================
 
-def record_failure(rev, author, reason):
+def record_failure(rev, author, reason, revision_time=""):
     zip_name = zip_name_for_rev(rev)
-    update_mk_fail_failure(rev, author, zip_name, reason)
+    update_mk_fail_failure(
+        rev,
+        author,
+        zip_name,
+        reason,
+        revision_time,
+    )
     save_last_version(rev)
 
 
-def record_success(rev, author):
+def record_success(rev, author, revision_time=""):
     zip_name = zip_name_for_rev(rev)
-    update_mk_fail_success(rev, author, zip_name)
+    update_mk_fail_success(
+        rev,
+        author,
+        zip_name,
+        revision_time,
+    )
     save_last_version(rev)
 
 
 def build_revision(rev):
     ci_log(f"build r{rev}")
 
-    author = get_author(rev)
-    ci_debug(f"r{rev} author={author}")
+    author, revision_time = get_revision_metadata(rev)
+    ci_debug(
+        f"r{rev} author={author} revision_time={revision_time}"
+    )
 
     svn_clean()
 
@@ -757,7 +979,12 @@ def build_revision(rev):
     if not checkout(rev):
         ci_log(f"FAIL r{rev}")
         ci_debug(f"svn update failed for r{rev}")
-        record_failure(rev, author, "svn_update_failed")
+        record_failure(
+            rev,
+            author,
+            "svn_update_failed",
+            revision_time,
+        )
         return False
 
     # 2. First build attempt: mk.
@@ -777,7 +1004,12 @@ def build_revision(rev):
                 f"FAIL r{rev} {failure_reason} "
                 f"rc={failure_code}"
             )
-            record_failure(rev, author, failure_reason)
+            record_failure(
+                rev,
+                author,
+                failure_reason,
+                revision_time,
+            )
             return False
 
     # 4. Submit gate. Only generate zip when submit_test.sh really passes.
@@ -787,18 +1019,31 @@ def build_revision(rev):
         detail = summarize_submit_output(submit_output)
         ci_log(f"FAIL r{rev} submit_failed")
         ci_debug(f"submit failed for r{rev}: {submit_reason}: {detail}")
-        record_failure(rev, author, "submit_failed")
+        failure_case = detail
+        if detail == "no submit output":
+            failure_case = submit_reason
+        record_failure(
+            rev,
+            author,
+            failure_case,
+            revision_time,
+        )
         return False
 
     # 5. Create the zip only after mk and submit both succeed.
     if not compress_to_zip(rev):
         ci_log(f"FAIL r{rev} compress_failed")
         ci_debug(f"compress failed for r{rev}")
-        record_failure(rev, author, "compress_failed")
+        record_failure(
+            rev,
+            author,
+            "compress_failed",
+            revision_time,
+        )
         return False
 
     clean_old_zips()
-    record_success(rev, author)
+    record_success(rev, author, revision_time)
     ci_log(f"Success r{rev}")
     return True
 
@@ -1227,6 +1472,12 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     validate_paths()
+    upgraded_count = upgrade_mk_fail_records()
+    if upgraded_count:
+        ci_log(
+            f"upgraded {upgraded_count} old mk_fail record(s) "
+            "with SVN revision time"
+        )
     print_startup()
 
     while running:
@@ -1240,19 +1491,27 @@ def main():
 
         if head <= local:
             wait_start = time.time()
+            last_idle_log = wait_start
+            ci_log(f"Idle | local={local} head={head}")
+
             while running:
                 current_head = get_head()
                 if current_head > local:
                     break
 
-                elapsed = int(time.time() - wait_start)
-                print(
-                    f"\r[CI] Idle | local={local} head={current_head} wait: {elapsed}s",
-                    end="",
-                    flush=True,
-                )
+                current_time = time.time()
+                if (
+                    IDLE_LOG_INTERVAL > 0
+                    and current_time - last_idle_log >= IDLE_LOG_INTERVAL
+                ):
+                    elapsed = int(current_time - wait_start)
+                    ci_log(
+                        f"Idle | local={local} head={current_head} "
+                        f"wait={elapsed}s"
+                    )
+                    last_idle_log = current_time
+
                 time.sleep(IDLE_SLEEP)
-            print(flush=True)
             continue
 
         ci_log(f"update detected {local} -> {head}")

@@ -70,6 +70,60 @@ def locate(versions, step, test):
             'first_fail': versions[high], 'uncached_gap': versions[high] - versions[low] > 1}
 
 
+def format_summary(result, current, case, count, records):
+    """Render a readable terminal summary while keeping JSON machine-readable."""
+    lines = ['', '=' * 60, 'Regression Search Result', '-' * 60, 'Testcase: {}'.format(case)]
+    outcome = result['outcome']
+    if outcome == 'BOUNDARY':
+        if result.get('uncached_gap'):
+            lines.extend([
+                'Status: PASS/FAIL interval found',
+                'Passing version: r{}'.format(result['last_pass']),
+                'Failing version: r{}'.format(result['first_fail']),
+                'Note: Uncached versions in this interval prevent an exact first-failure result.',
+            ])
+        else:
+            lines.extend([
+                'Status: First failing version in history identified',
+                'First failure: r{}  [FAIL]'.format(result['first_fail']),
+                'Previous pass: r{}  [PASS]'.format(result['last_pass']),
+                'Suggested check: Review the code changes in r{}.'.format(result['first_fail']),
+            ])
+    elif outcome == 'BASE_PASS':
+        lines.extend(['Status: Current version passed; failure not reproduced',
+                      'Base version: r{}  [PASS]'.format(result['base']),
+                      'Historical versions were not searched.'])
+    elif outcome == 'NO_PASS_IN_CACHE':
+        lines.extend(['Status: No passing version found; failure boundary unknown',
+                      'Oldest tested: r{}  [FAIL]'.format(result['oldest']),
+                      'Note: Earlier available versions are needed to continue.'])
+    lines.extend(['-' * 60, 'Versions tested: {}'.format(count),
+                  'Current checkout: r{} (not automatically restored)'.format(current),
+                  'Records: {}'.format(records), '=' * 60])
+    return '\n'.join(lines)
+
+
+def color_summary(summary):
+    """Add terminal-only ANSI colors; keep saved reports free of escapes."""
+    if not sys.stdout.isatty() or os.environ.get('TERM') == 'dumb' or 'NO_COLOR' in os.environ:
+        return summary
+    colored = []
+    for line in summary.split('\n'):
+        code = None
+        if '[FAIL]' in line or line.startswith(('First failure:', 'Failing version:')):
+            code = '1;31'
+        elif '[PASS]' in line or line.startswith(('Previous pass:', 'Passing version:')):
+            code = '1;32'
+        elif line.startswith(('Status:', 'Note:', 'Suggested check:')):
+            code = '1;33'
+        elif line == 'Regression Search Result' or line.startswith(('Current checkout:', 'Records:')):
+            code = '1;36'
+        elif line and set(line) <= {'=', '-'}:
+            code = '36'
+        colored.append('\033[{}m{}\033[0m'.format(code, line) if code else line)
+    return '\n'.join(colored)
+
+
 class Regression:
     def __init__(self, args):
         self.args = args
@@ -225,8 +279,10 @@ class Regression:
         try:
             result = locate(versions, self.args.step, self.test)
             self.save(result)
-            print('\nRESULT: {}'.format(json.dumps(result, sort_keys=True)))
-            print('Current checkout: r{}\nRecords: {}'.format(self.current, self.output / 'results.tsv'))
+            summary = format_summary(result, self.current, self.case,
+                                     len(self.rows), self.output / 'results.tsv')
+            (self.output / 'summary.txt').write_text(summary + '\n', encoding='utf-8')
+            print(color_summary(summary))
             return 0 if result['outcome'] == 'BOUNDARY' else 2
         except BaseException as exc:
             self.save({'outcome': 'STOPPED', 'reason': str(exc) or type(exc).__name__})

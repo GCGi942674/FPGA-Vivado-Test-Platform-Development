@@ -13,8 +13,7 @@ Main workflow:
    - svn update -r <rev>
    - run mk
    - if mk fails, run make clean and retry mk once
-   - zip GalaxCore binary after success
-   - keep only latest MAX_BIN_KEEP zip files
+   - record success after the submit test passes
 4. State files:
    - No history file is used anymore.
    - last_version is kept for resume after interruption.
@@ -32,7 +31,6 @@ import shutil
 import sys
 import time
 import signal
-import zipfile
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -56,11 +54,6 @@ BIN_SRC = Path(os.environ.get(
 BIN_DST = Path(os.environ.get(
     "GALAXCORE_BIN_DST",
     "/home/xshare/zhouwei_runcache/GalaxCore",
-)).expanduser()
-
-ZIP_DIR = Path(os.environ.get(
-    "GALAXCORE_ZIP_DIR",
-    str(BIN_DST / "zip"),
 )).expanduser()
 
 MK_FAIL_FILE = Path(os.environ.get(
@@ -87,8 +80,6 @@ NO_MAKE_CLEAN_WHITELIST_FILE = Path(os.environ.get(
     str(Path(__file__).absolute().parent / "no_make_clean_whitelist.txt"),
 )).expanduser()
 
-MAX_BIN_KEEP = int(os.environ.get("GALAXCORE_MAX_BIN_KEEP", "600"))
-ZIP_PREFIX = os.environ.get("GALAXCORE_ZIP_PREFIX", "GalaxCore")
 POLL_INTERVAL = int(os.environ.get("GALAXCORE_POLL_INTERVAL", "2"))
 IDLE_SLEEP = int(os.environ.get("GALAXCORE_IDLE_SLEEP", "1"))
 QUIET_CMD_OUTPUT = os.environ.get("GALAXCORE_QUIET", "1") != "0"
@@ -582,65 +573,6 @@ def summarize_submit_output(output):
     return " | ".join(selected)[:240]
 
 
-# ================= ZIP =================
-
-def zip_name_for_rev(rev):
-    return f"{ZIP_PREFIX}_{rev}.zip"
-
-
-def compress_to_zip(rev):
-    if not BIN_SRC.exists():
-        ci_log("FAIL binary not found")
-        ci_debug(f"binary not found: {BIN_SRC}")
-        return False
-
-    ZIP_DIR.mkdir(parents=True, exist_ok=True)
-    zip_path = ZIP_DIR / zip_name_for_rev(rev)
-
-    tmp_zip_path = zip_path.with_name(zip_path.name + ".tmp")
-    try:
-        if tmp_zip_path.exists():
-            tmp_zip_path.unlink()
-
-        with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            # Equivalent to `zip -j`: only store basename, not full directory path.
-            zf.write(BIN_SRC, arcname=BIN_SRC.name)
-
-        os.replace(tmp_zip_path, zip_path)
-        return True
-    except Exception as e:
-        ci_debug(f"compress failed: {e}")
-        try:
-            if tmp_zip_path.exists():
-                tmp_zip_path.unlink()
-        except Exception:
-            pass
-        return False
-
-
-def _revision_from_zip_name(path):
-    m = re.search(r"_(\d+)\.zip$", path.name)
-    return int(m.group(1)) if m else -1
-
-
-def clean_old_zips():
-    if MAX_BIN_KEEP <= 0 or not ZIP_DIR.exists():
-        return
-
-    zip_files = list(ZIP_DIR.glob(f"{ZIP_PREFIX}_*.zip"))
-    zip_files.sort(key=lambda p: (_revision_from_zip_name(p), p.stat().st_mtime))
-
-    remove_count = len(zip_files) - MAX_BIN_KEEP
-    if remove_count <= 0:
-        return
-
-    for path in zip_files[:remove_count]:
-        try:
-            path.unlink()
-        except Exception as e:
-            ci_debug(f"warning: failed to remove old zip {path}: {e}")
-
-
 # ================= MK_FAIL STATE FILE =================
 
 # mk_fail display format, newest records at the top:
@@ -680,7 +612,6 @@ def make_record(
     status,
     rev,
     author,
-    zip_name,
     reason="",
     revision_time="",
     recorded_at=None,
@@ -691,12 +622,7 @@ def make_record(
     Required format:
         Success  r14773  author  ok       2026-06-01 15:55:00  [2026-06-01 16:00:57]
         FAIL     r14775  author  case_x   2026-06-01 17:15:00  [2026-06-01 17:20:57]
-
-    Notes:
-    - `zip_name` is kept in the function argument for compatibility with the
-      previous workflow, but it is not printed in mk_fail now.
     """
-    del zip_name
 
     safe_author = fit_record_column(author, AUTHOR_WIDTH, "unknown")
     safe_reason = fit_record_column(reason, REASON_WIDTH, "ok")
@@ -866,7 +792,6 @@ def upgrade_mk_fail_records():
             old_record["status"],
             revision,
             author,
-            zip_name_for_rev(revision),
             old_record["reason"],
             revision_time,
             old_record["recorded_at"],
@@ -921,7 +846,7 @@ def collapse_active_failure_streak(fail_lines, success_revision):
     return [earliest_streak_line] + fail_lines[streak_end:]
 
 
-def update_mk_fail_success(rev, author, zip_name, revision_time=""):
+def update_mk_fail_success(rev, author, revision_time=""):
     """
     Write latest success as line 1.
     Keep failure records below it, newest first.
@@ -956,7 +881,6 @@ def update_mk_fail_success(rev, author, zip_name, revision_time=""):
         "SUCCESS",
         rev,
         author,
-        zip_name,
         "ok",
         revision_time,
     )
@@ -966,7 +890,6 @@ def update_mk_fail_success(rev, author, zip_name, revision_time=""):
 def update_mk_fail_failure(
     rev,
     author,
-    zip_name,
     reason,
     revision_time="",
 ):
@@ -1035,7 +958,6 @@ def update_mk_fail_failure(
             "FAIL",
             rev,
             author,
-            zip_name,
             new_reason,
             revision_time,
         )
@@ -1052,11 +974,9 @@ def update_mk_fail_failure(
 # ================= BUILD FLOW =================
 
 def record_failure(rev, author, reason, revision_time=""):
-    zip_name = zip_name_for_rev(rev)
     update_mk_fail_failure(
         rev,
         author,
-        zip_name,
         reason,
         revision_time,
     )
@@ -1064,11 +984,9 @@ def record_failure(rev, author, reason, revision_time=""):
 
 
 def record_success(rev, author, revision_time=""):
-    zip_name = zip_name_for_rev(rev)
     update_mk_fail_success(
         rev,
         author,
-        zip_name,
         revision_time,
     )
     save_last_version(rev)
@@ -1193,7 +1111,7 @@ def build_revision(rev):
             )
             return False
 
-    # 4. Submit gate. Only generate zip when submit_test.sh really passes.
+    # 4. Submit gate. Record success only after submit_test.sh passes.
     ci_log(f"submit_test r{rev}")
     submit_ok, submit_reason, submit_output = run_submit_test()
     if not submit_ok:
@@ -1208,19 +1126,7 @@ def build_revision(rev):
         )
         return False
 
-    # 5. Create the zip only after mk and submit both succeed.
-    if not compress_to_zip(rev):
-        ci_log(f"FAIL r{rev} compress_failed")
-        ci_debug(f"compress failed for r{rev}")
-        record_failure(
-            rev,
-            author,
-            "compress_failed",
-            revision_time,
-        )
-        return False
-
-    clean_old_zips()
+    # 5. Record the completed revision.
     record_success(rev, author, revision_time)
     ci_log(f"Success r{rev}")
     return True
@@ -1444,7 +1350,6 @@ def run_config_check():
     work_dir = normalize_path(WORK_DIR)
     bin_src = normalize_path(BIN_SRC)
     bin_dst = normalize_path(BIN_DST)
-    zip_dir = normalize_path(ZIP_DIR)
     submit_dir = normalize_path(SUBMIT_TEST_DIR)
 
     submit_script_value = Path(SUBMIT_TEST_SCRIPT)
@@ -1465,7 +1370,6 @@ def run_config_check():
     )
     reporter.info("BIN_SRC", str(bin_src))
     reporter.info("BIN_DST", str(bin_dst))
-    reporter.info("ZIP_DIR", str(zip_dir))
     reporter.info("SUBMIT_TEST_DIR", str(submit_dir))
     reporter.info("SVN_URL", str(SVN_URL))
 
@@ -1591,7 +1495,6 @@ def run_config_check():
         reporter.fail("submit script", "missing: {}".format(submit_script))
 
     check_writable_target(reporter, "BIN_DST writable", bin_dst)
-    check_writable_target(reporter, "ZIP_DIR writable", zip_dir)
     check_writable_target(reporter, "mk_fail writable", MK_FAIL_FILE)
     check_writable_target(reporter, "last_version writable", LAST_VERSION_FILE)
 
@@ -1627,7 +1530,6 @@ def print_startup():
     ci_debug(f"WORK_DIR={WORK_DIR}")
     ci_debug(f"BIN_SRC={BIN_SRC}")
     ci_debug(f"BIN_DST={BIN_DST}")
-    ci_debug(f"ZIP_DIR={ZIP_DIR}")
     ci_debug(f"SUBMIT_TEST_DIR={SUBMIT_TEST_DIR}")
     ci_debug(f"SUBMIT_TEST_SCRIPT={SUBMIT_TEST_SCRIPT}")
     ci_debug(f"MK_FAIL_FILE={MK_FAIL_FILE}")
@@ -1645,7 +1547,6 @@ def print_startup():
 
 def validate_paths():
     BIN_DST.mkdir(parents=True, exist_ok=True)
-    ZIP_DIR.mkdir(parents=True, exist_ok=True)
 
     if not WORK_DIR.exists():
         ci_debug(f"warning: WORK_DIR does not exist: {WORK_DIR}")

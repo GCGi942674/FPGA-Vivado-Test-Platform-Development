@@ -55,6 +55,13 @@ class SearchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             regression.cached_versions('bad output')
 
+    def test_release_cache_parser(self):
+        output = ('All available release success versions:\n'
+                  '[18265, 18264, 18263, 18262, 18261, 18260, 18259, '
+                  '18258, 18257, 18256, 18255, 18254, 18253]\n'
+                  'All available release day versions:\n[]')
+        self.assertEqual(regression.cached_versions(output), list(range(18253, 18266)))
+
 
 if __name__ == '__main__':
     unittest.main()

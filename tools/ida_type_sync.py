@@ -1,6 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import print_function
+
+# ============================================================
+# USER SETTINGS - normally only these two paths need changing.
+# Use absolute paths on the machine running the converter.
+# Environment variables override these defaults when supplied.
+# ============================================================
+
+# Converter executable (override: CC_CONVERTER).
+DEFAULT_CONVERTER = "/home/chenggong/workspace/pyscript/container_convert"
+
+# Converter working directory; relative input/output files resolve here.
+# Override: IDA_TYPE_SYNC_WORKDIR.
+DEFAULT_WORKDIR = "/home/chenggong/workspace/galaxcore"
+
+# Optional settings: keep these defaults for normal use.
+# Registry override must be identical in the IDA and shell environments.
+DEFAULT_REGISTRY_DIR = ""  # Empty means automatic per-user temporary directory.
+DISCOVERY_TIMEOUT = 0.5  # Seconds per instance; increase if busy IDAs time out.
+ENABLE_VECTOR_BOOL_LAYOUT = True  # Supplied 64-bit Linux layout, not universal.
+
+# The alias and IDA exec(open(...)) command must use this file's actual path.
+# No script-path setting is needed inside this file.
+
+
 """
 GalaxCore container -> IDA Local Types (multi-instance)
 
@@ -69,7 +94,6 @@ Target:
 """
 
 
-from __future__ import print_function
 
 import sys
 import os
@@ -82,8 +106,8 @@ def registry_directory():
     # A separate registry for each OS user; override on both sides if needed.
     identity = str(os.getuid()) if hasattr(os, "getuid") else os.path.expanduser("~")
     suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-    return os.environ.get("IDA_TYPE_SYNC_REGISTRY", os.path.join(
-        tempfile.gettempdir(), "ida_type_sync_" + suffix))
+    configured = os.environ.get("IDA_TYPE_SYNC_REGISTRY", DEFAULT_REGISTRY_DIR)
+    return configured or os.path.join(tempfile.gettempdir(), "ida_type_sync_" + suffix)
 
 
 def write_registration(server, health):
@@ -935,7 +959,7 @@ else:
 
     CONVERTER = os.environ.get(
         "CC_CONVERTER",
-        "/home/chenggong/workspace/pyscript/container_convert"
+        DEFAULT_CONVERTER
     )
 
     BRIDGE_URL = os.environ.get(
@@ -943,9 +967,7 @@ else:
         ""
     )
 
-    WORKDIR = (
-        "/home/chenggong/workspace/galaxcore"
-    )
+    WORKDIR = os.environ.get("IDA_TYPE_SYNC_WORKDIR", DEFAULT_WORKDIR)
 
 
     # ========================================================
@@ -1159,7 +1181,7 @@ else:
                 if not 0 < port < 65536:
                     return None
                 url = "http://127.0.0.1:%d" % port
-                health = http_json("GET", "/health", timeout=0.5, base_url=url)
+                health = http_json("GET", "/health", timeout=DISCOVERY_TIMEOUT, base_url=url)
                 if (not health.get("success") or not health.get("idb_path")
                         or not record.get("instance_id")
                         or any(health.get(key) != record.get(key)
@@ -1543,6 +1565,8 @@ else:
 
 
     def specialize_containers(declarations):
+        if not ENABLE_VECTOR_BOOL_LAYOUT:
+            return declarations
         # Preserve generated names: nested containers may refer to vec_bool.
         # This layout targets the user's 64-bit Linux database ABI.
         for item in declarations:

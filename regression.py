@@ -42,7 +42,7 @@ def resolve_testcase(value, test2):
 
 def cached_versions(output):
     output = re.sub(r'\x1b\[[0-9;]*m', '', output)
-    match = re.search(r'All available success versions:\s*\[([^]]*)\]', output)
+    match = re.search(r'All available (?:release\s+)?success versions:\s*\[([^]]*)\]', output)
     if not match:
         raise RuntimeError('Cannot parse qkmk -v success versions')
     return sorted(set(int(v) for v in re.findall(r'\d+', match.group(1))))

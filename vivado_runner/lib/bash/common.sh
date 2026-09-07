@@ -1,7 +1,8 @@
 #!/bin/bash
 
-WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-PROJECT_ROOT="$WORKSPACE_ROOT/vivado_runner"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# A pinned runner may execute cases in a separate SVN working copy.
+WORKSPACE_ROOT="${GALAXCORE_WORKSPACE_ROOT:-$(cd "$PROJECT_ROOT/.." && pwd)}"
 RUNTIME_DIR="$PROJECT_ROOT/runtime"
 LOG_DIR="$RUNTIME_DIR/logs"
 STATUS_DIR="$RUNTIME_DIR/status"

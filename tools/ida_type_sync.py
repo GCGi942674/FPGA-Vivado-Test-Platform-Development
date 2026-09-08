@@ -102,6 +102,22 @@ import tempfile
 import hashlib
 
 
+def member_name_matches(actual_name, requested_name):
+    # IDA may flatten inherited fields using BaseClass__original_name.
+    if "__" in requested_name:
+        return actual_name == requested_name
+    return (actual_name == requested_name or
+            (actual_name.endswith("__" + requested_name)
+             and len(actual_name) > len(requested_name) + 2))
+
+
+def converter_member_name(pattern):
+    import re
+    if "__" in pattern and re.search(r"_0x[0-9a-fA-F]+$", pattern):
+        return pattern.rsplit("__", 1)[-1]
+    return pattern
+
+
 def registry_directory():
     # A separate registry for each OS user; override on both sides if needed.
     identity = str(os.getuid()) if hasattr(os, "getuid") else os.path.expanduser("~")
@@ -386,6 +402,84 @@ if IN_IDA:
     # ========================================================
     # Local Types import
     # ========================================================
+
+    def refill_member_main(member_name, target_name, owner_name=None):
+        import re
+        def skipped(reason):
+            return {"updated": False, "message": reason}
+        til = ida_typeinf.get_idati()
+        target = ida_typeinf.tinfo_t()
+        if not target.get_named_type(til, target_name):
+            return skipped("target type unavailable")
+        hits = []
+        for ordinal in range(1, ida_typeinf.get_ordinal_qty(til)):
+            name = ida_typeinf.get_numbered_type_name(til, ordinal)
+            if not name or (owner_name and name != owner_name):
+                continue
+            tif = ida_typeinf.tinfo_t()
+            if not tif.get_numbered_type(til, ordinal) or not tif.is_udt():
+                continue
+            udt = ida_typeinf.udt_type_data_t()
+            if not tif.get_udt_details(udt):
+                continue
+            for index, member in enumerate(udt):
+                if member_name_matches(member.name, member_name):
+                    hits.append((ordinal, name, tif, udt, index))
+        if not hits:
+            return skipped("member not found")
+        if len(hits) > 1 and "__" not in member_name:
+            return skipped("ambiguous member; use full inherited name or --owner: " +
+                           ", ".join(x[1] for x in hits))
+        outcomes = []
+        for hit in hits:
+            try:
+                outcome = refill_one_member_main(hit, member_name, target_name, target, til)
+            except Exception as exc:
+                outcome = skipped("update error; inspect owner: %s" % exc)
+            outcome["owner"] = hit[1]
+            outcomes.append(outcome)
+        count = sum(1 for outcome in outcomes if outcome["updated"])
+        failures = ["%s: %s" % (o["owner"], o["message"])
+                    for o in outcomes if not o["updated"]]
+        return {"updated": count > 0, "count": count, "failures": failures,
+                "message": "%d/%d members" % (count, len(hits)), "outcomes": outcomes}
+
+
+    def refill_one_member_main(hit, member_name, target_name, target, til):
+        import re
+        def skipped(reason):
+            return {"updated": False, "message": reason}
+        ordinal, name, original, udt, index = hit
+        member = udt[index]
+        suffix = re.search(r"_0x([0-9a-fA-F]+)$", member_name)
+        if suffix and member.offset != int(suffix.group(1), 16) * 8:
+            return skipped("member offset differs from input suffix")
+        if original.is_union() or member.size != target.get_size() * 8:
+            return skipped("member size mismatch or union; manual review required")
+        before = [(m.name, m.offset, m.size, str(m.type)) for m in udt]
+        member.type = target
+        replacement = ida_typeinf.tinfo_t()
+        if not replacement.create_udt(udt, ida_typeinf.BTF_STRUCT):
+            return skipped("cannot construct updated owner")
+        check = ida_typeinf.udt_type_data_t()
+        if not replacement.get_udt_details(check):
+            return skipped("cannot verify proposed layout")
+        after = [(m.name, m.offset, m.size, str(m.type)) for m in check]
+        if (replacement.get_size() != original.get_size() or len(after) != len(before)
+                or any(a[:3] != b[:3] or (i != index and a[3] != b[3])
+                       for i, (a, b) in enumerate(zip(before, after)))):
+            return skipped("proposed owner layout changed")
+        status = replacement.set_numbered_type(til, ordinal, ida_typeinf.NTF_REPLACE, name)
+        if status != ida_typeinf.TERR_OK:
+            return skipped("saving owner failed: %s" % status)
+        saved = ida_typeinf.tinfo_t()
+        details = ida_typeinf.udt_type_data_t()
+        if (not saved.get_numbered_type(til, ordinal) or not saved.get_udt_details(details)
+                or [(m.name, m.offset, m.size, str(m.type)) for m in details] != after):
+            restored = original.set_numbered_type(til, ordinal, ida_typeinf.NTF_REPLACE, name)
+            return skipped("readback failed; rollback status=%s" % restored)
+        return {"updated": True, "message": "%s.%s -> %s" % (name, member.name, target_name)}
+
 
     def import_local_types_main(
         declaration,
@@ -771,7 +865,18 @@ if IN_IDA:
                             or request.get("idb_path") != idc.get_idb_path()):
                         return {"success": False, "stage": "selection",
                                 "error": "IDA instance/database changed; run the command again"}
-                    return import_local_types_main(declaration, type_names)
+                    result = import_local_types_main(declaration, type_names)
+                    if result.get("success") and request.get("member_name"):
+                        try:
+                            if len(type_names) != 1:
+                                result["member_update"] = {"updated": False,
+                                    "message": "multiple generated types; manual target selection required"}
+                            else:
+                                result["member_update"] = refill_member_main(
+                                    request["member_name"], type_names[0], request.get("owner"))
+                        except Exception as exc:
+                            result["member_update"] = {"updated": False, "message": str(exc)}
+                    return result
 
                 result = run_in_ida_thread(checked_import, write=True)
 
@@ -1657,7 +1762,9 @@ else:
         pattern,
         dry_run=False,
         verbose=False,
-        ida=None
+        ida=None,
+        owner=None,
+        no_refill=False
     ):
 
         # ----------------------------------------------------
@@ -1670,7 +1777,7 @@ else:
             selector = "port:" + BRIDGE_URL.rstrip("/").rsplit(":", 1)[-1]
         health = None
         if not dry_run:
-            health = select_instance(discover_instances(), pattern, selector)
+            health = select_instance(discover_instances(), converter_member_name(pattern), selector)
             BRIDGE_URL = health["url"]
 
         if verbose and health:
@@ -1698,7 +1805,7 @@ else:
         # ----------------------------------------------------
 
         converter_output = run_converter(
-            pattern
+            converter_member_name(pattern)
         )
 
         if verbose:
@@ -1806,6 +1913,8 @@ else:
             "POST",
             "/import",
             {
+                "member_name": pattern if not no_refill and re.search(r"_0x[0-9a-fA-F]+$", pattern) else None,
+                "owner": owner,
                 "instance_id": health["instance_id"],
                 "idb_path": health["idb_path"],
                 "type_names": type_names,
@@ -1887,9 +1996,16 @@ else:
                     GREEN
                 ),
                 pattern,
-                ", ".join(verified)
+                ", ".join(verified) + (
+                    " | member updated: " + result["member_update"]["message"]
+                    if result.get("member_update", {}).get("updated") else "")
             )
         )
+
+        for failure in result.get("member_update", {}).get("failures", []):
+            print("[WARN] " + failure)
+        if result.get("member_update") and not result["member_update"].get("updated"):
+            print("[WARN] Local Types imported; member not updated: " + result["member_update"]["message"])
 
         return 0
 
@@ -1935,6 +2051,8 @@ else:
 
         parser.add_argument("--list-ida", action="store_true", help="list responding IDA instances")
         parser.add_argument("--ida", help="target PID, port:NUMBER, or IDB path/name substring")
+        parser.add_argument("--owner", help="exact owner class/struct name for member refill")
+        parser.add_argument("--no-refill", action="store_true", help="import Local Types only")
         args = parser.parse_args()
         if not args.list_ida and not args.pattern:
             parser.error("pattern is required unless --list-ida is used")
@@ -1949,7 +2067,9 @@ else:
                 args.pattern,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
-                ida=args.ida
+                ida=args.ida,
+                owner=args.owner,
+                no_refill=args.no_refill
             )
 
         except ChangeError as exc:

@@ -41,6 +41,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .task_queries import list_tasks
+
 from config import (
     CONFIG_FILE,
     get_bool,
@@ -110,6 +112,8 @@ SCHEDULER_DEBUG = get_bool(
 
 LOG_LOCK = threading.Lock()
 DB_WRITE_LOCK = threading.RLock()
+REGRESSION_SERVICE_LOCK = threading.Lock()
+REGRESSION_SERVICE = None
 DB_LOCK_RETRIES = get_int(
     "database",
     "lock_retries",
@@ -303,6 +307,19 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     """Threaded HTTP server for concurrent worker requests."""
 
     daemon_threads = True
+
+
+def get_regression_service():
+    """Share one lazy background index across every GUI client."""
+    global REGRESSION_SERVICE
+    with REGRESSION_SERVICE_LOCK:
+        if REGRESSION_SERVICE is None:
+            from regression_core.service import RegressionService
+            REGRESSION_SERVICE = RegressionService(
+                DB_PATH, cache_path=os.environ.get("PJTEST_REGRESSION_CACHE_PATH"),
+            )
+            REGRESSION_SERVICE.start()
+        return REGRESSION_SERVICE
 
 
 def get_conn():
@@ -3268,6 +3285,11 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path
 
+            if path.startswith("/api/regression/"):
+                from regression_core.http import handle_get
+                handle_get(self, parsed, get_regression_service)
+                return
+
             if path == "/api/health":
                 self.send_json({"ok": True, "service": "scheduler", "time": local_now()})
                 return
@@ -3590,53 +3612,18 @@ class SchedulerHandler(BaseHTTPRequestHandler):
         limit = max(1, min(limit, TASK_API_MAX_LIMIT))
 
         conn = get_conn()
-        cur = conn.cursor()
-
-        sql = """
-            SELECT
-                t.task_id,
-                t.task_name,
-                t.template_name,
-                t.revision,
-                t.revision_policy,
-                t.resolved_zip_path,
-                t.split_mode,
-                t.result_json,
-                t.suite,
-                t.target_worker,
-                t.status,
-                t.priority,
-                t.work_root,
-                t.target_dir,
-                t.total_examples,
-                t.created_at,
-                t.started_at,
-                t.finished_at,
-                t.message,
-                COUNT(e.example_id) AS real_total,
-                SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
-                SUM(CASE WHEN e.status = 'running' THEN 1 ELSE 0 END) AS running_count,
-                SUM(CASE WHEN e.status = 'success' THEN 1 ELSE 0 END) AS success_count,
-                SUM(CASE WHEN e.status IN ('failed', 'timeout') THEN 1 ELSE 0 END) AS failed_count,
-                SUM(CASE WHEN e.status IN ('success', 'failed', 'timeout', 'canceled') THEN 1 ELSE 0 END) AS done_count
-            FROM tasks t
-            LEFT JOIN task_examples e
-                ON t.task_id = e.task_id
-        """
-        params = []
-
-        if status:
-            sql += " WHERE t.status = ?"
-            params.append(status)
-
-        sql += " GROUP BY t.task_id ORDER BY t.id DESC LIMIT ?"
-        params.append(limit)
-
-        cur.execute(sql, params)
-        rows = [row_to_dict(row) for row in cur.fetchall()]
-        conn.close()
-
-        self.send_json({"ok": True, "tasks": rows})
+        try:
+            rows = list_tasks(
+                conn, limit, status=status,
+                suite=query.get("suite", [None])[0],
+                before_id=query.get("before_id", [None])[0],
+            )
+        finally:
+            conn.close()
+        next_id = rows[-1]["id"] if len(rows) == limit else None
+        for row in rows:
+            row.pop("id", None)
+        self.send_json({"ok": True, "tasks": rows, "next_before_id": next_id})
 
     def handle_list_examples(self, parsed):
         """List examples of a task as JSON."""
@@ -3776,6 +3763,8 @@ def main():
         log_scheduler("INFO", "scheduler stopped by KeyboardInterrupt")
     finally:
         stop_event.set()
+        if REGRESSION_SERVICE is not None:
+            REGRESSION_SERVICE.close()
         server.server_close()
         reconcile_thread.join(timeout=5)
         report_thread.join(timeout=10)

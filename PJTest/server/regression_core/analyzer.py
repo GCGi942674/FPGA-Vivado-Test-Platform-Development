@@ -3,8 +3,7 @@
 """Read PJTest terminal results and derive a current regression summary."""
 
 import re
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import defaultdict, namedtuple
 
 from .identity import build_test_identity
 
@@ -35,49 +34,15 @@ STATE_ORDER = {
 }
 
 
-@dataclass(frozen=True)
-class Observation:
-    test_key: str
-    case_path: str
-    template_name: str
-    config_hash: str
-    revision: int
-    status: str
-    run_date: str
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class RevisionResult:
-    revision: int
-    status: str
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class RegressionCase:
-    test_key: str
-    case_path: str
-    template_name: str
-    config_hash: str
-    state: str
-    last_good: object
-    first_bad: object
-    last_bad: object
-    first_fixed: object
-    latest_revision: int
-    latest_status: str
-    severity: int
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class NightlyRegression:
-    test_key: str
-    case_path: str
-    template_name: str
-    success_revision: int
-    fail_revision: int
+# Immutable records without a dataclasses dependency on Python 3.6 servers.
+Observation = namedtuple("Observation", "test_key case_path template_name config_hash "
+                         "revision status run_date updated_at")
+RevisionResult = namedtuple("RevisionResult", "revision status updated_at")
+RegressionCase = namedtuple("RegressionCase", "test_key case_path template_name config_hash "
+                            "state last_good first_bad last_bad first_fixed latest_revision "
+                            "latest_status severity updated_at")
+NightlyRegression = namedtuple("NightlyRegression", "test_key case_path template_name "
+                               "success_revision fail_revision")
 
 
 def _parse_revision(value):
@@ -98,7 +63,7 @@ def _observation_status(example_status, infra_reason):
     return mapping.get(str(example_status or "").strip().lower(), "UNKNOWN")
 
 
-def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE):
+def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE, task_ids=None):
     """Load comparable terminal results from completed regression-suite tasks."""
     task_placeholders = ",".join("?" for _ in TERMINAL_TASK_STATUSES)
     example_placeholders = ",".join("?" for _ in TERMINAL_EXAMPLE_STATUSES)
@@ -124,6 +89,13 @@ def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE):
         ORDER BY t.id, e.id
     """ % (task_placeholders, example_placeholders)
     params = TERMINAL_TASK_STATUSES + TERMINAL_EXAMPLE_STATUSES + (suite,)
+    if task_ids is not None:
+        if not task_ids:
+            return [], {"terminal_rows": 0, "terminal_attempts": 0,
+                        "loaded_observations": 0, "skipped_non_numeric_revision": 0}
+        clause = " AND e.task_id IN (%s) " % ",".join("?" for _ in task_ids)
+        query = query.replace("ORDER BY t.id, e.id", clause + " ORDER BY t.id, e.id")
+        params += tuple(task_ids)
     rows = conn.execute(query, params).fetchall()
 
     attempt_query = """
@@ -152,6 +124,11 @@ def load_observations(conn, suite=DEFAULT_REGRESSION_SUITE):
         + TERMINAL_EXAMPLE_STATUSES
         + (suite,)
     )
+    if task_ids is not None:
+        clause = (" AND a.example_id IN (SELECT example_id FROM task_examples "
+                  "WHERE task_id IN (%s)) " % ",".join("?" for _ in task_ids))
+        attempt_query = attempt_query.replace("ORDER BY a.id", clause + " ORDER BY a.id")
+        attempt_params += tuple(task_ids)
     attempts_by_example = defaultdict(list)
     for attempt in conn.execute(attempt_query, attempt_params).fetchall():
         attempts_by_example[attempt["example_id"]].append(attempt)

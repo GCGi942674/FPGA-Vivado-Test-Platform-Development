@@ -819,63 +819,46 @@ def cmd_list(args):
         print("No tasks found.")
         return
 
-    header = (
-        "%-18s %-10s %-12s %-12s %-22s %5s %5s %7s %6s %7s %5s %7s %-13s %-8s %s"
-        % (
-            "TASK_ID",
-            "TEMPLATE",
-            "REV",
-            "STATUS",
-            "TARGET",
-            "TOTAL",
-            "DONE",
-            "SUCCESS",
-            "FAILED",
-            "RUNNING",
-            "STALE",
-            "PENDING",
-            "PROGRESS",
-            "PRI",
-            "CREATED_AT",
-        )
+    headers = (
+        "TASK_ID", "TEMPLATE", "REV", "STATUS", "SUCCESS", "FAILED",
+        "RUNNING", "PENDING", "PROGRESS", "CREATED_AT",
     )
-    print(header)
-    print("-" * len(header))
-
+    display_rows = []
     for row in rows:
         total = row["real_total"] or row["total_examples"] or 0
         done = row["done_count"] or 0
         success = row["success_count"] or 0
-        failed = row["failed_count"] or 0
-        running = row["active_running_count"] or 0
-        stale = row["stale_running_count"] or 0
-        pending = row["pending_count"] or 0
-
-        if total > 0:
-            progress = "%d/%d %.1f%%" % (done, total, done * 100.0 / total)
-        else:
-            progress = "-"
-
-        print(
-            "%-18s %-10s %-12s %-12s %-22s %5d %5d %7d %6d %7d %5d %7d %-13s %-8s %s"
-            % (
-                format_short(row["task_id"], 18),
-                format_short(row["template_name"], 10),
-                format_short(format_revision(row), 12),
-                format_short(row["status"], 12),
-                format_short(row["target_dir"], 22),
-                total,
-                done,
-                success,
-                failed,
-                running,
-                stale,
-                pending,
-                progress,
-                row["priority"],
-                row["created_at"],
-            )
+        progress = (
+            "%d/%d %.1f%%" % (done, total, success * 100.0 / total)
+            if total > 0 else "-"
         )
+        values = (
+            row["task_id"], row["template_name"], format_revision(row),
+            row["status"], success, row["failed_count"] or 0,
+            row["active_running_count"] or 0, row["pending_count"] or 0,
+            progress, row["created_at"],
+        )
+        display_rows.append(tuple("-" if value is None else str(value)
+                                  for value in values))
+
+    # Size columns from the complete result set; keep full paths on detail lines.
+    widths = [max(len(header), *(len(row[i]) for row in display_rows))
+              for i, header in enumerate(headers)]
+
+    def render(values):
+        return "  ".join(
+            value.rjust(widths[i]) if 4 <= i <= 8
+            else value.ljust(widths[i])
+            for i, value in enumerate(values)
+        ).rstrip()
+
+    print(render(headers))
+    print("  ".join("-" * width for width in widths))
+    for row, values in zip(rows, display_rows):
+        print(render(values))
+        print("  TARGET: %s" % (row["target_dir"] or "-"))
+        print()
+
 
 def cmd_examples(args):
     """List examples for a parent task."""

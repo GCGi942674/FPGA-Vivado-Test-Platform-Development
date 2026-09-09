@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Read-only regression endpoints with bounded concurrent query admission."""
 
 import sqlite3
@@ -11,7 +12,7 @@ QUERY_SLOTS = threading.BoundedSemaphore(8)
 
 def handle_get(handler, parsed, service_factory):
     if not QUERY_SLOTS.acquire(False):
-        handler.send_json({"ok": False, "error": "查询繁忙，请稍后刷新。"}, status=503)
+        handler.send_json({"ok": False, "error": "Queries are busy. Refresh again shortly."}, status=503)
         return
     try:
         service = service_factory()
@@ -27,7 +28,7 @@ def handle_get(handler, parsed, service_factory):
             result = service.evidence(query)
         elif action == "export":
             if not service.status().get("ready"):
-                raise ViewError("回归索引正在首次生成，请稍后导出。", 503)
+                raise ViewError("Initial regression cache is building. Export again shortly.", 503)
             body = service.export(query).encode("utf-8-sig")
             handler.send_response(200)
             handler.send_header("Content-Type", "text/plain; charset=utf-8")

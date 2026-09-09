@@ -50,7 +50,7 @@ def main():
                 patch.object(scheduler, "log_scheduler"):
             thread.start()
             window = Window("http://127.0.0.1:%d" % server.server_port)
-            window.setWindowTitle("PJTest · 模拟数据 · 本地交互验收")
+            window.setWindowTitle("PJTest · Demo data - Local integration check")
             window.show()
             try:
                 wait_for(lambda: window.total == 1 and len(window.history_rows) == 2, "initial list / history")

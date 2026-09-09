@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Shared read-only regression view; source scheduler data is never modified."""
 
 import csv
@@ -303,7 +304,7 @@ class RegressionService:
             conn.execute("BEGIN")
             meta = self._meta(conn)
             if generation not in (None, "") and int(generation) != meta["generation"]:
-                raise ViewError("数据已刷新，请重新加载列表。", 409)
+                raise ViewError("Data has changed. Reload the list.", 409)
             yield conn, meta
         finally:
             conn.close()
@@ -361,7 +362,7 @@ class RegressionService:
         with self.snapshot(query.get("generation")) as (conn, meta):
             count = conn.execute("SELECT COUNT(*) FROM cases" + where, args).fetchone()[0]
             if count > 100000:
-                raise ViewError("导出超过 100000 行，请先缩小筛选范围。", 413)
+                raise ViewError("Export exceeds 100000 rows. Narrow the filters first.", 413)
             stream = io.StringIO()
             stream.write("PJTEST REGRESSION\nSnapshot: %s\nRows: %d\n\n" %
                          (meta.get("updated_at", "not ready"), count))
@@ -391,7 +392,7 @@ class RegressionService:
                 "WHERE e.example_id=? AND t.suite=?", (example_id, "daily_regression"),
             ).fetchone()
             if row is None:
-                raise ViewError("该 nightly 用例记录不存在。", 404)
+                raise ViewError("Nightly example record not found.", 404)
             attempts = conn.execute(
                 "SELECT attempt_id, attempt_no, worker_name, revision, status, exit_code, "
                 "infra_reason, log_file, substr(log_tail,-4000) AS log_tail "

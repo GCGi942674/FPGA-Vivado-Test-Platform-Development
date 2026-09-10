@@ -20,6 +20,8 @@ def handle_get(handler, parsed, service_factory):
         action = parsed.path.rsplit("/", 1)[-1]
         if action == "status":
             result = service.status()
+        elif action in ("matrix", "compare"):
+            result = getattr(service, action)(query)
         elif action == "cases":
             result = service.cases(query)
         elif action == "history":

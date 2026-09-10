@@ -19,7 +19,7 @@ def main():
         "regression_gui", str(Path(__file__).resolve().parents[2] / "regression_gui.py"))
     gui = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gui)
-    QtCore, QtWidgets, Window = gui.load_ui()
+    QtCore, QtWidgets, Window = gui.load_legacy_ui()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     # Windows offscreen Qt does not discover system fonts automatically.
     if sys.platform == "win32":

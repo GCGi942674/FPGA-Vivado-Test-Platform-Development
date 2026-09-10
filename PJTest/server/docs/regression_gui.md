@@ -1,5 +1,7 @@
 # Qt5 回归工作台（只读）
 
+新版三个页面（All cases / History / Compare）的部署请使用 [results_browser.md](results_browser.md)。客户端现在需要同时复制 `regression_gui.py` 和 `results_ui.py`；以下内容保留为旧 nightly 界面的说明。
+
 客户端提供分类、模块和最新结果版本筛选、用例搜索、分页历史、日志/重试摘录，以及全部匹配结果的 TXT 导出。没有修改、取消任务或重跑入口。
 
 ## 服务端更新

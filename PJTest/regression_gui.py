@@ -39,6 +39,11 @@ def prepare_qt(qt_root=None):
 
 
 def load_ui():
+    from results_ui import load_ui as load_results_ui
+    return load_results_ui()
+
+
+def load_legacy_ui():
     from PyQt5 import QtCore, QtGui, QtWidgets
 
     categories = [

@@ -114,6 +114,7 @@ LOG_LOCK = threading.Lock()
 DB_WRITE_LOCK = threading.RLock()
 REGRESSION_SERVICE_LOCK = threading.Lock()
 REGRESSION_SERVICE = None
+RESULTS_SERVICE = None
 DB_LOCK_RETRIES = get_int(
     "database",
     "lock_retries",
@@ -307,6 +308,16 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     """Threaded HTTP server for concurrent worker requests."""
 
     daemon_threads = True
+
+
+def get_results_service():
+    global RESULTS_SERVICE
+    with REGRESSION_SERVICE_LOCK:
+        if RESULTS_SERVICE is None:
+            from regression_core.results import ResultsService
+            RESULTS_SERVICE = ResultsService(DB_PATH, os.environ.get("PJTEST_RESULTS_CACHE_PATH"))
+            RESULTS_SERVICE.start()
+        return RESULTS_SERVICE
 
 
 def get_regression_service():
@@ -3285,6 +3296,11 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             path = parsed.path
 
+            if path.startswith("/api/results/"):
+                from regression_core.http import handle_get
+                handle_get(self, parsed, get_results_service)
+                return
+
             if path.startswith("/api/regression/"):
                 from regression_core.http import handle_get
                 handle_get(self, parsed, get_regression_service)
@@ -3765,6 +3781,8 @@ def main():
         stop_event.set()
         if REGRESSION_SERVICE is not None:
             REGRESSION_SERVICE.close()
+        if RESULTS_SERVICE is not None:
+            RESULTS_SERVICE.close()
         server.server_close()
         reconcile_thread.join(timeout=5)
         report_thread.join(timeout=10)

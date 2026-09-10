@@ -1,5 +1,6 @@
 """Actual Qt controls against a real HTTP server with fixture source data."""
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -33,20 +34,35 @@ def main():
         seed(source)
         service=ResultsService(source)
         service.refresh()
+        matrix=service.matrix
+        attempts=[0]
+        def fail_once(query):
+            attempts[0]+=1
+            if attempts[0]==1:
+                raise sqlite3.OperationalError('temporary test failure')
+            return matrix(query)
         server=scheduler.ThreadingHTTPServer(('127.0.0.1',0),scheduler.SchedulerHandler)
         thread=threading.Thread(target=server.serve_forever,daemon=True)
-        with patch.object(scheduler,'get_results_service',return_value=service),patch.object(scheduler,'log_scheduler'):
+        with patch.object(scheduler,'get_results_service',return_value=service),patch.object(scheduler,'log_scheduler'), \
+                patch.object(service,'matrix',side_effect=fail_once):
             thread.start()
             window=Window('http://127.0.0.1:%d' % server.server_port)
             window.show()
             try:
+                wait(lambda:window.pages[0].get('retry'))
+                window.poll_status()
                 wait(lambda:window.pages[0]['total']==4)
+                assert attempts[0]>=2 and not window.pages[0]['retry']
                 p=window.pages[0]
                 assert p['table'].editTriggers()==QtWidgets.QAbstractItemView.NoEditTriggers
                 row=next(i for i,r in enumerate(p['rows']) if r['name']=='fir')
                 window.select(row,2)
                 wait(lambda:'PAST RUNS' in p['details'].toPlainText())
                 assert 'SAMPLE: stage assertion' in p['details'].toPlainText()
+                shots=os.environ.get('PJTEST_RESULTS_SCREENSHOTS')
+                if shots:
+                    app.processEvents()
+                    window.grab().save(str(Path(shots)/'details.png'))
                 p['details'].hide()
                 app.processEvents()
                 assert window.tabs.tabText(1)=='History'

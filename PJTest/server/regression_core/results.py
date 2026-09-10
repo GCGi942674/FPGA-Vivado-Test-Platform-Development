@@ -149,6 +149,12 @@ class ResultsService:
                         changed = True
                 meta = dict(ready=True, generation=old.get('generation', 0) + int(changed or not old.get('ready')),
                             updated_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                # Build filter catalogs once per refresh, not on every status poll.
+                meta.update(stages=list(dict.fromkeys(STAGES + [r[0] for r in c.execute('SELECT DISTINCT stage FROM runs ORDER BY stage')])),
+                            versions=[r[0] for r in c.execute('SELECT DISTINCT version FROM runs ORDER BY CAST(version AS INTEGER) DESC,version DESC')],
+                            dates=[r[0] for r in c.execute("SELECT DISTINCT day FROM runs WHERE day<>'' ORDER BY day DESC")])
+                if 'stages' not in old and meta['generation']==old.get('generation',0):
+                    meta['generation'] += 1
                 c.execute('INSERT OR REPLACE INTO meta VALUES(1,?)', (encode(meta),))
                 c.commit()
         finally:
@@ -175,9 +181,8 @@ class ResultsService:
 
     def status(self):
         with self.snapshot({}) as (c, meta):
-            meta.update(stages=list(dict.fromkeys(STAGES + [r[0] for r in c.execute('SELECT DISTINCT stage FROM runs ORDER BY stage')])),
-                        versions=[r[0] for r in c.execute('SELECT DISTINCT version FROM runs ORDER BY CAST(version AS INTEGER) DESC,version DESC')],
-                        dates=[r[0] for r in c.execute("SELECT DISTINCT day FROM runs WHERE day<>'' ORDER BY day DESC")])
+            if 'stages' not in meta:
+                meta.update(ready=False,stages=STAGES,versions=[],dates=[])
         meta.update(syncing=self.syncing, error=self.error, processed_tasks=self.processed)
         return meta
 

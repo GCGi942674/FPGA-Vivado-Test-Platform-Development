@@ -8,10 +8,13 @@ from urllib.parse import parse_qs
 from .service import ViewError
 
 QUERY_SLOTS = threading.BoundedSemaphore(8)
+STATUS_SLOTS = threading.BoundedSemaphore(2)
 
 
 def handle_get(handler, parsed, service_factory):
-    if not QUERY_SLOTS.acquire(False):
+    action = parsed.path.rsplit("/", 1)[-1]
+    slots = STATUS_SLOTS if action == "status" else QUERY_SLOTS
+    if not slots.acquire(False):
         handler.send_json({"ok": False, "error": "Queries are busy. Refresh again shortly."}, status=503)
         return
     try:
@@ -48,8 +51,9 @@ def handle_get(handler, parsed, service_factory):
     except (ValueError, TypeError) as exc:
         handler.send_json({"ok": False, "error": str(exc)}, status=400)
     except sqlite3.OperationalError as exc:
+        handler.log_message("query failed action=%s error=%s", action, str(exc))
         handler.send_json({"ok": False, "error": str(exc)}, status=503)
     except (BrokenPipeError, ConnectionResetError):
         pass
     finally:
-        QUERY_SLOTS.release()
+        slots.release()

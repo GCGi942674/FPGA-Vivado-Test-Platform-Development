@@ -2,11 +2,14 @@
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import Mock
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from test_regression_view import create_source, add_task
 from regression_core.results import ResultsService
 from regression_core.service import ViewError
+from regression_core.http import handle_get, QUERY_SLOTS
 
 
 def seed(path):
@@ -40,6 +43,27 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.service.matrix({'source':'other'})['total'],1)
         self.assertEqual(self.service.matrix({'stage':'report_utilization','result':'No result'})['total'],4)
         self.assertEqual(self.service.matrix({'trend':'New fail'})['total'],1)
+
+    def test_status_uses_published_metadata_without_scanning_runs(self):
+        with self.service.connect() as c:
+            c.execute('ALTER TABLE runs RENAME TO unavailable_runs')
+            c.commit()
+        status=self.service.status()
+        self.assertTrue(status['ready'])
+        self.assertIn('18300',status['versions'])
+
+    def test_status_has_capacity_when_query_slots_full(self):
+        handler=Mock()
+        acquired=0
+        try:
+            while QUERY_SLOTS.acquire(False):
+                acquired+=1
+            handle_get(handler,urlparse('/api/results/status'),lambda:self.service)
+            self.assertTrue(handler.send_json.call_args[0][0]['ok'])
+            self.assertNotIn('status',handler.send_json.call_args[1])
+        finally:
+            for _ in range(acquired):
+                QUERY_SLOTS.release()
 
     def test_concurrent_reads_keep_source_unchanged(self):
         before=self.source.read_bytes()

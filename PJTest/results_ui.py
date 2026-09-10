@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Native Qt5 result browser. Network jobs never run on the GUI thread."""
 import json
+import html
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, ProxyHandler, build_opener
 from urllib.error import HTTPError
@@ -11,6 +12,113 @@ def load_ui():
     colors = {'Pass':('#eaf8ef','#277448'), 'Fail':('#fff0f1','#b54450'),
               'Running':('#edf3ff','#406ab1'), 'Waiting':('#fff8e6','#957225'),
               'Timeout':('#fff3e7','#a66a2c'), 'Canceled':('#f0f1f5','#748092')}
+    colors.update({'No result':('#f5f6f8','#8b95a5'),'All pass':('#eefbf3','#16834f'),
+                   'All fail':('#fff1f2','#c52d48'),'New fail':('#fff5ed','#c76826'),
+                   'Fixed':('#eafbf8','#168e81'),'Pass + Fail':('#f7f0ff','#935aca'),
+                   'Still fail':('#fff5ed','#b96a28'),'Still pass':('#f3f5f8','#7a8496'),
+                   'Unknown':('#f3f5f8','#7a8496'),'Other':('#f3f5f8','#7a8496')})
+
+    class ResultDelegate(QtWidgets.QStyledItemDelegate):
+        """Compact name/path cells and small badges matching the supplied design."""
+        def __init__(self,kind,parent):
+            super().__init__(parent)
+            self.kind=kind
+
+        def paint(self,painter,option,index):
+            painter.save()
+            painter.setClipRect(option.rect)
+            rect=option.rect
+            selected=bool(option.state & QtWidgets.QStyle.State_Selected)
+            hovered=bool(option.state & QtWidgets.QStyle.State_MouseOver)
+            painter.fillRect(rect,QtGui.QColor('#edf4ff' if selected else '#f3f7fc' if hovered else
+                                              '#ffffff' if index.row()%2==0 else '#fafbfd'))
+            painter.setPen(QtGui.QColor('#edf0f5'))
+            painter.drawLine(rect.bottomLeft(),rect.bottomRight())
+            text=str(index.data() or '')
+            lines=text.split('\n')
+            font=QtGui.QFont(option.font)
+            font.setPixelSize(11)
+            painter.setFont(font)
+            def line(value,y,color='#526078',size=11,bold=False):
+                f=QtGui.QFont(font)
+                f.setPixelSize(size)
+                f.setBold(bold)
+                painter.setFont(f)
+                painter.setPen(QtGui.QColor(color))
+                value=QtGui.QFontMetrics(f).elidedText(value,QtCore.Qt.ElideRight,max(0,rect.width()-24))
+                painter.drawText(QtCore.QRect(rect.x()+12,y,rect.width()-24,16),QtCore.Qt.AlignVCenter|QtCore.Qt.TextSingleLine,value)
+            if index.column()==0:
+                line(lines[0],rect.center().y()-17,'#25354c',11,True)
+                if len(lines)>1:
+                    line(lines[1],rect.center().y()+1,'#96a0b2',10)
+            elif self.kind=='history' and index.column()==7:
+                for n,status in enumerate(text.split()):
+                    key={'P':'Pass','F':'Fail','R':'Running','W':'Waiting','T':'Timeout'}.get(status,'Unknown')
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(QtGui.QColor(colors[key][1]))
+                    painter.drawRoundedRect(QtCore.QRectF(rect.x()+12+n*10,rect.center().y()-4,8,8),2,2)
+            elif lines[0] in colors:
+                bg,fg=colors[lines[0]]
+                f=QtGui.QFont(font)
+                f.setPixelSize(10)
+                painter.setFont(f)
+                dot=self.kind=='matrix' and index.column()>1 or self.kind=='history' and index.column()==4
+                width=min(rect.width()-20,QtGui.QFontMetrics(f).horizontalAdvance(lines[0])+12+(8 if dot else 0))
+                y=rect.y()+9 if len(lines)>1 else rect.center().y()-9
+                badge=QtCore.QRectF(rect.x()+12,y,width,18)
+                painter.setRenderHint(QtGui.QPainter.Antialiasing)
+                painter.setPen(QtGui.QPen(QtGui.QColor(fg).lighter(180),.7))
+                painter.setBrush(QtGui.QColor(bg))
+                painter.drawRoundedRect(badge,2,2)
+                if dot:
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(QtGui.QColor(fg))
+                    painter.drawEllipse(QtCore.QPointF(rect.x()+18,y+9),2,2)
+                painter.setPen(QtGui.QColor(fg))
+                painter.drawText(badge.adjusted(6+(8 if dot else 0),0,-4,0),QtCore.Qt.AlignVCenter,lines[0])
+                if len(lines)>1:
+                    parts=lines[1].split('  |  ')
+                    line(parts[0],rect.y()+29,'#8290a5',10)
+                    if len(parts)>1:
+                        line(parts[1],rect.y()+43,'#9ba5b6',10)
+            else:
+                line(lines[0],rect.center().y()-8,'#cc4055' if index.column()==index.model().columnCount()-1 and text!='-' else '#617087')
+                if len(lines)>1:
+                    line(lines[1],rect.center().y()+8,'#929eb1',10)
+            painter.restore()
+
+    class DetailPanel(QtWidgets.QTextBrowser):
+        """Read-only, selectable details with a visual hierarchy instead of raw text."""
+        def __init__(self):
+            super().__init__()
+            self.raw=''
+            self.setOpenLinks(False)
+            self.setStyleSheet('QTextBrowser {background:white;border:0;border-left:1px solid #e2e7ef;padding:16px;}')
+
+        def setPlainText(self,text):
+            self.raw=text
+            blocks=[]
+            for line in text.splitlines():
+                safe=html.escape(line)
+                if not line:
+                    blocks.append('<div style="height:12px"></div>')
+                elif line.startswith('Result: '):
+                    value=line[8:]
+                    bg,fg=colors.get(value,('#f3f5f8','#617087'))
+                    blocks.append('<p style="color:%s;background-color:%s;font-size:15px"><b>%s</b></p>' % (fg,bg,html.escape(value)))
+                elif line.startswith('Fail reason: '):
+                    blocks.append('<p style="color:#8c98aa;font-size:10px">FAIL REASON</p><p style="color:#b24a58">%s</p>' % html.escape(line[13:]))
+                elif line.startswith('PAST RUNS'):
+                    blocks.append('<hr><p><b>%s</b></p>' % safe)
+                elif ': ' in line:
+                    key,value=line.split(': ',1)
+                    blocks.append('<p><span style="color:#8a96aa">%s</span>&nbsp;&nbsp; %s</p>' % (html.escape(key),html.escape(value)))
+                else:
+                    blocks.append('<p>%s</p>' % safe)
+            self.setHtml('<html><body style="font-family:sans-serif;font-size:11px;color:#425169">'+''.join(blocks)+'</body></html>')
+
+        def appendPlainText(self,text):
+            self.setPlainText(self.raw+'\n'+text)
 
     class Signals(QtCore.QObject):
         done = QtCore.pyqtSignal(int, object, object)
@@ -37,27 +145,34 @@ def load_ui():
                         pass
                     if exc.code == 404:
                         message = 'Update scheduler: results API not found.'
-                self.signals.done.emit(self.token,None,message)
+                self.signals.done.emit(self.token,None,dict(message=message,status=getattr(exc,'code',0)))
 
     class Window(QtWidgets.QMainWindow):
         def __init__(self,url):
             super().__init__()
             self.setWindowTitle('PJTest - Test Results')
-            self.resize(1380,860)
+            self.resize(1440,900)
             self.setMinimumSize(1000,680)
             self.setStyleSheet('''
-                QMainWindow,QWidget {font-size:12px;color:#35445a;}
-                QMainWindow {background:#f6f8fb;}
-                QLineEdit,QComboBox,QPushButton {background:white;border:1px solid #dbe2eb;border-radius:4px;padding:6px;}
+                QMainWindow,QWidget {font-size:11px;color:#526078;}
+                QMainWindow {background:white;}
+                QLineEdit,QComboBox,QPushButton {background:white;border:1px solid #dbe2eb;border-radius:3px;padding:5px;}
                 QPushButton:hover {background:#edf3fc;}
                 QPushButton:disabled {color:#a6afbd;}
-                QTabWidget::pane {border:1px solid #e0e5ed;background:white;}
-                QTabBar::tab {padding:12px 24px;background:white;}
+                QTabWidget::pane {border:0;border-top:1px solid #e0e5ed;background:white;}
+                QTabBar::tab {padding:10px 23px;background:white;}
                 QTabBar::tab:selected {color:#3769b7;border-bottom:2px solid #759bdb;}
                 QTableWidget {background:white;alternate-background-color:#fafbfd;border:0;selection-background-color:#eaf1fc;selection-color:#263f64;}
-                QHeaderView::section {background:#f1f4f8;border:0;padding:9px;color:#617088;}
+                QHeaderView::section {background:#f3f4f7;border:0;border-bottom:1px solid #e1e5ed;padding:7px 12px;color:#617088;font-size:10px;}
                 QPlainTextEdit {background:#fafbfd;border:1px solid #e1e7ef;padding:10px;}
-                QLabel#brand {font-size:18px;font-weight:600;color:#315983;}
+                QLabel#brand {font-size:12px;font-weight:600;color:#91c9ff;}
+                QWidget#titlebar {background:#1e2330;}
+                QWidget#titlebar QLabel {color:#cad3df;}
+                QLabel#connection {color:#47c28b;background:#164f3e;padding:2px 6px;border-radius:3px;}
+                QScrollBar:vertical {background:#f7f8fa;width:9px;}
+                QScrollBar::handle:vertical {background:#cdd3dc;border-radius:4px;min-height:24px;}
+                QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {height:0;}
+                QSplitter::handle {background:#e8edf4;width:1px;}
             ''')
             self.pool = QtCore.QThreadPool(self)
             self.pool.setMaxThreadCount(4)
@@ -66,26 +181,32 @@ def load_ui():
             self.pages = []
             central = QtWidgets.QWidget()
             outer = QtWidgets.QVBoxLayout(central)
-            outer.setContentsMargins(16,12,16,12)
+            outer.setContentsMargins(0,0,0,0)
+            outer.setSpacing(0)
             self.setCentralWidget(central)
-            top = QtWidgets.QHBoxLayout()
-            brand = QtWidgets.QLabel('PJTest  |  Test Results')
+            titlebar=QtWidgets.QWidget()
+            titlebar.setObjectName('titlebar')
+            top = QtWidgets.QHBoxLayout(titlebar)
+            top.setContentsMargins(14,5,12,5)
+            brand = QtWidgets.QLabel('PJTEST  |  Test Results Viewer')
             brand.setObjectName('brand')
             top.addWidget(brand)
             top.addStretch()
             self.connection = QtWidgets.QLabel('Not connected')
+            self.connection.setObjectName('connection')
             top.addWidget(self.connection)
             self.server = QtWidgets.QLineEdit(url)
-            self.server.setFixedWidth(300)
+            self.server.setFixedWidth(240)
             top.addWidget(self.server)
             self.button(top,'Load / Update',self.reload)
-            outer.addLayout(top)
+            outer.addWidget(titlebar)
             self.tabs = QtWidgets.QTabWidget()
             outer.addWidget(self.tabs,1)
             for kind,title in [('matrix','All cases'),('history','History'),('compare','Compare')]:
                 self.build_page(kind,title)
             self.message = QtWidgets.QLabel('')
             self.message.setWordWrap(True)
+            self.message.setStyleSheet('color:#8793a7;font-size:10px;padding:3px 12px;')
             outer.addWidget(self.message)
             self.tabs.currentChanged.connect(self.change_tab)
             self.debounce = QtCore.QTimer(self)
@@ -111,17 +232,26 @@ def load_ui():
             return w
 
         def build_page(self,kind,title):
-            page = dict(kind=kind,offset=0,total=0,rows=[],filters={})
+            page = dict(kind=kind,offset=0,total=0,rows=[],filters={},boxes={})
             widget = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout(widget)
-            layout.setContentsMargins(10,10,10,8)
+            layout.setContentsMargins(0,10,0,6)
+            layout.setSpacing(6)
             controls = QtWidgets.QHBoxLayout()
+            controls.setContentsMargins(12,0,12,0)
+            controls.setSpacing(7)
             def add(label,key,w):
                 box=QtWidgets.QVBoxLayout()
                 box.setSpacing(3)
-                box.addWidget(QtWidgets.QLabel(label))
+                if kind!='matrix':
+                    caption=QtWidgets.QLabel(label.upper())
+                    caption.setStyleSheet('font-size:9px;color:#96a0b2;')
+                    box.addWidget(caption)
+                w.setFixedWidth(170 if key=='stage' else 185 if key=='q' else 105)
+                w.setToolTip(label)
                 box.addWidget(w)
                 controls.addLayout(box)
+                page['boxes'][key]=box
                 page['filters'][key]=w
                 if isinstance(w,QtWidgets.QLineEdit):
                     w.textChanged.connect(self.text_changed)
@@ -151,10 +281,19 @@ def load_ui():
                         w.setMaximumWidth(110)
             add('Result','result',self.combo([('All','')]+[(v,v) for v in results]))
             add('Source','source',self.combo([('All tests',''),('Daily tests','daily'),('Other tests','other')]))
+            order = (['q','trend','result','stage','source'] if kind=='matrix' else
+                     ['mode','left','right','result','stage','q','source'] if kind=='compare' else
+                     ['q','stage','version','from','to','result','source'])
+            for box in page['boxes'].values():
+                controls.removeItem(box)
+            for i,key in enumerate(order):
+                controls.insertLayout(i,page['boxes'][key])
             self.button(controls,'Clear',self.clear)
+            controls.addStretch()
             self.button(controls,'Save TXT',self.export_txt)
             layout.addLayout(controls)
             page['summary']=QtWidgets.QLabel('Loading...')
+            page['summary'].setStyleSheet('font-size:10px;color:#7d8aa0;padding:0 12px;')
             layout.addWidget(page['summary'])
             split=QtWidgets.QSplitter()
             table=QtWidgets.QTableWidget()
@@ -163,13 +302,16 @@ def load_ui():
             table.setShowGrid(False)
             table.setAlternatingRowColors(True)
             table.verticalHeader().hide()
-            table.verticalHeader().setDefaultSectionSize(70 if kind=='matrix' else 52)
+            table.verticalHeader().setDefaultSectionSize(66 if kind=='matrix' else 54)
+            table.setMouseTracking(True)
+            table.setItemDelegate(ResultDelegate(kind,table))
+            table.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignLeft|QtCore.Qt.AlignVCenter)
             table.horizontalHeader().setMinimumSectionSize(95)
             table.setWordWrap(False)
             table.cellClicked.connect(self.select)
             table.horizontalHeader().sectionClicked.connect(self.sort)
             split.addWidget(table)
-            details=QtWidgets.QPlainTextEdit()
+            details=DetailPanel()
             details.setReadOnly(True)
             details.setMinimumWidth(280)
             details.hide()
@@ -178,17 +320,19 @@ def load_ui():
             page.update(table=table,details=details)
             layout.addWidget(split,1)
             footer=QtWidgets.QHBoxLayout()
+            footer.setContentsMargins(12,0,12,0)
             footer.addWidget(QtWidgets.QLabel('Rows per page:'))
             page['size']=self.combo([(str(n),n) for n in (15,30,50,100)])
+            page['size'].setFixedWidth(55)
             page['size'].currentIndexChanged.connect(self.filters_changed)
             footer.addWidget(page['size'])
             page['pager']=QtWidgets.QLabel('')
-            footer.addWidget(page['pager'])
             footer.addStretch()
             self.button(footer,'Hide details',lambda: details.hide())
             self.button(footer,'More details',self.more_details)
             if kind=='matrix':
                 self.button(footer,'Full history',self.view_history)
+            footer.addWidget(page['pager'])
             page['back']=self.button(footer,'Back',lambda: self.turn(-1))
             page['next']=self.button(footer,'Next',lambda: self.turn(1))
             layout.addLayout(footer)
@@ -451,10 +595,26 @@ def load_ui():
             if p['kind']!='matrix':
                 table.setColumnWidth(1,190)
             table.horizontalHeader().setStretchLastSection(True)
+            if p['kind']=='matrix':
+                table.setColumnWidth(0,290)
+                table.setColumnWidth(1,130)
+                for j in range(2,len(headers)):
+                    table.horizontalHeader().setSectionResizeMode(j,QtWidgets.QHeaderView.Stretch)
+            elif p['kind']=='history':
+                for j,width in enumerate([250,195,135,85,95,145,75,105,190]):
+                    table.setColumnWidth(j,width)
             size=p['size'].currentData()
             p['pager'].setText('Page %d / %d' % (p['offset']//size+1,max(1,(p['total']+size-1)//size)))
             p['summary'].setText('%s %s found' % (p['total'],'cases' if p['kind']=='matrix' else 'records')+
                 ('   |   '+('Stage results: ' if p['kind']=='matrix' else '')+'   '.join('%s %s' % (k,v) for k,v in data['counts'].items()) if 'counts' in data else ''))
+            if data.get('counts'):
+                chips=[]
+                for label,count in data['counts'].items():
+                    bg,fg=colors.get(label,('#f5f6f8','#7e899c'))
+                    chips.append('<span style="background-color:%s;color:%s">&nbsp;%s %s&nbsp;</span>' %
+                                 (bg,fg,html.escape(label),count))
+                p['summary'].setText('%s %s &nbsp; | &nbsp; %s' %
+                    (p['total'],'cases - stage results' if p['kind']=='matrix' else 'records',' &nbsp; '.join(chips)))
             p['back'].setEnabled(p['offset']>0)
             p['next'].setEnabled(p['offset']+size<p['total'])
 
@@ -464,7 +624,13 @@ def load_ui():
             if epoch!=self.epoch or self.latest.get((kind,id(p)))!=token:
                 return
             if error:
-                self.message.setText(error)
+                message=error.get('message','Request failed') if isinstance(error,dict) else str(error)
+                self.message.setText(message)
+                if p is not None and kind==p['kind'] and extra!='detail':
+                    p['retry']=True
+                    p['summary'].setText('Load failed. Will retry: '+message)
+                if isinstance(error,dict) and error.get('status')==409:
+                    self.generation=None
                 if kind=='status':
                     self.connection.setText('Connection failed')
                 return
@@ -493,6 +659,8 @@ def load_ui():
                         page['offset']=0
                     self.populate_compare(preserve=True)
                     self.fetch()
+                elif self.current().get('retry') and not any(v[2]==self.current()['kind'] and v[3] is self.current() for v in self.jobs.values()):
+                    self.fetch()
             elif kind=='export':
                 out=QtCore.QSaveFile(extra)
                 if not out.open(QtCore.QIODevice.WriteOnly) or out.write(data)!=len(data) or not out.commit():
@@ -505,6 +673,7 @@ def load_ui():
                     '\n'.join('%s | r%s | %s | %s' % (r['day'],r['version'],r['result'],r['failed_reason'] or '-') for r in data['items'])+
                     '\n\nUse History for all past runs.')
             else:
+                p['retry']=False
                 self.fill(p,data)
 
         def closeEvent(self,event):

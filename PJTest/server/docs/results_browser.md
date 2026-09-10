@@ -103,6 +103,15 @@ The cache writer uses a single transaction and readers retain a committed snapsh
 Client requests are asynchronous and obsolete responses are ignored. Exports are
 saved locally using Qt atomic file saving. Close asks Yes/No, default No.
 
+Status requests have two separate admission slots and read a prebuilt metadata
+record; they no longer scan the runs table for filter choices at every poll.
+Existing caches publish this metadata on the next successful background refresh.
+Failed page loads retry after the next successful status poll even if the cache
+generation has not changed. SQLite 503 errors include the query action and cause
+in scheduler logs as well as the JSON error response. These changes require
+updating regression_core/http.py, regression_core/results.py and results_ui.py,
+then restarting scheduler and the client; do not delete the cache.
+
 ## Verification
 
 Local checks include fixtures for every page, multiple sources/stages, conflicting

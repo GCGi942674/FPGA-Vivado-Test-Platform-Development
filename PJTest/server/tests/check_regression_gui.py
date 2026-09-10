@@ -66,7 +66,7 @@ def main():
                 wait_for(lambda: window.rows and window.rows[0]["category"] == "FLAKY"
                          and window.current_example == "latest_3", "flaky category")
                 window.fetch_evidence()
-                wait_for(lambda: "Attempt 2" in window.details.toPlainText(), "retry evidence")
+                wait_for(lambda: "Run 2" in window.details.toPlainText(), "retry evidence")
                 window.choose_category("")
                 wait_for(lambda: window.total == 7, "all cases")
                 window.search.setText("dsp/fir")
@@ -81,11 +81,18 @@ def main():
                 old_rows = list(window.rows)
                 window.received((window.epoch - 1, "cases", 0), {"items": [], "total": 0})
                 assert window.rows == old_rows
+                old_epoch = window.epoch
+                with patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.No):
+                    window.close()
+                assert window.isVisible() and window.poll.isActive()
+                assert window.epoch == old_epoch
                 print("Qt integration: list, categories, history, logs, retries, search, TXT export, stale response: PASS")
             finally:
                 window.poll.stop()
                 wait_for(lambda: not window.jobs, "pending GUI requests", seconds=25)
-                window.close()
+                with patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.Yes):
+                    window.close()
+                assert not window.isVisible()
                 window.pool.waitForDone(5000)
                 server.shutdown()
                 server.server_close()

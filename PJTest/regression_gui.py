@@ -42,10 +42,10 @@ def load_ui():
     from PyQt5 import QtCore, QtGui, QtWidgets
 
     categories = [
-        ("All cases", ""), ("New regressions", "NEW"), ("Open regressions", "OPEN"),
-        ("Recovered", "RECOVERED"), ("Flaky", "FLAKY"),
-        ("Execution errors / inconclusive", "INCONCLUSIVE"), ("No passing baseline", "NO_BASELINE"),
-        ("Incomplete", "INCOMPLETE"), ("Previously fixed", "FIXED"), ("Stable pass", "STABLE"),
+        ("All cases", ""), ("New fails", "NEW"), ("Still failing", "OPEN"),
+        ("Fixed now", "RECOVERED"), ("Pass + Fail", "FLAKY"),
+        ("Run error / Unknown", "INCONCLUSIVE"), ("No past pass", "NO_BASELINE"),
+        ("No final result", "INCOMPLETE"), ("Fixed before", "FIXED"), ("All pass", "STABLE"),
     ]
     category_names = dict((value, label) for label, value in categories)
 
@@ -66,7 +66,7 @@ def load_ui():
                 with build_opener(ProxyHandler({})).open(request, timeout=20) as response:
                     data = response.read(32 * 1024 * 1024 + 1)
                 if len(data) > 32 * 1024 * 1024:
-                    raise ValueError("Response exceeds 32 MB. Narrow the export filters.")
+                    raise ValueError("Too much data (over 32 MB). Select fewer cases.")
                 result = data if self.binary else json.loads(data.decode("utf-8"))
                 if not self.binary and not result.get("ok"):
                     raise ValueError(result.get("error", "Server returned an error"))
@@ -84,7 +84,7 @@ def load_ui():
     class Window(QtWidgets.QMainWindow):
         def __init__(self, url):
             super().__init__()
-            self.setWindowTitle("PJTest · Regression Viewer (read-only)")
+            self.setWindowTitle("PJTest · Test Results (read-only)")
             self.resize(1220, 880)
             self.setMinimumSize(960, 640)
             self.setStyleSheet("""
@@ -151,7 +151,7 @@ def load_ui():
             layout.setSpacing(12)
             self.setCentralWidget(central)
             top = QtWidgets.QHBoxLayout()
-            title = self.label("PJTest  /  Regression Viewer")
+            title = self.label("PJTest  /  Test Results")
             font = title.font()
             font.setPointSize(17)
             title.setFont(font)
@@ -161,12 +161,12 @@ def load_ui():
             self.server = QtWidgets.QLineEdit(self.base_url)
             self.server.setMinimumWidth(270)
             top.addWidget(self.server)
-            connect = QtWidgets.QPushButton("Connect / Refresh")
+            connect = QtWidgets.QPushButton("Load / Update")
             connect.clicked.connect(self.connect_server)
             top.addWidget(connect)
             layout.addLayout(top)
             self.summary = self.label("Connecting...")
-            self.sync_label = self.label("Read-only daily_regression view; shared server cache.")
+            self.sync_label = self.label("View only. Daily tests. Shared data for all users.")
             layout.addWidget(self.summary)
             layout.addWidget(self.sync_label)
             cards = QtWidgets.QHBoxLayout()
@@ -192,7 +192,7 @@ def load_ui():
             self.module.currentIndexChanged.connect(self.filters_changed)
             filters.addWidget(self.module)
             self.revision = QtWidgets.QLineEdit()
-            self.revision.setPlaceholderText("Latest revision")
+            self.revision.setPlaceholderText("Last version")
             self.revision.setMaximumWidth(135)
             self.revision.setValidator(QtGui.QIntValidator(0, 2147483647, self))
             filters.addWidget(self.revision)
@@ -200,7 +200,7 @@ def load_ui():
             self.search.setPlaceholderText("Search case path or ID")
             self.search.setClearButtonEnabled(True)
             filters.addWidget(self.search, 1)
-            self.export_button = QtWidgets.QPushButton("Export all matches to TXT")
+            self.export_button = QtWidgets.QPushButton("Save TXT")
             self.export_button.clicked.connect(self.export_txt)
             filters.addWidget(self.export_button)
             layout.addLayout(filters)
@@ -208,8 +208,8 @@ def load_ui():
             upper = QtWidgets.QWidget()
             upper_layout = QtWidgets.QVBoxLayout(upper)
             upper_layout.setContentsMargins(0, 0, 0, 0)
-            self.case_table = self.table(["Case path", "Module", "Category", "Known good -> bad",
-                                          "Latest result", "Last run date", "ID"])
+            self.case_table = self.table(["Case path", "Module", "Group", "Pass -> Fail version",
+                                          "Last result", "Last run", "ID"])
             self.case_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
             self.case_table.itemSelectionChanged.connect(self.select_case)
             upper_layout.addWidget(self.case_table)
@@ -217,7 +217,7 @@ def load_ui():
             self.page_label = self.label()
             pager.addWidget(self.page_label)
             pager.addStretch()
-            self.previous = QtWidgets.QPushButton("Previous")
+            self.previous = QtWidgets.QPushButton("Back")
             self.next = QtWidgets.QPushButton("Next")
             self.previous.clicked.connect(lambda: self.turn_page(-100))
             self.next.clicked.connect(lambda: self.turn_page(100))
@@ -228,9 +228,9 @@ def load_ui():
             lower = QtWidgets.QWidget()
             details_layout = QtWidgets.QVBoxLayout(lower)
             details_layout.setContentsMargins(0, 0, 0, 0)
-            self.detail_title = self.label("Select a case to view its execution history.")
+            self.detail_title = self.label("Click a case to see past runs.")
             details_layout.addWidget(self.detail_title)
-            self.history_table = self.table(["Date", "Revision", "Final status", "worker", "Task", "Example ID"])
+            self.history_table = self.table(["Date", "Version", "Result", "worker", "Task", "Case ID"])
             self.history_table.itemSelectionChanged.connect(self.select_history)
             details_layout.addWidget(self.history_table)
             history_controls = QtWidgets.QHBoxLayout()
@@ -241,7 +241,7 @@ def load_ui():
             self.history_next = QtWidgets.QPushButton("Older")
             self.history_previous.clicked.connect(lambda: self.turn_history(-50))
             self.history_next.clicked.connect(lambda: self.turn_history(50))
-            self.evidence_button = QtWidgets.QPushButton("View logs / retries")
+            self.evidence_button = QtWidgets.QPushButton("Show logs")
             self.evidence_button.clicked.connect(self.fetch_evidence)
             for button in (self.history_previous, self.history_next, self.evidence_button):
                 history_controls.addWidget(button)
@@ -261,7 +261,7 @@ def load_ui():
             url = self.server.text().strip().rstrip("/")
             parsed = urlparse(url)
             if parsed.scheme not in ("http", "https") or not parsed.netloc:
-                self.message.setText("Enter a complete http:// or https:// server URL.")
+                self.message.setText("Enter a server address starting with http:// or https://.")
                 return
             self.epoch += 1
             self.base_url, self.generation, self.offset = url, None, 0
@@ -333,7 +333,7 @@ def load_ui():
             self.history_offset = 0
             self.detail_title.setText("%s  ·  %s  ·  %s" %
                                       (data["case_path"], data["template_name"], data["test_key"]))
-            self.details.setPlainText("History shows each execution's final status; aggregate results include conflicts such as a successful retry after failure.")
+            self.details.setPlainText("Past runs show the final result of each run. Pass + Fail means results differ, including a failed run that passed on retry.")
             self.fetch_history()
 
         def fetch_history(self):
@@ -353,9 +353,9 @@ def load_ui():
             data = self.history_rows[row]
             self.current_example = data["example_id"]
             self.latest.pop("evidence", None)
-            labels = [("Final status", "status"), ("Failure reason", "failed_reason"),
-                      ("Infrastructure reason", "infra_reason"), ("Exit code", "exit_code"),
-                      ("Log path", "log_file"), ("Report directory", "report_dir")]
+            labels = [("Result", "status"), ("Fail reason", "failed_reason"),
+                      ("System error", "infra_reason"), ("Exit code", "exit_code"),
+                      ("Log path", "log_file"), ("Report folder", "report_dir")]
             self.details.setPlainText("\n".join("%s: %s" % (label, "-" if data.get(key) is None else data[key])
                                                  for label, key in labels))
             self.evidence_button.setEnabled(True)
@@ -369,7 +369,7 @@ def load_ui():
             if self.generation is None:
                 return
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Export all matching cases", "Regression.txt", "Text files (*.txt)")
+                self, "Save all listed cases", "Regression.txt", "Text files (*.txt)")
             if not path:
                 return
             self.export_path = path
@@ -396,7 +396,7 @@ def load_ui():
             self.evidence_button.setEnabled(bool(self.current_example))
             self.page_label.setText("%d rows - Page %d - 100 per page" %
                                     (self.total, self.offset // 100 + 1))
-            self.history_label.setText("History: %d rows - Page %d" %
+            self.history_label.setText("Past runs: %d - Page %d" %
                                        (self.history_total, self.history_offset // 50 + 1))
 
         @QtCore.pyqtSlot(object, object)
@@ -408,15 +408,15 @@ def load_ui():
             self.message.clear()
             if kind == "status":
                 days = data.get("dates", [])
-                self.summary.setText("Nightly submitted: %s   |   Submitted tasks done %s/%s   |   Examples done %s/%s" %
+                self.summary.setText("Daily tests: %s   |   Tasks done %s/%s   |   Cases done %s/%s" %
                                      (" vs ".join(days) or "None", data.get("latest_tasks_done", 0),
                                       data.get("latest_tasks", 0), data.get("latest_done", 0),
                                       data.get("latest_examples", 0)))
-                syncing = "Syncing (%s tasks processed)" % data.get("processed_tasks", 0) if data.get("syncing") else "Synced"
-                self.sync_label.setText("%s - Snapshot %s - Submitted tasks only; missing modules cannot be detected." %
-                                        (syncing, data.get("updated_at", "Building first snapshot")))
+                syncing = "Loading (%s tasks read)" % data.get("processed_tasks", 0) if data.get("syncing") else "Up to date"
+                self.sync_label.setText("%s - Data time: %s - Only sent tasks counted; missing tasks are not known." %
+                                        (syncing, data.get("updated_at", "Loading data")))
                 if data.get("error"):
-                    self.message.setText("Cache refresh failed; showing previous snapshot: " + data["error"])
+                    self.message.setText("Update failed. Showing old data: " + data["error"])
                 for category, button in self.cards.items():
                     button.setText("%s   %s" % (category_names[category], data.get("categories", {}).get(category, 0)))
                 selected = self.module.currentData()
@@ -448,7 +448,7 @@ def load_ui():
                     self.history_rows, self.history_total = [], 0
                     self.history_table.setRowCount(0)
                     self.details.clear()
-                    self.detail_title.setText("No cases match the current filters.")
+                    self.detail_title.setText("No cases found. Try All cases or clear the search.")
             elif kind == "history":
                 self.history_rows, self.history_total = data["items"], data["total"]
                 self.fill_table(self.history_table, [[row["run_date"], row["revision"], row["status"],
@@ -458,13 +458,13 @@ def load_ui():
                     self.history_table.selectRow(0)
             elif kind == "evidence":
                 example = data["example"]
-                lines = ["Example: " + example["example_id"], "Final log excerpt:",
-                         example.get("log_tail") or "No excerpt stored. Check the original file at the log path."]
+                lines = ["Case: " + example["example_id"], "Last log (part):",
+                         example.get("log_tail") or "No log text saved. Open the log file to see it."]
                 for attempt in data["attempts"]:
-                    lines.extend(["", "Attempt %s | %s | r%s | %s" %
+                    lines.extend(["", "Run %s | %s | r%s | %s" %
                                   (attempt["attempt_no"], attempt["worker_name"],
                                    attempt["revision"], attempt["status"]),
-                                  attempt.get("log_file") or "", attempt.get("log_tail") or "No excerpt"])
+                                  attempt.get("log_file") or "", attempt.get("log_tail") or "No log text"])
                 self.details.setPlainText("\n".join(lines))
             elif kind == "export":
                 output = QtCore.QSaveFile(self.export_path)
@@ -474,7 +474,7 @@ def load_ui():
                     output.cancelWriting()
                     self.message.setText("Save failed: " + output.errorString())
                 else:
-                    self.message.setText("Exported all matching records: " + self.export_path)
+                    self.message.setText("Saved all matching cases: " + self.export_path)
                 self.export_button.setEnabled(True)
             self.update_pagers()
 
@@ -490,10 +490,17 @@ def load_ui():
                 self.offset = self.history_offset = 0
                 self.refresh_status()
             if status == 404 and token[1] == "status":
-                message = "Regression API not found. Update scheduler using the deployment guide."
+                message = "Server has no test data API. Update scheduler first."
             self.message.setText(message)
 
         def closeEvent(self, event):
+            answer = QtWidgets.QMessageBox.question(
+                self, "Exit", "Close this window?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
             self.poll.stop()
             self.epoch += 1
             super().closeEvent(event)

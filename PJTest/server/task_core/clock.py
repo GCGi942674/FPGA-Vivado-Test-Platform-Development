@@ -3,9 +3,9 @@
 """PJTest daily task submitter.
 
 The runner reads task.yaml, resolves one revision for the complete invocation,
-and submits the configured tasks one by one. Durable history lives in the task
-database and the date-based clock log; no separate batch status or snapshot is
-maintained.
+writes that revision to the shared zip-retention marker, and submits the
+configured tasks one by one. Durable history lives in the task database and the
+date-based clock log; no separate batch status or snapshot is maintained.
 """
 
 import argparse
@@ -123,6 +123,69 @@ def scan_available_zips():
             available[revision] = item.resolve()
 
     return available
+
+
+def get_protect_version_file(zip_path=None):
+    """Return the shared revision-retention marker path."""
+    override = os.environ.get("PJTEST_PROTECT_VERSION_FILE")
+    if override:
+        return Path(override).expanduser()
+
+    if zip_path is not None:
+        return Path(zip_path).expanduser().resolve().parent.parent / (
+            "protect_versions"
+        )
+
+    zip_dirs = get_zip_dirs()
+    if zip_dirs:
+        return zip_dirs[0].expanduser().parent / "protect_versions"
+    return Path(DEFAULT_ZIP_DIR).parent / "protect_versions"
+
+
+def add_mode_bits(path, bits):
+    """Add POSIX permission bits without clearing existing permissions."""
+    try:
+        current_mode = path.stat().st_mode & 0o777
+        os.chmod(str(path), current_mode | bits)
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot make %s readable by other users: %s" % (path, exc)
+        )
+
+
+def atomic_write_public_text(path, content):
+    """Write text atomically and keep the result readable by other users."""
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = path.with_name("%s.tmp.%s" % (path.name, os.getpid()))
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        add_mode_bits(tmp_path, 0o444)
+        os.replace(str(tmp_path), str(path))
+        add_mode_bits(path, 0o444)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def save_protected_version(revision, zip_path=None):
+    """Replace the protected revision used by external zip cleanup."""
+    revision_text = normalize_revision(revision, "protected revision")
+    if revision_text == "latest":
+        raise ValueError("protected revision must be a fixed number")
+
+    protect_file = get_protect_version_file(zip_path)
+    content = "%d\n" % int(revision_text)
+    previous_content = None
+    if protect_file.exists():
+        previous_content = protect_file.read_text(encoding="utf-8")
+
+    atomic_write_public_text(protect_file, content)
+    return protect_file, previous_content != content
 
 
 def normalize_revision(value, field_name):
@@ -385,6 +448,17 @@ def submit_daily_tasks():
     log_message(
         "Revision fixed to %s using %s (%s)"
         % (revision, zip_path, revision_source)
+    )
+
+    try:
+        protect_file, updated = save_protected_version(revision, zip_path)
+    except Exception as exc:
+        log_message("Failed to protect revision %s: %s" % (revision, exc))
+        return False
+
+    log_message(
+        "Protected revision %s in %s (%s)"
+        % (revision, protect_file, "updated" if updated else "already current")
     )
 
     success = submit_tasks(task_list, revision)

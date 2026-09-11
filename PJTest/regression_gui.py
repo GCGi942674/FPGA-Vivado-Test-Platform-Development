@@ -3,6 +3,7 @@
 """Read-only PJTest regression desktop client, compatible with Python 3.6 / Qt5."""
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -39,8 +40,715 @@ def prepare_qt(qt_root=None):
 
 
 def load_ui():
-    from results_ui import load_ui as load_results_ui
-    return load_results_ui()
+    from PyQt5 import QtCore, QtGui, QtWidgets
+    # Store every badge as (background, foreground).
+    colors = {name:(bg,fg) for name,(fg,bg) in {
+        'Pass':('#0f7b4f','#e6f7ee'), 'Fail':('#c0263c','#fdecef'),
+        'Running':('#2563c9','#e8f0fe'), 'Waiting':('#a16207','#fef7e0'),
+        'Timeout':('#c2410c','#fff1e6'), 'Canceled':('#5b6675','#eef1f5'),
+        'No result':('#7a8496','#f1f3f7'), 'All pass':('#0f7b4f','#e6f7ee'),
+        'All fail':('#c0263c','#fdecef'), 'New fail':('#c2410c','#fff1e6'),
+        'Fixed':('#0d9488','#e6fbf8'), 'Pass + Fail':('#7c3aed','#f3ecff'),
+        'Still fail':('#c2410c','#fff1e6'), 'Still pass':('#5b6675','#eef1f5'),
+        'Unknown':('#5b6675','#eef1f5'), 'Other':('#5b6675','#eef1f5')}.items()}
+
+    class ResultDelegate(QtWidgets.QStyledItemDelegate):
+        """Compact name/path cells and small badges matching the supplied design."""
+        def __init__(self,kind,parent):
+            super().__init__(parent)
+            self.kind=kind
+
+        def paint(self,painter,option,index):
+            painter.save()
+            painter.setClipRect(option.rect)
+            rect=option.rect
+            selected=bool(option.state & QtWidgets.QStyle.State_Selected)
+            hovered=bool(option.state & QtWidgets.QStyle.State_MouseOver)
+            painter.fillRect(rect,QtGui.QColor('#cfe4ff' if selected else '#f6f8fa' if hovered else
+                                              '#ffffff' if index.row()%2==0 else '#eef3f8'))
+            painter.setPen(QtGui.QColor('#b7c4d1'))
+            painter.drawLine(rect.bottomLeft(),rect.bottomRight())
+            text=str(index.data() or '')
+            lines=text.split('\n')
+            font=QtGui.QFont(option.font)
+            font.setPixelSize(14)
+            painter.setFont(font)
+            def line(value,y,color='#202c3b',size=14,bold=False):
+                f=QtGui.QFont(font)
+                f.setPixelSize(size)
+                f.setBold(bold)
+                painter.setFont(f)
+                painter.setPen(QtGui.QColor(color))
+                value=QtGui.QFontMetrics(f).elidedText(value,QtCore.Qt.ElideRight,max(0,rect.width()-24))
+                painter.drawText(QtCore.QRect(rect.x()+12,y,rect.width()-24,20),QtCore.Qt.AlignVCenter|QtCore.Qt.TextSingleLine,value)
+            if index.column()==0:
+                line(lines[0],rect.center().y()-17,'#192b40',15,True)
+                if len(lines)>1:
+                    line(lines[1],rect.center().y()+1,'#43556a',13)
+            elif self.kind=='history' and index.column()==7:
+                for n,status in enumerate(text.split()):
+                    key={'P':'Pass','F':'Fail','R':'Running','W':'Waiting','T':'Timeout'}.get(status,'Unknown')
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(QtGui.QColor(colors[key][1]))
+                    painter.drawRoundedRect(QtCore.QRectF(rect.x()+12+n*10,rect.center().y()-4,8,8),2,2)
+            elif lines[0] in colors:
+                bg,fg=colors[lines[0]]
+                f=QtGui.QFont(font)
+                f.setPixelSize(13)
+                painter.setFont(f)
+                dot=self.kind=='matrix' and index.column()>1 or self.kind=='history' and index.column()==4
+                width=min(rect.width()-20,QtGui.QFontMetrics(f).horizontalAdvance(lines[0])+12+(8 if dot else 0))
+                y=rect.y()+9 if len(lines)>1 else rect.center().y()-12
+                badge=QtCore.QRectF(rect.x()+12,y,width,24)
+                painter.setRenderHint(QtGui.QPainter.Antialiasing)
+                painter.setPen(QtGui.QPen(QtGui.QColor(fg).lighter(180),.7))
+                painter.setBrush(QtGui.QColor(bg))
+                painter.drawRoundedRect(badge,2,2)
+                if dot:
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(QtGui.QColor(fg))
+                    painter.drawEllipse(QtCore.QPointF(rect.x()+18,y+9),2,2)
+                painter.setPen(QtGui.QColor(fg))
+                painter.drawText(badge.adjusted(6+(8 if dot else 0),0,-4,0),QtCore.Qt.AlignVCenter,lines[0])
+                if len(lines)>1:
+                    parts=lines[1].split('  |  ')
+                    line(parts[0],rect.y()+36,'#43556a',13)
+                    if len(parts)>1:
+                        line(parts[1],rect.y()+55,'#43556a',13)
+            else:
+                line(lines[0],rect.center().y()-8,'#bd203b' if index.column()==index.model().columnCount()-1 and text!='-' else '#43556a')
+                if len(lines)>1:
+                    line(lines[1],rect.center().y()+8,'#43556a',13)
+            painter.restore()
+
+    class DetailPanel(QtWidgets.QTextBrowser):
+        """Read-only, selectable details with a visual hierarchy instead of raw text."""
+        def __init__(self):
+            super().__init__()
+            self.raw=''
+            self.setOpenLinks(False)
+            self.setStyleSheet('QTextBrowser {background:#f0f3f6;color:#202c3b;border:0;border-left:1px solid #b7c4d1;padding:16px;}')
+
+        def setPlainText(self,text):
+            self.raw=text
+            blocks=[]
+            for line in text.splitlines():
+                safe=html.escape(line)
+                if not line:
+                    blocks.append('<div style="height:12px"></div>')
+                elif line.startswith('Result: '):
+                    value=line[8:]
+                    bg,fg=colors.get(value,('#f3f5f8','#43556a'))
+                    blocks.append('<p style="color:%s;background-color:%s;font-size:15px"><b>%s</b></p>' % (fg,bg,html.escape(value)))
+                elif line.startswith('Fail reason: '):
+                    blocks.append('<p style="color:#43556a;font-size:13px">FAIL REASON</p><p style="color:#bd203b">%s</p>' % html.escape(line[13:]))
+                elif line.startswith('PAST RUNS'):
+                    blocks.append('<hr><p><b>%s</b></p>' % safe)
+                elif ': ' in line:
+                    key,value=line.split(': ',1)
+                    blocks.append('<p><span style="color:#43556a">%s</span>&nbsp;&nbsp; %s</p>' % (html.escape(key),html.escape(value)))
+                else:
+                    blocks.append('<p>%s</p>' % safe)
+            self.setHtml('<html><body style="font-family:sans-serif;font-size:14px;color:#202c3b">'+''.join(blocks)+'</body></html>')
+
+        def appendPlainText(self,text):
+            self.setPlainText(self.raw+'\n'+text)
+
+    class Signals(QtCore.QObject):
+        done = QtCore.pyqtSignal(int, object, object)
+
+    class Job(QtCore.QRunnable):
+        def __init__(self, token, url, binary=False):
+            super().__init__()
+            self.token, self.url, self.binary = token, url, binary
+            self.signals = Signals()
+
+        def run(self):
+            try:
+                with build_opener(ProxyHandler({})).open(Request(self.url),timeout=25) as reply:
+                    data = reply.read(32*1024*1024+1)
+                if len(data)>32*1024*1024:
+                    raise ValueError('Too much data. Select fewer cases.')
+                self.signals.done.emit(self.token,data if self.binary else json.loads(data.decode('utf-8')),None)
+            except Exception as exc:
+                message = str(exc)
+                if isinstance(exc,HTTPError):
+                    try:
+                        message = json.loads(exc.read().decode('utf-8')).get('error',message)
+                    except Exception:
+                        pass
+                    if exc.code == 404:
+                        message = 'Update scheduler: results API not found.'
+                self.signals.done.emit(self.token,None,dict(message=message,status=getattr(exc,'code',0)))
+
+    class Window(QtWidgets.QMainWindow):
+        def __init__(self,url):
+            super().__init__()
+            self.setWindowTitle('PJTest - Test Results')
+            self.resize(1440,900)
+            self.setMinimumSize(1000,680)
+            self.setStyleSheet("""
+                QWidget {background:#ffffff;font-size:14px;color:#202c3b;}
+                QLabel {background:transparent;}
+                QMainWindow,QTabWidget::pane {background:#ffffff;}
+                QWidget#titlebar {background:#dde9f6;border-bottom:1px solid #b7c4d1;}
+                QLabel#brand {font-size:16px;font-weight:600;color:#192b40;}
+                QLabel#connection {background:#f6f8fa;color:#43556a;border:1px solid #b7c4d1;border-radius:4px;padding:6px 10px;}
+                QLineEdit,QComboBox {background:#ffffff;color:#202c3b;border:1px solid #8d9fb1;border-radius:4px;padding:6px;min-height:22px;}
+                QLineEdit:focus,QComboBox:focus {border:1px solid #2f81f7;}
+                QComboBox QAbstractItemView {background:#f6f8fa;color:#202c3b;selection-background-color:#cfe4ff;}
+                QTabBar::tab {background:#f0f3f6;color:#43556a;border:1px solid #b7c4d1;border-bottom:none;padding:10px 20px;margin:4px 3px 0 3px;border-top-left-radius:6px;border-top-right-radius:6px;}
+                QTabBar::tab:selected {background:#ffffff;color:#192b40;border-bottom:2px solid #2f81f7;}
+                QTableWidget {background:#ffffff;border:none;gridline-color:#b7c4d1;}
+                QHeaderView::section {background:#e0e9f2;color:#43556a;font-size:14px;font-weight:600;border:none;border-bottom:1px solid #8d9fb1;padding:10px;}
+                QScrollBar:vertical {background:#ffffff;width:12px;}
+                QScrollBar::handle:vertical {background:#4d5c6e;min-height:28px;border-radius:6px;}
+                QScrollBar::handle:vertical:hover {background:#687d94;}
+                QScrollBar:horizontal {background:#ffffff;height:12px;}
+                QScrollBar::handle:horizontal {background:#4d5c6e;min-width:28px;border-radius:6px;}
+                QScrollBar::add-line,QScrollBar::sub-line {background:#f0f3f6;border:none;}
+                QSplitter::handle {background:#b7c4d1;width:1px;}
+                QToolTip {background:#f6f8fa;color:#202c3b;border:1px solid #8d9fb1;padding:6px;}
+            """)
+            self.pool = QtCore.QThreadPool(self)
+            self.pool.setMaxThreadCount(4)
+            self.jobs, self.serial, self.epoch = {}, 0, 0
+            self.latest, self.data, self.generation = {}, {}, None
+            self.pages = []
+            central = QtWidgets.QWidget()
+            outer = QtWidgets.QVBoxLayout(central)
+            outer.setContentsMargins(0,0,0,0)
+            outer.setSpacing(0)
+            self.setCentralWidget(central)
+            titlebar=QtWidgets.QWidget()
+            titlebar.setObjectName('titlebar')
+            top = QtWidgets.QHBoxLayout(titlebar)
+            top.setContentsMargins(14,5,12,5)
+            brand = QtWidgets.QLabel('PJTEST  |  Test Results Viewer')
+            brand.setObjectName('brand')
+            top.addWidget(brand)
+            top.addStretch()
+            self.connection = QtWidgets.QLabel('Not connected')
+            self.connection.setObjectName('connection')
+            top.addWidget(self.connection)
+            self.server = QtWidgets.QLineEdit(url)
+            self.server.setFixedWidth(240)
+            top.addWidget(self.server)
+            self.button(top,'Load / Update',self.reload)
+            outer.addWidget(titlebar)
+            self.tabs = QtWidgets.QTabWidget()
+            outer.addWidget(self.tabs,1)
+            for kind,title in [('matrix','All cases'),('history','History'),('compare','Compare')]:
+                self.build_page(kind,title)
+            self.message = QtWidgets.QLabel('')
+            self.message.setWordWrap(True)
+            self.message.setStyleSheet('color:#43556a;background:#f0f3f6;border-top:1px solid #b7c4d1;font-size:13px;padding:6px 12px;')
+            outer.addWidget(self.message)
+            self.tabs.currentChanged.connect(self.change_tab)
+            self.debounce = QtCore.QTimer(self)
+            self.debounce.setSingleShot(True)
+            self.debounce.setInterval(400)
+            self.debounce.timeout.connect(self.filters_changed)
+            self.poll = QtCore.QTimer(self)
+            self.poll.setInterval(10000)
+            self.poll.timeout.connect(self.poll_status)
+            self.poll.start()
+            QtCore.QTimer.singleShot(0,self.reload)
+
+        def button(self,layout,text,action):
+            b = QtWidgets.QPushButton(text)
+            icons={'Load / Update':QtWidgets.QStyle.SP_BrowserReload,
+                   'Save TXT':QtWidgets.QStyle.SP_DialogSaveButton,
+                   'Back':QtWidgets.QStyle.SP_ArrowBack,'Next':QtWidgets.QStyle.SP_ArrowForward}
+            if text in icons:
+                b.setIcon(self.style().standardIcon(icons[text]))
+                b.setIconSize(QtCore.QSize(13,13))
+            if text in ('Load / Update','Save TXT'):
+                b.setObjectName('primary')
+            primary=text in ('Load / Update','Save TXT')
+            b.setStyleSheet(
+                'QPushButton {background:%s;color:%s;border:1px solid %s;border-radius:4px;padding:6px 10px;min-height:22px;} '
+                'QPushButton:hover {background:%s;} QPushButton:pressed {background:%s;} '
+                'QPushButton:focus {border:2px solid #397ac3;padding:5px 9px;} '
+                'QPushButton:disabled {background:#edf1f5;color:#8795a5;border-color:#c6d0dc;}'
+                % ('#1768bd' if primary else '#e2eaf3','#ffffff' if primary else '#223f60',
+                   '#16599e' if primary else '#91a6bd', '#287bd2' if primary else '#cbddef',
+                   '#12528f' if primary else '#b8cde4'))
+            b.setCursor(QtCore.Qt.PointingHandCursor)
+            b.clicked.connect(action)
+            layout.addWidget(b)
+            return b
+
+        def combo(self,options):
+            w = QtWidgets.QComboBox()
+            for label,value in options:
+                w.addItem(label,value)
+            return w
+
+        def build_page(self,kind,title):
+            page = dict(kind=kind,offset=0,total=0,rows=[],filters={},boxes={})
+            widget = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(widget)
+            layout.setContentsMargins(0,10,0,6)
+            layout.setSpacing(6)
+            toolbar=QtWidgets.QWidget()
+            toolbar.setObjectName('toolbar')
+            toolbar.setAttribute(QtCore.Qt.WA_StyledBackground,True)
+            toolbar.setStyleSheet('QWidget#toolbar {background:#f0f3f6;border-bottom:1px solid #b7c4d1;}')
+            controls = QtWidgets.QHBoxLayout(toolbar)
+            controls.setContentsMargins(12,10,12,13)
+            controls.setSpacing(7)
+            def add(label,key,w):
+                box=QtWidgets.QVBoxLayout()
+                box.setSpacing(3)
+                if kind!='matrix':
+                    caption=QtWidgets.QLabel(label.upper())
+                    caption.setStyleSheet('font-size:13px;color:#43556a;')
+                    box.addWidget(caption)
+                w.setFixedWidth(170 if key=='stage' else 185 if key=='q' else 105)
+                w.setToolTip(label)
+                box.addWidget(w)
+                controls.addLayout(box)
+                page['boxes'][key]=box
+                page['filters'][key]=w
+                if isinstance(w,QtWidgets.QLineEdit):
+                    w.textChanged.connect(self.text_changed)
+                else:
+                    w.currentIndexChanged.connect(self.filters_changed)
+                return w
+            search=add('Case','q',QtWidgets.QLineEdit())
+            search.setPlaceholderText('Name or path...')
+            search.setMinimumWidth(180)
+            add('Stage','stage',self.combo([('All stages','')]))
+            if kind=='matrix':
+                add('Trend','trend',self.combo([('All','')]+[(v,v) for v in
+                    ['All pass','All fail','New fail','Fixed','Pass + Fail','Running','Waiting','Timeout','No result']]))
+            if kind=='compare':
+                mode=add('Compare by','mode',self.combo([('Dates','day'),('Versions','version')]))
+                mode.currentIndexChanged.connect(self.populate_compare)
+                add('Left','left',self.combo([]))
+                add('Right','right',self.combo([]))
+                results=['New fail','Fixed','Still fail','Still pass','No result','Other']
+            else:
+                results=['Pass','Fail','Running','Waiting','Timeout','Canceled','Unknown','No result']
+                if kind=='history':
+                    add('Version','version',self.combo([('All','')]))
+                    for date_label,key in [('Date from','from'),('Date to','to')]:
+                        w=add(date_label,key,QtWidgets.QLineEdit())
+                        w.setPlaceholderText('YYYY-MM-DD')
+                        w.setMaximumWidth(110)
+            add('Result','result',self.combo([('All','')]+[(v,v) for v in results]))
+            add('Source','source',self.combo([('All tests',''),('Daily tests','daily'),('Other tests','other')]))
+            order = (['q','trend','result','stage','source'] if kind=='matrix' else
+                     ['mode','left','right','result','stage','q','source'] if kind=='compare' else
+                     ['q','stage','version','from','to','result','source'])
+            for box in page['boxes'].values():
+                controls.removeItem(box)
+            for i,key in enumerate(order):
+                controls.insertLayout(i,page['boxes'][key])
+            self.button(controls,'Clear',self.clear)
+            controls.addStretch()
+            self.button(controls,'Save TXT',self.export_txt)
+            layout.addWidget(toolbar)
+            page['summary']=QtWidgets.QLabel('Loading...')
+            page['summary'].setStyleSheet('background:#ffffff;font-size:13px;color:#43556a;padding:4px 12px;')
+            layout.addWidget(page['summary'])
+            split=QtWidgets.QSplitter()
+            table=QtWidgets.QTableWidget()
+            table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            table.setShowGrid(False)
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().hide()
+            table.verticalHeader().setDefaultSectionSize(84 if kind=='matrix' else 64)
+            table.setMouseTracking(True)
+            table.setItemDelegate(ResultDelegate(kind,table))
+            table.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignLeft|QtCore.Qt.AlignVCenter)
+            table.horizontalHeader().setMinimumSectionSize(95)
+            table.setWordWrap(False)
+            table.cellClicked.connect(self.select)
+            table.horizontalHeader().sectionClicked.connect(self.sort)
+            split.addWidget(table)
+            details=DetailPanel()
+            details.setReadOnly(True)
+            details.setMinimumWidth(280)
+            details.hide()
+            split.addWidget(details)
+            split.setSizes([1000,340])
+            page.update(table=table,details=details)
+            layout.addWidget(split,1)
+            footer_widget=QtWidgets.QWidget()
+            footer_widget.setObjectName('footer')
+            footer_widget.setAttribute(QtCore.Qt.WA_StyledBackground,True)
+            footer_widget.setStyleSheet('QWidget#footer {background:#f0f3f6;border-top:1px solid #b7c4d1;}')
+            footer=QtWidgets.QHBoxLayout(footer_widget)
+            footer.setContentsMargins(12,8,12,8)
+            footer.addWidget(QtWidgets.QLabel('Rows per page:'))
+            page['size']=self.combo([(str(n),n) for n in (15,30,50,100)])
+            page['size'].setFixedWidth(55)
+            page['size'].currentIndexChanged.connect(self.filters_changed)
+            footer.addWidget(page['size'])
+            page['pager']=QtWidgets.QLabel('')
+            footer.addStretch()
+            self.button(footer,'Hide details',lambda: details.hide())
+            self.button(footer,'More details',self.more_details)
+            if kind=='matrix':
+                self.button(footer,'Full history',self.view_history)
+            footer.addWidget(page['pager'])
+            page['back']=self.button(footer,'Back',lambda: self.turn(-1))
+            page['next']=self.button(footer,'Next',lambda: self.turn(1))
+            layout.addWidget(footer_widget)
+            self.pages.append(page)
+            self.tabs.addTab(widget,title)
+
+        def current(self):
+            return self.pages[self.tabs.currentIndex()]
+
+        def query(self,page):
+            q={k:(w.text().strip() if isinstance(w,QtWidgets.QLineEdit) else w.currentData())
+               for k,w in page['filters'].items()}
+            q={k:v for k,v in q.items() if v not in ('',None)}
+            q.update(limit=page['size'].currentData(),offset=page['offset'])
+            if page.get('order'):
+                q['order']=page['order']
+            if page.get('sort'):
+                q['sort']=page['sort']
+            if page.get('case_id'):
+                q['case_id']=page['case_id']
+            if self.generation is not None:
+                q['generation']=self.generation
+            return q
+
+        def submit(self,kind,params=None,page=None,extra=None):
+            self.serial+=1
+            token=self.serial
+            url=self.server.text().strip().rstrip('/')+'/api/results/'+kind
+            if params:
+                url+='?'+urlencode(params)
+            job=Job(token,url,kind=='export')
+            self.jobs[token]=(job,self.epoch,kind,page,extra)
+            self.latest[(kind,id(page))]=token
+            job.signals.done.connect(self.received)
+            self.pool.start(job)
+
+        def reload(self):
+            if urlparse(self.server.text().strip()).scheme not in ('http','https'):
+                self.message.setText('Enter an http:// or https:// server address.')
+                return
+            self.epoch+=1
+            self.generation=None
+            self.latest.clear()
+            for p in self.pages:
+                p['offset']=0
+                p['table'].setRowCount(0)
+                p['details'].hide()
+            self.connection.setText('Connecting...')
+            self.submit('status')
+
+        def poll_status(self):
+            if not any(v[2]=='status' for v in self.jobs.values()):
+                self.submit('status')
+
+        def change_tab(self):
+            self.debounce.stop()
+            self.fetch()
+
+        def text_changed(self):
+            p=self.current()
+            self.latest.pop((p['kind'],id(p)),None)
+            self.latest.pop(('history',id(p)),None)
+            p['details'].hide()
+            self.debounce.start()
+
+        def filters_changed(self):
+            if not hasattr(self,'tabs') or not self.pages:
+                return
+            p=self.current()
+            p['offset']=0
+            self.latest.pop((p['kind'],id(p)),None)
+            self.latest.pop(('history',id(p)),None)
+            p['details'].hide()
+            self.fetch()
+
+        def clear(self):
+            p=self.current()
+            p.pop('case_id',None)
+            for w in p['filters'].values():
+                w.blockSignals(True)
+                w.clear() if isinstance(w,QtWidgets.QLineEdit) else w.setCurrentIndex(0)
+                w.blockSignals(False)
+            self.populate_compare()
+            self.filters_changed()
+
+        def populate_compare(self, preserve=False):
+            p=self.pages[2]
+            values=self.data.get('dates' if p['filters']['mode'].currentData()=='day' else 'versions',[])
+            for key,index in [('left',1),('right',0)]:
+                w=p['filters'][key]
+                selected=w.currentData() if preserve is True else None
+                w.blockSignals(True)
+                w.clear()
+                for value in values:
+                    w.addItem(value,value)
+                w.setCurrentIndex(w.findData(selected) if selected in values else min(index,max(0,len(values)-1)))
+                w.blockSignals(False)
+            if preserve is not True and self.generation is not None:
+                self.filters_changed()
+
+        def fetch(self):
+            if self.generation is None or not self.data.get('ready'):
+                return
+            p=self.current()
+            q=self.query(p)
+            if p['kind']=='compare' and (not q.get('left') or not q.get('right')):
+                p['summary'].setText('No dates or versions to compare.')
+                return
+            self.submit(p['kind'],q,p)
+
+        def turn(self,direction):
+            p=self.current()
+            p['offset']=max(0,p['offset']+direction*p['size'].currentData())
+            self.fetch()
+
+        def sort(self,column):
+            p=self.current()
+            if p['kind']=='matrix':
+                p['sort']='name' if column==0 else 'trend' if column==1 else p['stages'][column-2]
+            else:
+                fields=['name','stage','date','version','result'] if p['kind']=='history' else ['name','stage',None,None,'result']
+                if column>=len(fields) or fields[column] is None:
+                    return
+                p['sort']=fields[column]
+            p['order']='desc' if p.get('order')!='desc' else 'asc'
+            self.fetch()
+
+        def export_txt(self):
+            if any(v[2]=='export' for v in self.jobs.values()):
+                self.message.setText('A TXT file is being saved. Please wait.')
+                return
+            if self.generation is None:
+                return
+            p=self.current()
+            path,_=QtWidgets.QFileDialog.getSaveFileName(self,'Save TXT','PJTest_'+p['kind']+'.txt','Text files (*.txt)')
+            if path:
+                q=self.query(p)
+                q['view']=p['kind']
+                self.submit('export',q,p,path)
+
+        def select(self,row,column):
+            p=self.current()
+            if row>=len(p['rows']):
+                return
+            r=p['rows'][row]
+            p['selected']=r
+            if p['kind']=='matrix':
+                if column<2:
+                    return
+                stage=p['stages'][column-2]
+                p['selected_stage']=stage
+                runs=r['stages'].get(stage,[])
+                p['details'].setPlainText(r['name']+'\n'+r['path']+'\n\nStage: '+stage+'\n'+
+                                         ('\n\n'.join(self.run_text(v) for v in runs) if runs else 'No result'))
+                q=dict(case_id=r['case_id'],stage=stage,limit=30,generation=self.generation)
+                if p['filters']['source'].currentData():
+                    q['source']=p['filters']['source'].currentData()
+                self.submit('history',q,p,'detail')
+            elif p['kind']=='history':
+                p['details'].setPlainText(self.run_text(r))
+            else:
+                p['details'].setPlainText(r['name']+'\n'+r['stage']+'\n'+r['result']+'\n\nLeft:\n'+
+                                         self.run_text(r['left'])+'\n\nRight:\n'+self.run_text(r['right']))
+            p['details'].show()
+
+        def view_history(self):
+            p=self.current()
+            r=p.get('selected')
+            if not r:
+                return
+            h=self.pages[1]
+            for key,w in h['filters'].items():
+                w.blockSignals(True)
+                if isinstance(w,QtWidgets.QLineEdit):
+                    w.setText(r['path'] if key=='q' else '')
+                else:
+                    value=p.get('selected_stage','') if key=='stage' else p['filters']['source'].currentData() if key=='source' else ''
+                    w.setCurrentIndex(max(0,w.findData(value)))
+                w.blockSignals(False)
+            h['case_id']=r['case_id']
+            h['offset']=0
+            self.tabs.setCurrentIndex(1)
+
+        def run_text(self,r,more=False):
+            if not r:
+                return 'No result'
+            duration='Unknown' if r.get('duration') is None else str(r['duration'])+'s'
+            text='Result: %s\nVersion: r%s\nDate: %s\nMachine: %s\nTime: %s\nFail reason: %s' % (
+                r['result'],r['version'],r['date'],r.get('assigned_worker') or '-',duration,
+                r.get('failed_reason') or r.get('infra_reason') or 'No reason saved')
+            if more:
+                text+='\n\nTask ID: %s\nCase ID: %s\nConfig: %s\nLog path: %s\nExit code: %s\nSource: %s\nRetries: %s' % (
+                    r['task_id'],r['example_id'],r['config'],r.get('log_file') or '-',r.get('exit_code'),r['source'],r.get('retries',0))
+            return text
+
+        def more_details(self):
+            p=self.current()
+            self.latest.pop(('history',id(p)),None)
+            r=p.get('selected')
+            if not r:
+                return
+            if p['kind']=='matrix':
+                rows=[v for runs in r['stages'].values() for v in runs]
+            elif p['kind']=='compare':
+                rows=[v for v in (r['left'],r['right']) if v]
+            else:
+                rows=[r]
+            p['details'].setPlainText('\n\n'.join(v['stage']+'\n'+self.run_text(v,True) for v in rows))
+            p['details'].show()
+
+        def fill(self,p,data):
+            p['rows'],p['total']=data['items'],data['total']
+            table=p['table']
+            if p['kind']=='matrix':
+                selected_stage=p['filters']['stage'].currentData()
+                p['stages']=[selected_stage] if selected_stage else self.data.get('stages',[])
+                short={'place_design':'place','route_design':'route','route_design_from_place':'route from place',
+                       'report_timing_summary':'timing','report_utilization':'util'}
+                headers=['Case','Trend']+[short.get(s,s) for s in p['stages']]
+                rows=[]
+                for r in p['rows']:
+                    cells=[r['name']+'\n'+r['path'],r['trend']]
+                    for stage in p['stages']:
+                        runs=r['stages'].get(stage,[])
+                        cells.append('No result' if not runs else ('%d configs\nClick to view' % len(runs) if len(runs)>1 else
+                                     '%s\nr%s  |  %s' % (runs[0]['result'],runs[0]['version'],runs[0]['day'])))
+                    rows.append(cells)
+            elif p['kind']=='history':
+                headers=['Case','Stage','Date','Version','Result','Machine','Time','Recent runs','Fail reason']
+                rows=[[r['name']+'\n'+r['path'],r['stage'],r['date'],'r'+r['version'],r['result'],
+                       r.get('assigned_worker') or '-',str(r['duration'])+'s' if r['duration'] is not None else '-',
+                       ' '.join(v['result'][0] for v in r.get('recent',[])),
+                       r.get('failed_reason') or r.get('infra_reason') or '-'] for r in p['rows']]
+            else:
+                q=self.query(p)
+                headers=['Case','Stage',q.get('left','Left'),q.get('right','Right'),'Result','Fail reason']
+                rows=[[r['name']+'\n'+r['path'],r['stage'],r['left']['result'] if r['left'] else 'No result',
+                       r['right']['result'] if r['right'] else 'No result',r['result'],
+                       (r['right'] or {}).get('failed_reason') or '-'] for r in p['rows']]
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setRowCount(len(rows))
+            for i,row in enumerate(rows):
+                for j,value in enumerate(row):
+                    item=QtWidgets.QTableWidgetItem(str(value))
+                    item.setToolTip(str(value))
+                    if p['kind']=='history' and j==7:
+                        item.setToolTip('Latest first (all dates):\n'+'\n'.join('%s r%s %s' %
+                            (v['day'],v['version'],v['result']) for v in p['rows'][i].get('recent',[])))
+                    first=str(value).split('\n')[0]
+                    if first in colors:
+                        bg,fg=colors[first]
+                        item.setBackground(QtGui.QColor(bg))
+                        item.setForeground(QtGui.QColor(fg))
+                    table.setItem(i,j,item)
+            table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+            table.setColumnWidth(0,270)
+            for j in range(1,len(headers)):
+                table.setColumnWidth(j,150 if p['kind']=='matrix' else 125)
+            if p['kind']!='matrix':
+                table.setColumnWidth(1,190)
+            table.horizontalHeader().setStretchLastSection(True)
+            if p['kind']=='matrix':
+                table.setColumnWidth(0,290)
+                table.setColumnWidth(1,130)
+                for j in range(2,len(headers)):
+                    table.horizontalHeader().setSectionResizeMode(j,QtWidgets.QHeaderView.Stretch)
+            elif p['kind']=='history':
+                for j,width in enumerate([250,195,135,85,95,145,75,105,190]):
+                    table.setColumnWidth(j,width)
+            size=p['size'].currentData()
+            p['pager'].setText('Page %d / %d' % (p['offset']//size+1,max(1,(p['total']+size-1)//size)))
+            p['summary'].setText('%s %s found' % (p['total'],'cases' if p['kind']=='matrix' else 'records')+
+                ('   |   '+('Stage results: ' if p['kind']=='matrix' else '')+'   '.join('%s %s' % (k,v) for k,v in data['counts'].items()) if 'counts' in data else ''))
+            if data.get('counts'):
+                chips=[]
+                for label,count in data['counts'].items():
+                    bg,fg=colors.get(label,('#f5f6f8','#7e899c'))
+                    chips.append('<span style="background-color:%s;color:%s">&nbsp;%s %s&nbsp;</span>' %
+                                 (bg,fg,html.escape(label),count))
+                p['summary'].setText('%s %s &nbsp; | &nbsp; %s' %
+                    (p['total'],'cases - stage results' if p['kind']=='matrix' else 'records',' &nbsp; '.join(chips)))
+            p['back'].setEnabled(p['offset']>0)
+            p['next'].setEnabled(p['offset']+size<p['total'])
+
+        @QtCore.pyqtSlot(int,object,object)
+        def received(self,token,data,error):
+            job,epoch,kind,p,extra=self.jobs.pop(token)
+            if epoch!=self.epoch or self.latest.get((kind,id(p)))!=token:
+                return
+            if error:
+                message=error.get('message','Request failed') if isinstance(error,dict) else str(error)
+                self.message.setText(message)
+                if p is not None and kind==p['kind'] and extra!='detail':
+                    p['retry']=True
+                    p['summary'].setText('Load failed. Will retry: '+message)
+                if isinstance(error,dict) and error.get('status')==409:
+                    self.generation=None
+                if kind=='status':
+                    self.connection.setText('Connection failed')
+                return
+            self.message.clear()
+            if kind=='status':
+                old=self.generation
+                self.generation=data['generation']
+                self.data=data
+                self.connection.setText('Loading...' if data.get('syncing') else 'Connected')
+                self.message.setText(('Update failed: '+data['error']) if data.get('error') else
+                                     'Data time: '+data.get('updated_at','Loading first data...'))
+                if old!=self.generation:
+                    for page in self.pages:
+                        for key,values,label in [('stage',data['stages'],'All stages'),('version',data['versions'],'All')]:
+                            if key not in page['filters']:
+                                continue
+                            w=page['filters'][key]
+                            selected=w.currentData()
+                            w.blockSignals(True)
+                            w.clear()
+                            w.addItem(label,'')
+                            for v in values:
+                                w.addItem(v,v)
+                            w.setCurrentIndex(max(0,w.findData(selected)))
+                            w.blockSignals(False)
+                        page['offset']=0
+                    self.populate_compare(preserve=True)
+                    self.fetch()
+                elif self.current().get('retry') and not any(v[2]==self.current()['kind'] and v[3] is self.current() for v in self.jobs.values()):
+                    self.fetch()
+            elif kind=='export':
+                out=QtCore.QSaveFile(extra)
+                if not out.open(QtCore.QIODevice.WriteOnly) or out.write(data)!=len(data) or not out.commit():
+                    out.cancelWriting()
+                    self.message.setText('Save failed: '+out.errorString())
+                else:
+                    self.message.setText('Saved: '+extra)
+            elif extra=='detail':
+                p['details'].appendPlainText('\nPAST RUNS (latest %d of %d)\n' % (len(data['items']),data['total'])+
+                    '\n'.join('%s | r%s | %s | %s' % (r['day'],r['version'],r['result'],r['failed_reason'] or '-') for r in data['items'])+
+                    '\n\nUse History for all past runs.')
+            else:
+                p['retry']=False
+                self.fill(p,data)
+
+        def closeEvent(self,event):
+            if QtWidgets.QMessageBox.question(self,'Exit','Close this window?',
+                    QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No,QtWidgets.QMessageBox.No)!=QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
+            self.poll.stop()
+            self.debounce.stop()
+            self.epoch+=1
+            event.accept()
+
+    return QtCore,QtWidgets,Window
 
 
 def load_legacy_ui():
@@ -102,10 +810,12 @@ def load_legacy_ui():
                 QPushButton:hover { background: #e9f3f6; }
                 QPushButton:checked { background: #126a79; color: white; border-color: #126a79; }
                 QPushButton:disabled { color: #8c9da7; background: #edf1f4; }
-                QPushButton#categoryCard { text-align: left; padding: 12px 16px; font-size: 15px; }
+                QPushButton#categoryCard { background:#ffffff;border:1px solid #d0d7de;border-radius:8px;text-align:left;padding:12px 16px;font-size:15px; }
+                QPushButton#categoryCard:hover {background:#f6f8fa;border-color:#0969da;}
+                QPushButton#categoryCard:checked {background:#ddf4ff;border-color:#0969da;color:#0969da;}
                 QTableWidget { background: white; alternate-background-color: #f7fafb;
                     color: #253c4b; border: 1px solid #d8e3ea; gridline-color: #edf2f5;
-                    selection-background-color: #dceff3; selection-color: #14333c; }
+                    selection-background-color: #ddf4ff; selection-color: #1f2328; }
                 QHeaderView::section { background: #eaf1f5; color: #425e70;
                     border: none; padding: 8px; }
             """)
@@ -160,6 +870,7 @@ def load_legacy_ui():
             font = title.font()
             font.setPointSize(17)
             title.setFont(font)
+            title.setStyleSheet("font-size:18px;font-weight:600;color:#1f2328;")
             top.addWidget(title)
             top.addStretch()
             top.addWidget(self.label("Server"))
@@ -172,6 +883,8 @@ def load_legacy_ui():
             layout.addLayout(top)
             self.summary = self.label("Connecting...")
             self.sync_label = self.label("View only. Daily tests. Shared data for all users.")
+            self.summary.setStyleSheet("font-size:14px;color:#1f2328;")
+            self.sync_label.setStyleSheet("font-size:13px;color:#656d76;")
             layout.addWidget(self.summary)
             layout.addWidget(self.sync_label)
             cards = QtWidgets.QHBoxLayout()
@@ -522,7 +1235,7 @@ def main():
     try:
         QtCore, QtWidgets, Window = load_ui()
     except ImportError as exc:
-        print("Qt import failed: %s\nUse --qt-root /path/to/PyQt5/Qt5" % exc, file=sys.stderr)
+        print("GUI startup failed: %s\nThis single-file client needs Python and PyQt5. --qt-root is only for Qt library path conflicts." % exc, file=sys.stderr)
         return 1
     app = QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName("PJTest Regression")

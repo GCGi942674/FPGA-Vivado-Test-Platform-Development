@@ -2,7 +2,7 @@
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -33,6 +33,29 @@ class BrowserTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_matrix_reuses_summary_but_loads_only_page_details(self):
+        with patch.object(self.service, 'latest', wraps=self.service.latest) as latest, \
+                patch.object(self.service, 'matrix_details', wraps=self.service.matrix_details) as details:
+            first = self.service.matrix({'limit': '1'})
+            second = self.service.matrix({'limit': '1', 'offset': '1'})
+            self.assertEqual(latest.call_count, 1)
+            self.assertEqual(first['total'], 4)
+            self.assertNotEqual(first['items'][0]['case_id'], second['items'][0]['case_id'])
+            self.assertTrue(all(len(call.args[1]) == 1 for call in details.call_args_list))
+            first['items'][0]['stages'].clear()
+            self.assertTrue(self.service.matrix({'limit': '1'})['items'][0]['stages'])
+
+    def test_matrix_summary_changes_with_snapshot_and_date_scope(self):
+        before = self.service.matrix({'source': 'daily'})
+        old = self.service.matrix({'source': 'daily', 'to': '2026-09-07'})
+        self.assertEqual(next(r for r in old['items'] if r['name'] == 'fir')['trend'], 'All pass')
+        self.assertEqual(next(r for r in before['items'] if r['name'] == 'fir')['trend'], 'New fail')
+        add_task(self.source, 'extra', '2026-09-11', 18302, [('new/case', 'success')])
+        self.service.refresh()
+        after = self.service.matrix({'source': 'daily'})
+        self.assertGreater(after['generation'], before['generation'])
+        self.assertEqual(after['total'], before['total'] + 1)
+
     def test_all_sources_stages_and_missing(self):
         data=self.service.matrix({})
         self.assertEqual(data['total'],4)
@@ -43,6 +66,27 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.service.matrix({'source':'other'})['total'],1)
         self.assertEqual(self.service.matrix({'stage':'report_utilization','result':'No result'})['total'],4)
         self.assertEqual(self.service.matrix({'trend':'New fail'})['total'],1)
+
+    def test_overnight_runs_use_task_day_for_filters_and_compare(self):
+        add_task(self.source, 'night', '2026-09-10', 18376, [('dsp/fir', 'success')])
+        with sqlite3.connect(str(self.source)) as c:
+            c.execute("UPDATE task_examples SET created_at=?, started_at=?, finished_at=? WHERE task_id=?",
+                      ('2026-09-11 00:01:00', '2026-09-11 02:19:06',
+                       '2026-09-11 03:00:00', 'night'))
+        self.service.refresh()
+        self.assertNotIn('2026-09-11', self.service.status()['dates'])
+        query = {'q': 'dsp/fir', 'from': '2026-09-10', 'to': '2026-09-10'}
+        history = self.service.history(query)
+        self.assertEqual(history['total'], 1)
+        run = history['items'][0]
+        self.assertEqual(run['day'], '2026-09-10')
+        self.assertEqual(run['date'], '2026-09-11 02:19:06')
+        self.assertEqual(self.service.matrix(query)['total'], 1)
+        self.assertEqual(self.service.history({'from': '2026-09-11'})['total'], 0)
+        compared = self.service.compare({'q': 'dsp/fir', 'stage': 'place_design',
+                                         'left': '2026-09-09', 'right': '2026-09-10'})
+        self.assertEqual(compared['total'], 1)
+        self.assertEqual(compared['items'][0]['result'], 'Fixed')
 
     def test_status_uses_published_metadata_without_scanning_runs(self):
         with self.service.connect() as c:

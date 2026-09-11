@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,8 @@ CREATE INDEX IF NOT EXISTS runs_task ON runs(task_id);
 CREATE INDEX IF NOT EXISTS runs_case ON runs(case_id,stage,rank,seq);
 CREATE INDEX IF NOT EXISTS runs_key ON runs(test_key,rank,seq);
 CREATE INDEX IF NOT EXISTS runs_day ON runs(day,version,source);
+CREATE INDEX IF NOT EXISTS runs_version ON runs(version,test_key,rank,seq);
+CREATE INDEX IF NOT EXISTS runs_source ON runs(source,test_key,rank,seq);
 CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, data TEXT);
 '''
 
@@ -40,6 +43,8 @@ class ResultsService:
             raise ValueError('Cache must differ from source database')
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
+        self.matrix_cache_lock = threading.Lock()
+        self.matrix_cache = OrderedDict()
         self.stop = threading.Event()
         self.thread = None
         self.syncing, self.error, self.processed = False, '', 0
@@ -122,6 +127,8 @@ class ResultsService:
                         case_id = hashlib.sha256((normalize_path(t['work_root']) + '\n' + path).encode('utf-8')).hexdigest()[:24]
                         name = PurePosixPath(path).parent.name if PurePosixPath(path).name == 'run.tcl' else PurePosixPath(path).stem
                         date = r['started_at'] or r['created_at'] or t['created_at'] or ''
+                        # Overnight execution belongs to the task submission day.
+                        task_day = (t['created_at'] or r['created_at'] or '')[:10]
                         result = RESULTS.get(r['status'], 'Unknown')
                         duration = None
                         if r['started_at'] and r['finished_at']:
@@ -132,7 +139,7 @@ class ResultsService:
                                 pass
                         r.update(case_id=case_id, test_key=key, config=config, path=path, name=name,
                                  stage=t['template_name'], version=str(r['revision'] or t['revision'] or ''),
-                                 day=date[:10], date=date, source='daily' if t['suite'] == 'daily_regression' else 'other',
+                                 day=task_day, date=date, source='daily' if t['suite'] == 'daily_regression' else 'other',
                                  result=result, task_id=task_id, duration=duration)
                         r['retries'] = max(0, attempts.get(r['example_id'],0)-1)
                         r['failed_reason'] = str(r['failed_reason'] or '')[:4096]
@@ -212,13 +219,68 @@ class ResultsService:
         limit = min(200, max(1, int(q.get('limit', 50))))
         return dict(items=items[offset:offset+limit], total=len(items), generation=meta['generation'])
 
-    def latest(self, c, q):
+    def latest(self, c, q, summary=False):
         where, args = self.conditions(q, result=False)
         other, other_args = self.conditions(q, 'n', result=False)
-        sql = ('SELECT r.data FROM runs r WHERE ' + where +
+        columns = 'r.id,r.case_id,r.name,r.path,r.stage,r.result,r.test_key' if summary else 'r.data'
+        sql = ('SELECT ' + columns + ' FROM runs r WHERE ' + where +
                ' AND NOT EXISTS (SELECT 1 FROM runs n WHERE n.test_key=r.test_key AND (' + other +
                ') AND (n.rank>r.rank OR (n.rank=r.rank AND n.seq>r.seq))) ORDER BY r.name,r.path,r.stage')
-        return [json.loads(r[0]) for r in c.execute(sql, args + other_args)]
+        return [dict(r) if summary else json.loads(r[0]) for r in c.execute(sql, args + other_args)]
+
+    def matrix_summary(self, c, scope, meta):
+        # Cache only compact summaries, keyed by the actual SQLite snapshot.
+        where, args = self.conditions(scope, result=False)
+        key = (meta['generation'], where, tuple(args))
+        with self.matrix_cache_lock:
+            cached = self.matrix_cache.get(key)
+            if cached is not None:
+                self.matrix_cache.move_to_end(key)
+                return cached
+        groups = {}
+        for r in self.latest(c, scope, summary=True):
+            item = groups.setdefault(r['case_id'], dict(case_id=r['case_id'], name=r['name'], path=r['path'], stages={}))
+            item['stages'].setdefault(r['stage'], []).append(r)
+        past = {}
+        for r in c.execute('SELECT r.test_key,r.result FROM runs r WHERE (' + where +
+                           ") AND r.result IN ('Pass','Fail') ORDER BY r.rank,r.seq", args):
+            previous, changes = past.get(r['test_key'], (None, 0))
+            past[r['test_key']] = (r['result'], min(2, changes + int(previous is not None and previous != r['result'])))
+        def trend(run):
+            if run['result'] not in ('Pass','Fail'):
+                return run['result']
+            last, changes = past.get(run['test_key'], (None, 0))
+            if changes > 1:
+                return 'Pass + Fail'
+            if changes == 1:
+                return 'New fail' if last == 'Fail' else 'Fixed'
+            return 'All pass' if last == 'Pass' else 'All fail'
+        priority = ['Running','Waiting','Timeout','Unknown','Pass + Fail','New fail','All fail','Fixed','Canceled','All pass']
+        for item in groups.values():
+            trends = [trend(r) for runs in item['stages'].values() for r in runs]
+            item['trend'] = next((v for v in priority if v in trends), 'No result')
+        items = tuple(groups.values())
+        weight = sum(len(runs) for item in items for runs in item['stages'].values())
+        with self.matrix_cache_lock:
+            for old_key in list(self.matrix_cache):
+                if old_key[0] != meta['generation']:
+                    del self.matrix_cache[old_key]
+            if weight <= 50000:
+                self.matrix_cache[key] = items
+                while len(self.matrix_cache) > 4:
+                    self.matrix_cache.popitem(last=False)
+        return items
+
+    @staticmethod
+    def matrix_details(c, items):
+        ids = list(dict.fromkeys(r['id'] for item in items for runs in item['stages'].values() for r in runs))
+        details = {}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            for row in c.execute('SELECT id,data FROM runs WHERE id IN (' + ','.join('?' for _ in chunk) + ')', chunk):
+                details[row['id']] = json.loads(row['data'])
+        return [dict(item, stages={stage: [details[r['id']] for r in runs]
+                                  for stage, runs in item['stages'].items()}) for item in items]
 
     def history(self, q):
         with self.snapshot(q) as (c, meta):
@@ -245,32 +307,7 @@ class ResultsService:
     def matrix(self, q):
         with self.snapshot(q) as (c, meta):
             scope = {k:v for k,v in q.items() if k not in ('stage','result')}
-            groups = {}
-            for r in self.latest(c, scope):
-                item = groups.setdefault(r['case_id'], dict(case_id=r['case_id'], name=r['name'], path=r['path'], stages={}))
-                item['stages'].setdefault(r['stage'], []).append(r)
-            # Trends are computed per comparable stage/config, never by mixing stages.
-            history_where, history_args = self.conditions(scope, result=False)
-            past = {}
-            for r in c.execute('SELECT r.test_key,r.result FROM runs r WHERE ' + history_where +
-                               ' ORDER BY r.rank,r.seq', history_args):
-                if r['result'] in ('Pass','Fail'):
-                    past.setdefault(r['test_key'], []).append(r['result'])
-            def trend(run):
-                if run['result'] not in ('Pass','Fail'):
-                    return run['result']
-                values = past.get(run['test_key'], [])
-                changes = sum(a != b for a,b in zip(values,values[1:]))
-                if changes > 1:
-                    return 'Pass + Fail'
-                if changes == 1:
-                    return 'New fail' if values[-1]=='Fail' else 'Fixed'
-                return 'All pass' if values and values[-1]=='Pass' else 'All fail'
-            priority = ['Running','Waiting','Timeout','Unknown','Pass + Fail','New fail','All fail','Fixed','Canceled','All pass']
-            for item in groups.values():
-                trends = [trend(r) for runs in item['stages'].values() for r in runs]
-                item['trend'] = next((v for v in priority if v in trends), 'No result')
-            items = list(groups.values())
+            items = list(self.matrix_summary(c, scope, meta))
             if q.get('trend'):
                 items = [r for r in items if r['trend']==q['trend']]
             if q.get('result'):
@@ -298,6 +335,7 @@ class ResultsService:
                         counts[r['result']] = counts.get(r['result'],0)+1
             result = dict(items=items, total=len(items), generation=meta['generation']) if q.get('_export') else self.page(items,q,meta)
             result['counts'] = counts
+            result['items'] = self.matrix_details(c, result['items'])
             return result
 
     def compare(self, q):

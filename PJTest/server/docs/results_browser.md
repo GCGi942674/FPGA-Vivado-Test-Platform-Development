@@ -26,10 +26,20 @@ setenv PJTEST_RESULTS_CACHE_PATH /absolute/local/path/results_view.db
 The original nightly TXT reports and old `/api/regression/` endpoints remain
 separate. Their export lock does not control this cache.
 
-Copy BOTH client files to the same readable directory for each user:
+Copy only `PJTest/regression_gui.py` to a shared readable directory.
+The full GUI is embedded in this file; `results_ui.py` is no longer required
+for deployment. Python and PyQt5 must still be installed on the client machine.
+The client queries the scheduler API, not a shared SQLite file.
 
-- `PJTest/regression_gui.py`
-- `PJTest/results_ui.py` (new)
+For the shared script directory, users of csh/tcsh can define:
+
+```csh
+alias regui 'python3 /home/xiaonan/Share/scripts/toolUnified/regression_gui.py'
+```
+
+Run `regui` to open a separate read-only window. The command can be distributed
+through the site's existing shared shell configuration. This does not install
+the alias into other users' active shells automatically.
 
 ```csh
 python3 regression_gui.py --url http://192.168.10.11:8888

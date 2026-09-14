@@ -54,6 +54,35 @@ class ModelTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_index_reads_shared_source_once_per_phase_without_holding_lock(self):
+        count = 300
+        self.file.write_text('=author r1\n' + ''.join('0x{:x}:power\n'.format(i+1) for i in range(count)))
+        self.source.write_text(''.join('//0x{:x}:power\nint f{}() {{}}\n'.format(i+1, i) for i in range(count)))
+        self.model.document = ReviewDocument(self.file)
+        self.model.make_rows()
+        reads, unlocked = [], []
+        original = Path.read_text
+        def read(path, *args, **kwargs):
+            if path == self.source:
+                reads.append(path)
+                acquired = threading.Event()
+                def probe():
+                    with self.model.lock:
+                        acquired.set()
+                thread = threading.Thread(target=probe, daemon=True)
+                thread.start()
+                unlocked.append(acquired.wait(0.5))
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', read):
+            self.model.reindex()
+            deadline = time.monotonic() + 5
+            while self.model.scanning and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(self.model.scanning)
+        self.assertEqual(len(reads), 2)
+        self.assertTrue(all(unlocked))
+        self.assertEqual(self.model.rows[-1]['funcName'], 'f299')
+
     def test_version_author_and_target_address(self):
         self.assertEqual(self.model.rows[0]['author'], 'changxu')
         self.assertEqual(self.model.rows[2]['version'], 'r18238')

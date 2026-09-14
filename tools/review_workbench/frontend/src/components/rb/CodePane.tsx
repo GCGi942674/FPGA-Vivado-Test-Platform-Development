@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import type { ReviewEntry, LeftPaneState, RightPaneState } from '../../data/reviewData';
 import { tokenizeLine } from './tokenizer';
 
@@ -19,13 +19,14 @@ interface CodePaneProps {
 }
 
 function CodeBlock({ code, startLine = 1 }: { code: string; startLine?: number }) {
-  const lines = code.split('\n');
+  const lines = useMemo(() => code.split('\n'), [code]);
+  const tokenLines = useMemo(() => lines.map(tokenizeLine), [lines]);
   return (
     <div className="overflow-auto flex-1 py-3">
       <table className="w-full border-collapse">
         <tbody>
           {lines.map((line, i) => {
-            const tokens = tokenizeLine(line);
+            const tokens = tokenLines[i];
             return (
               <tr key={i} className="code-line group">
                 <td className="select-none text-right pr-4 pl-3 text-tn-dim2 font-mono text-xs leading-5 w-10 align-top sticky left-0 bg-tn-bg group-hover:bg-tn-surface/30">
@@ -52,28 +53,28 @@ function PaneHeader({
   if (side === 'ida') {
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 bg-tn-surf2 border-b border-tn-border flex-shrink-0">
-        <span className="text-tn-dim text-[10px] uppercase tracking-wide font-semibold">IDA Pseudocode</span>
+        <span className="text-tn-dim text-[12px] uppercase tracking-wide font-semibold">IDA Pseudocode</span>
         <div className="w-px h-3 bg-tn-border" />
-        <span className="text-tn-dim2 font-mono text-[10px]">{entry.srcModule || 'unbound'}</span>
-        <span className="text-tn-orange font-mono text-[10px]">{entry.srcAddress || '--'}</span>
+        <span className="text-tn-dim2 font-mono text-[12px]">{entry.srcModule || 'unbound'}</span>
+        <span className="text-tn-orange font-mono text-[12px]">{entry.srcAddress || '--'}</span>
         <div className="flex-1" />
         {leftState === 'stale' && (
-          <span className="text-tn-yellow text-[10px] flex items-center gap-1">
+          <span className="text-tn-yellow text-[12px] flex items-center gap-1">
             <span>⚠</span> Stale snapshot, refresh failed
           </span>
         )}
         {leftState === 'loading' && (
-          <span className="text-tn-blue text-[10px] animate-pulse">Loading…</span>
+          <span className="text-tn-blue text-[12px] animate-pulse">Loading…</span>
         )}
         <button
           onClick={onOpenInIda}
-          className="text-[10px] px-2 py-0.5 border border-tn-border rounded text-tn-blue hover:bg-tn-surface"
+          className="text-[12px] px-2 py-0.5 border border-tn-border rounded text-tn-blue hover:bg-tn-surface"
         >
           Open in IDA
         </button>
         <button
           onClick={onRefreshIda}
-          className="text-[10px] px-2 py-0.5 border border-tn-border rounded text-tn-dim hover:bg-tn-surface"
+          className="text-[12px] px-2 py-0.5 border border-tn-border rounded text-tn-dim hover:bg-tn-surface"
         >
           ↻ Refresh
         </button>
@@ -82,25 +83,25 @@ function PaneHeader({
   }
   return (
     <div className="flex items-center gap-2 px-3 py-1.5 bg-tn-surf2 border-b border-tn-border flex-shrink-0">
-      <span className="text-tn-dim text-[10px] uppercase tracking-wide font-semibold">C++ Source</span>
+      <span className="text-tn-dim text-[12px] uppercase tracking-wide font-semibold">C++ Source</span>
       <div className="w-px h-3 bg-tn-border" />
-      <span className="text-tn-cyan font-mono text-[10px] truncate max-w-[200px]" title={entry.srcFile}>
+      <span className="text-tn-cyan font-mono text-[12px] truncate max-w-[200px]" title={entry.srcFile}>
         {entry.srcFile}
       </span>
-      <span className="text-tn-dim2 text-[10px]">:{entry.srcLine}</span>
+      <span className="text-tn-dim2 text-[12px]">:{entry.srcLine}</span>
       <div className="flex-1" />
       {rightState === 'loading' && (
-        <span className="text-tn-blue text-[10px] animate-pulse">Indexing…</span>
+        <span className="text-tn-blue text-[12px] animate-pulse">Indexing…</span>
       )}
       <button
         onClick={onOpenInVsCode}
-        className="text-[10px] px-2 py-0.5 border border-tn-border rounded text-tn-purple hover:bg-tn-surface"
+        className="text-[12px] px-2 py-0.5 border border-tn-border rounded text-tn-purple hover:bg-tn-surface"
       >
         Open in VS Code
       </button>
       <button
         onClick={onReload}
-        className="text-[10px] px-2 py-0.5 border border-tn-border rounded text-tn-dim hover:bg-tn-surface"
+        className="text-[12px] px-2 py-0.5 border border-tn-border rounded text-tn-dim hover:bg-tn-surface"
       >
         ↻ Reload
       </button>
@@ -110,7 +111,7 @@ function PaneHeader({
 
 function MappingBadge({ entry }: { entry: ReviewEntry }) {
   return (
-    <div className="flex items-center gap-1.5 px-3 py-1 bg-tn-bg2 border-b border-tn-border text-[10px] flex-shrink-0">
+    <div className="flex items-center gap-1.5 px-3 py-1 bg-tn-bg2 border-b border-tn-border text-[12px] flex-shrink-0">
       <span className="text-tn-dim">Mapping:</span>
       <span className="font-mono text-tn-orange">{entry.module}</span>
       <span className="font-mono text-tn-orange">{entry.address}</span>
@@ -155,7 +156,8 @@ export default function CodePane({
   const startLine = side === 'cpp' ? entry.srcLine : 1;
 
   // Filter code lines for search
-  const lines = code.split('\n');
+  const lines = useMemo(() => code.split('\n'), [code]);
+  const tokenLines = useMemo(() => lines.map(tokenizeLine), [lines]);
   const matchIndices = search.trim()
     ? lines.reduce<number[]>((acc, l, i) => { if (l.toLowerCase().includes(search.toLowerCase())) acc.push(i); return acc; }, [])
     : [];
@@ -178,7 +180,7 @@ export default function CodePane({
           className="bg-tn-surf2 border border-tn-border text-tn-text text-xs rounded px-2 py-0.5 w-48 focus:outline-none focus:border-tn-blue placeholder-tn-dim font-mono"
         />
         {search && (
-          <span className="text-tn-dim text-[10px]">
+          <span className="text-tn-dim text-[12px]">
             {matchIndices.length} match{matchIndices.length !== 1 ? 'es' : ''}
           </span>
         )}
@@ -225,7 +227,7 @@ export default function CodePane({
       {side === 'cpp' && rightState === 'indexing' && (
         <div className="flex-1 flex flex-col items-center justify-center gap-3">
           <div className="text-tn-blue text-xs animate-pulse">Building source index…</div>
-          <div className="text-tn-dim text-[10px]">This may take a few minutes on first run</div>
+          <div className="text-tn-dim text-[12px]">This may take a few minutes on first run</div>
         </div>
       )}
 
@@ -257,7 +259,7 @@ export default function CodePane({
           <table className="w-full border-collapse">
             <tbody>
               {lines.map((line, i) => {
-                const tokens = tokenizeLine(line);
+                const tokens = tokenLines[i];
                 const isMatch = matchIndices.includes(i);
                 return (
                   <tr key={i} className={`code-line group ${isMatch ? 'bg-tn-yellow/10' : ''}`}>

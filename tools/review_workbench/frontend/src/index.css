@@ -9,7 +9,7 @@ html, body, #root {
   background: #1a1b26;
   color: #c0caf5;
   font-family: 'Inter', system-ui, sans-serif;
-  font-size: 13px;
+  font-size: 16px;
   line-height: 1.5;
 }
 
@@ -29,3 +29,19 @@ html, body, #root {
 
 /* Resize cursor on divider */
 .resize-divider { cursor: col-resize; }
+
+/* Explicit native-control defaults for Linux QtWebEngine themes. */
+@layer base {
+  :root { color-scheme: dark; }
+  button, input, select, textarea {
+    color: #c0caf5;
+    background-color: #1f2335;
+  }
+  button { -webkit-appearance: none; appearance: none; background-image: none; }
+  option, optgroup { color: #c0caf5; background-color: #1f2335; }
+  option:checked { color: #c0caf5; background-color: #24283b; }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid #7aa2f7;
+    outline-offset: -2px;
+  }
+}

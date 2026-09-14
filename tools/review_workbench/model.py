@@ -130,21 +130,31 @@ class Workbench:
         def scan():
             try:
                 index, warnings, count = build_index(self.root, lambda: generation != self.scan_generation)
+                # Read each matched file once, outside the request lock.
+                with self.lock:
+                    rows = [dict(row) for row in self.rows]
+                grouped, names = {}, {}
+                for row in rows:
+                    hits = index.get((int(row['address'], 16), row['module']), [])
+                    if len(hits) == 1:
+                        grouped.setdefault(hits[0].path, []).append((row, hits[0].line))
+                for path, matches in grouped.items():
+                    if generation != self.scan_generation:
+                        return
+                    try:
+                        lines = Path(path).read_text(encoding='utf-8-sig', errors='replace').splitlines()
+                        for row, line in matches:
+                            names[row['id']] = self.function_name(lines, line, row['funcName'])
+                    except OSError:
+                        pass
                 with self.lock:
                     if generation != self.scan_generation:
                         return
                     self.index = index
                     self.scan_error = '{} source files indexed; {} unreadable.'.format(count, len(warnings))
-                    self.scanning = False
-                    # Only show names for unique matches; duplicate definitions stay explicit.
                     for row in self.rows:
-                        hits = index.get((int(row['address'], 16), row['module']), [])
-                        if len(hits) == 1:
-                            try:
-                                text = Path(hits[0].path).read_text(encoding='utf-8-sig', errors='replace')
-                                row['funcName'] = self.function_name(text, hits[0].line, row['funcName'])
-                            except OSError:
-                                pass
+                        row['funcName'] = names.get(row['id'], row['funcName'])
+                    self.scanning = False
             except Exception as exc:
                 with self.lock:
                     if generation == self.scan_generation:
@@ -155,7 +165,8 @@ class Workbench:
 
     @staticmethod
     def function_name(text, line, default):
-        signature = ' '.join(text.splitlines()[line + 1:line + 9])
+        lines = text if isinstance(text, list) else text.splitlines()
+        signature = ' '.join(lines[line + 1:line + 9])
         match = re.search(r'([\w:~]+)\s*\(', signature)
         return match.group(1) if match else default
 
@@ -198,10 +209,11 @@ class Workbench:
         hit = hits[choice]
         data = Path(hit.path).read_bytes()
         text = data.decode('utf-8-sig', errors='replace')
-        if hit not in source_hits(text, hit.path):
+        annotations = source_hits(text, hit.path)
+        if hit not in annotations:
             raise ReviewError('Source mapping changed. Rebuild the index before continuing.')
         lines = text.splitlines()
-        following = [item.line for item in source_hits(text, hit.path) if item.line > hit.line]
+        following = [item.line for item in annotations if item.line > hit.line]
         stop = min(following) if following else len(lines)
         row.update(srcFile=hit.path, srcLine=hit.line + 1, sourceCode='\n'.join(lines[hit.line:stop]),
                    funcName=self.function_name(text, hit.line, row['funcName']))

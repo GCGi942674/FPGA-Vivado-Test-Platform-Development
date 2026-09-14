@@ -30,17 +30,17 @@ export default function BottomBar({
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-tn-dim text-xs flex-shrink-0">Reviewing:</span>
             <span className="font-mono text-tn-blue text-xs font-medium truncate">{entry.funcName}</span>
-            <span className="text-tn-dim2 text-[10px] flex-shrink-0">{entry.author}</span>
-            <span className="text-tn-dim2 text-[10px] flex-shrink-0 font-mono">{entry.version}</span>
-            <span className="text-tn-dim2 text-[10px] flex-shrink-0 font-mono">{entry.address}</span>
+            <span className="text-tn-dim2 text-[12px] flex-shrink-0">{entry.author}</span>
+            <span className="text-tn-dim2 text-[12px] flex-shrink-0 font-mono">{entry.version}</span>
+            <span className="text-tn-dim2 text-[12px] flex-shrink-0 font-mono">{entry.address}</span>
           </div>
         ) : (
           <span className="text-tn-dim text-xs">No active task</span>
         )}
         {saveError && (
           <div className="flex items-center gap-1.5 mt-0.5">
-            <span className="text-tn-red text-[10px]">⚠</span>
-            <span className="text-tn-red text-[10px]">{saveError}</span>
+            <span className="text-tn-red text-[12px]">⚠</span>
+            <span className="text-tn-red text-[12px]">{saveError}</span>
           </div>
         )}
       </div>

@@ -14,7 +14,6 @@ add_case_if_valid() {
 
 resolve_list_entry_path() {
     local entry="$1"
-    local list_dir="$2"
 
     # absolute path
     if [[ "$entry" = /* ]]; then
@@ -22,17 +21,15 @@ resolve_list_entry_path() {
         return 0
     fi
 
-    # relative path -> relative to list file directory
-    echo "$list_dir/$entry"
+    # Report entries identify cases in the local workspace, regardless of
+    # where the list is stored or which directory the caller starts from.
+    echo "$WORKSPACE_ROOT/$entry"
 }
 
 load_case_list_file() {
     local list_file="$1"
-    local list_dir
     local each_case
     local resolved_path
-
-    list_dir=$(cd "$(dirname "$list_file")" && pwd)
 
     while IFS= read -r each_case || [ -n "$each_case" ]; do
         # trim leading/trailing spaces
@@ -44,7 +41,7 @@ load_case_list_file() {
             \#*) continue ;;
         esac
 
-        resolved_path=$(resolve_list_entry_path "$each_case" "$list_dir")
+        resolved_path=$(resolve_list_entry_path "$each_case")
         add_case_if_valid "$resolved_path"
     done < "$list_file"
 }

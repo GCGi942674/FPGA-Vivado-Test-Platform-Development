@@ -32,8 +32,11 @@ Options:
 Notes:
   - Ctrl+C / Ctrl+Z will both trigger safe shutdown
   - list_file paths:
+      * Lists and run.tcl files may be outside the workspace
       * Absolute paths are used directly
-      * Relative paths are resolved relative to the list file location
+      * Relative testcase paths are resolved under the local workspace root,
+        regardless of the list file location or current directory
+      * Entries must point to existing files named run.tcl
 USAGE
 }
 

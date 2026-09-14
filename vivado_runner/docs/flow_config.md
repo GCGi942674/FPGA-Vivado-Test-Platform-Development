@@ -20,7 +20,6 @@ Supported keys:
 - checksum_cmp
 - report_utilization
 - rpx_cmp
-- enable_copy
 
 ## shape_cmp
 

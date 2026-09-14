@@ -98,7 +98,7 @@ PROCESS_TERM_GRACE_SEC = int(os.environ.get(
 ))
 FLOW_CONFIG_IGNORE_KEYS = set(
     item.strip()
-    for item in os.environ.get("PJTEST_FLOW_CONFIG_IGNORE_KEYS", "enable_copy").split(",")
+    for item in os.environ.get("PJTEST_FLOW_CONFIG_IGNORE_KEYS", "").split(",")
     if item.strip()
 )
 
@@ -867,13 +867,13 @@ def update_flow_config_file(work_root, flow_config):
     """Update work_root/flow_config using key value format.
 
     Existing lines like:
-        enable_copy 0
-        enable_copy = 0
+        place_design 0
+        place_design = 0
     are rewritten as:
-        enable_copy 1
+        place_design 1
 
     Tcl-style lines like:
-        set enable_copy 0
+        set place_design 0
     keep the leading 'set'.
     """
     if not flow_config:

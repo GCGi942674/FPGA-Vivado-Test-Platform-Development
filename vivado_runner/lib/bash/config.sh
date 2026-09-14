@@ -86,9 +86,7 @@ load_flow_config() {
     ensure_flow_config_complete "$FLOW_CONFIG_ABS"
 
     FLOW_ARGS=()
-    FLOW_COPY_ARGS=()
     enabled_modules=""
-    ENABLE_COPY_FROM_FLOW=0
 
     for key in read_edif read_xdc report_timing_summary opt_design place_design place_design_from_syn phys_opt_design route_design route_design_from_place write_checkpoint shape_cmp write_bitstream bit_cmp msk_cmp bgn_cmp checksum_cmp report_utilization rpx_cmp dcp_cmp; do
         case "$key" in
@@ -107,16 +105,6 @@ load_flow_config() {
             append_enabled_module "$key"
         fi
     done
-
-    if is_enabled "enable_copy"; then
-        ENABLE_COPY_FROM_FLOW=1
-        FLOW_COPY_ARGS=(
-            "--copy"
-            "--"
-            "--report-dst"
-            "/home/xiaonan/Share/zw_cache/run_logs/"
-        )
-    fi
 
     [ -n "$enabled_modules" ] || enabled_modules="none"
     return 0

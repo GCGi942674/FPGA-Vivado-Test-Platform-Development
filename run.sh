@@ -60,12 +60,6 @@ main() {
     apply_cli_overrides
     load_flow_config
 
-    # Merge copy switches from CLI and flow_config.
-    # After this point, all copy logic only checks ENABLE_COPY_REPORTS.
-    if [ "${ENABLE_COPY_FROM_FLOW:-0}" -eq 1 ]; then
-        ENABLE_COPY_REPORTS=1
-    fi
-
     validate_runtime_config
 
     log_info "Workspace root: $SCRIPT_DIR"
@@ -99,7 +93,7 @@ main() {
     if [ "${ENABLE_COPY_REPORTS:-0}" -eq 1 ]; then
         copy_summary_reports
     else
-        log_info "Skip copying reports. Enable --copy or set 'enable_copy 1' in flow_config to export summaries."
+        log_info "Skip copying reports. Use --copy to export summaries."
     fi
 
     print_final_summary

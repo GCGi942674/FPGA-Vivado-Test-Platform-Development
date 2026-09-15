@@ -1,10 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INTERNAL_ROOT="$SCRIPT_DIR/vivado_runner"
+DEFAULT_FLOW_CONFIG="$SCRIPT_DIR/flow_config"
+
+# Resolve the workspace before choosing the manual execution lock.
+source "$INTERNAL_ROOT/lib/bash/common.sh"
+
 # Prevent duplicated run.sh jobs in the same execution slot.
 #
 # Manual run:
-#   no PJTest/DTS slot variables exist, so the lock still falls back to USER.
+#   different physical workspaces have independent lock files.
 #
 # Distributed run:
 #   worker slots use different DTS_WORKER / DTS_SLOT_WORKER values, so each
@@ -12,7 +19,7 @@ set -euo pipefail
 LOCK_DIR="${RUN_SH_LOCK_DIR:-${HOME}/PJTest/tmp}"
 mkdir -p "$LOCK_DIR"
 
-LOCK_TAG="${DTS_SLOT_WORKER:-${PJTEST_SLOT_WORKER:-${DTS_WORKER:-${GALAXCORE_WORKER_NAME:-${USER}}}}}"
+LOCK_TAG="${DTS_SLOT_WORKER:-${PJTEST_SLOT_WORKER:-${DTS_WORKER:-${GALAXCORE_WORKER_NAME:-workspace_${WORKSPACE_ID}}}}}"
 LOCK_TAG="$(echo "$LOCK_TAG" | sed 's#[^A-Za-z0-9_.-]#_#g')"
 
 RUN_SH_LOCK_FILE="${RUN_SH_LOCK_FILE:-${LOCK_DIR}/galaxcore_run_${LOCK_TAG}.lock}"
@@ -31,11 +38,15 @@ else
     echo "[INFO] run.sh slot lock already held by parent: $RUN_SH_LOCK_FILE"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INTERNAL_ROOT="$SCRIPT_DIR/vivado_runner"
-DEFAULT_FLOW_CONFIG="$SCRIPT_DIR/flow_config"
+# Also protect the case files when a caller supplies another namespace or slot.
+# Keep this separate from the lock that a PJTest parent may already hold.
+WORKSPACE_LOCK_FILE="$LOCK_DIR/galaxcore_workspace_${WORKSPACE_ID}.lock"
+exec 201>"$WORKSPACE_LOCK_FILE"
+if ! flock -n 201; then
+    echo "[ERROR] Current workspace already has a run.sh task running: $WORKSPACE_ROOT"
+    exit 75
+fi
 
-source "$INTERNAL_ROOT/lib/bash/common.sh"
 source "$INTERNAL_ROOT/lib/bash/args.sh"
 source "$INTERNAL_ROOT/lib/bash/config.sh"
 source "$INTERNAL_ROOT/lib/bash/discover.sh"
@@ -62,7 +73,9 @@ main() {
 
     validate_runtime_config
 
-    log_info "Workspace root: $SCRIPT_DIR"
+    log_info "Workspace root: $WORKSPACE_ROOT"
+    log_info "Workspace ID: $WORKSPACE_ID"
+    log_info "Runtime namespace: $RUNTIME_NAMESPACE"
     log_info "Input target: $INPUT_TARGET"
     log_info "Flow config: $FLOW_CONFIG_ABS"
     log_info "Runtime root: $RUNTIME_DIR"

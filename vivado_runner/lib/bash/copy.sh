@@ -48,8 +48,7 @@ init_live_report_dir() {
     }
     chmod 777 "$REPORT_DST_DIR" "$version_dir" 2>/dev/null || true
 
-    LIVE_REPORT_DIR="$version_dir/${server_name}_${timestamp}"
-    mkdir -p "$LIVE_REPORT_DIR" || {
+    LIVE_REPORT_DIR=$(mktemp -d "$version_dir/${server_name}_${timestamp}_${RUNTIME_NAMESPACE}_XXXXXX") || {
         log_error "Cannot create report directory: $LIVE_REPORT_DIR"
         return 1
     }

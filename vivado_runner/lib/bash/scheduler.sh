@@ -101,7 +101,9 @@ launch_case_job() {
     status_out="$TMP_DIR/$(echo "$case_dir" | sed 's#[/ ]#_#g').out"
 
     setsid bash -c '
-        source "$1/lib/bash/common.sh"
+        export GALAXCORE_WORKSPACE_ROOT="$2"
+        export VIVADO_RUNNER_NAMESPACE="${14}"
+        source "$1/lib/bash/common.sh" || exit 2
         source "$1/config/log_keywords.conf"
         source "$1/lib/bash/judge.sh"
         source "$1/lib/bash/worker.sh"
@@ -114,12 +116,13 @@ launch_case_job() {
         REPORT_DIR="$7"
         ARCHIVE_DIR="$8"
         CACHE_DIR="$9"
+        RUN_LOG_FILE="$LOG_DIR/run.log"
         GALAXCORE_BIN="${10}"
         FLOW_CONFIG_ABS="${11}"
         FLOW_ARGS_STR="${12}"
         IFS="|" read -r -a FLOW_ARGS <<< "$FLOW_ARGS_STR"
         run_one_case "${13}"
-    ' _ "$PROJECT_ROOT" "$WORKSPACE_ROOT" "$RUNTIME_DIR" "$LOG_DIR" "$STATUS_DIR" "$TMP_DIR" "$REPORT_DIR" "$ARCHIVE_DIR" "$CACHE_DIR" "$GALAXCORE_BIN" "$FLOW_CONFIG_ABS" "$(IFS='|'; echo "${FLOW_ARGS[*]}")" "$run_tcl" > "$status_out" 2>&1 &
+    ' _ "$PROJECT_ROOT" "$WORKSPACE_ROOT" "$RUNTIME_DIR" "$LOG_DIR" "$STATUS_DIR" "$TMP_DIR" "$REPORT_DIR" "$ARCHIVE_DIR" "$CACHE_DIR" "$GALAXCORE_BIN" "$FLOW_CONFIG_ABS" "$(IFS='|'; echo "${FLOW_ARGS[*]}")" "$run_tcl" "$RUNTIME_NAMESPACE" > "$status_out" 2>&1 &
 
     local pid=$!
     printf '%s|%s|%s|%s|%s\n' "$pid" "$run_tcl" "$case_dir" "$(date '+%s')" "$status_out" >> "$PID_MAP_FILE"

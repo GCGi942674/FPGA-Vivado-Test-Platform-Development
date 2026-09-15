@@ -133,14 +133,22 @@ run_case_with_bounded_log() {
 build_case_status_dir() {
     local case_dir="$1"
     local rel
-    rel=$(python3 - <<PY
+    rel=$(python3 - "$WORKSPACE_ROOT" "$case_dir" <<'PY'
+import hashlib
 import os
-root = os.path.realpath("$WORKSPACE_ROOT")
-case_dir = os.path.realpath("$case_dir")
+import sys
+
+root = os.path.realpath(sys.argv[1])
+case_dir = os.path.realpath(sys.argv[2])
 try:
-    print(os.path.relpath(case_dir, root))
+    relative = os.path.relpath(case_dir, root)
 except Exception:
-    print(os.path.basename(case_dir))
+    relative = case_dir
+if relative == '..' or relative.startswith('../') or os.path.isabs(relative):
+    # External list entries remain supported without escaping this status root.
+    digest = hashlib.sha256(os.fsencode(case_dir)).hexdigest()[:16]
+    relative = os.path.join('_external', digest, os.path.basename(case_dir))
+print(relative)
 PY
 )
     rel=$(sanitize_relpath "$rel")

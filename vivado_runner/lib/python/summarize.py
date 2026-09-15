@@ -128,6 +128,10 @@ def build_reports(records, meta):
         f"Host: {meta['host_name']}",
         f"SVN Version: {meta['svn_version']}",
         f"Flow Config: {meta['flow_config']}",
+        f"Workspace Root: {meta.get('workspace_root', '')}",
+        f"Workspace ID: {meta.get('workspace_id', '')}",
+        f"Runtime Namespace: {meta.get('runtime_namespace', '')}",
+        f"Runtime Directory: {meta.get('runtime_dir', '')}",
         f"Enabled Modules: {meta['enabled_modules']}",
         f"Parallel Max: {meta['bg_max']}",
         f"Time Limit(s): {meta['time_limit']}",
@@ -233,6 +237,9 @@ def main():
     parser.add_argument('--json-report', required=True)
     parser.add_argument('--timeout-list', required=True)
     parser.add_argument('--workspace-root', required=True)
+    parser.add_argument('--workspace-id', default='')
+    parser.add_argument('--runtime-namespace', default='')
+    parser.add_argument('--runtime-dir', default='')
     parser.add_argument('--enabled-modules', required=True)
     parser.add_argument('--time-limit', required=True)
     parser.add_argument('--bg-max', required=True)
@@ -245,6 +252,9 @@ def main():
     meta = {
         'case_list': args.case_list,
         'workspace_root': args.workspace_root,
+        'workspace_id': args.workspace_id,
+        'runtime_namespace': args.runtime_namespace,
+        'runtime_dir': args.runtime_dir,
         'enabled_modules': args.enabled_modules,
         'time_limit': args.time_limit,
         'bg_max': args.bg_max,

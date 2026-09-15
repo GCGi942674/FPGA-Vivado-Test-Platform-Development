@@ -28,6 +28,7 @@ load_default_config() {
         safe_remove "$REPORT_DIR"
         safe_remove "$ARCHIVE_DIR"
         safe_remove "$CACHE_DIR"
+        safe_remove "$RUNTIME_BASE_DIR/status/$RUNTIME_NAMESPACE"
         init_runtime_dirs
     fi
 }

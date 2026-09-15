@@ -25,6 +25,8 @@ sort_reports() {
 }
 
 refresh_reports() {
+    python3 "$PROJECT_ROOT/lib/python/workspace_runtime.py" publish \
+        "$RUNTIME_BASE_DIR" "$RUNTIME_NAMESPACE" || return 1
     python3 "$PROJECT_ROOT/lib/python/summarize.py" \
         --status-root "$STATUS_DIR" \
         --case-list "$CASE_LIST_FILE" \
@@ -35,6 +37,9 @@ refresh_reports() {
         --json-report "$EXECUTION_JSON" \
         --timeout-list "$TIMEOUT_TXT" \
         --workspace-root "$WORKSPACE_ROOT" \
+        --workspace-id "$WORKSPACE_ID" \
+        --runtime-namespace "$RUNTIME_NAMESPACE" \
+        --runtime-dir "$RUNTIME_DIR" \
         --enabled-modules "$enabled_modules" \
         --time-limit "$TIME_LIMIT" \
         --bg-max "$BG_MAX" \

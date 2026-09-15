@@ -1,9 +1,22 @@
 #!/bin/bash
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 # A pinned runner may execute cases in a separate SVN working copy.
 WORKSPACE_ROOT="${GALAXCORE_WORKSPACE_ROOT:-$(cd "$PROJECT_ROOT/.." && pwd)}"
-RUNTIME_DIR="$PROJECT_ROOT/runtime"
+WORKSPACE_ROOT=$(cd -- "$WORKSPACE_ROOT" 2>/dev/null && pwd -P) || {
+    printf '[ERROR] Invalid workspace directory: %s\n' "${GALAXCORE_WORKSPACE_ROOT:-$PROJECT_ROOT/..}" >&2
+    return 2
+}
+WORKSPACE_ID=$(python3 "$PROJECT_ROOT/lib/python/workspace_runtime.py" identity "$WORKSPACE_ROOT") || return 2
+RUNTIME_NAMESPACE="${VIVADO_RUNNER_NAMESPACE:-$WORKSPACE_ID}"
+case "$RUNTIME_NAMESPACE" in
+    [!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*|*..*)
+        printf '[ERROR] Invalid VIVADO_RUNNER_NAMESPACE: %s\n' "$RUNTIME_NAMESPACE" >&2
+        return 2
+        ;;
+esac
+RUNTIME_BASE_DIR="$PROJECT_ROOT/runtime"
+RUNTIME_DIR="$RUNTIME_BASE_DIR/workspaces/$RUNTIME_NAMESPACE"
 LOG_DIR="$RUNTIME_DIR/logs"
 STATUS_DIR="$RUNTIME_DIR/status"
 TMP_DIR="$RUNTIME_DIR/tmp"
@@ -116,6 +129,8 @@ safe_remove() {
 }
 
 init_runtime_dirs() {
+    python3 "$PROJECT_ROOT/lib/python/workspace_runtime.py" prepare \
+        "$RUNTIME_BASE_DIR" "$WORKSPACE_ROOT" "$RUNTIME_NAMESPACE" || return 1
     mkdir -p "$LOG_DIR" "$STATUS_DIR" "$TMP_DIR" "$REPORT_DIR" "$ARCHIVE_DIR" "$CACHE_DIR"
     : > "$RUN_LOG_FILE"
 }

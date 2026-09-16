@@ -354,6 +354,8 @@ def init_database_pragmas():
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("CREATE TABLE IF NOT EXISTS example_logs (example_id TEXT PRIMARY KEY, run_text TEXT, flow_text TEXT)")
+        conn.commit()
     finally:
         conn.close()
 
@@ -1791,6 +1793,10 @@ def _finish_attempt_once(data):
         )
 
         refresh_one_task_status(cur, task_id)
+        if isinstance(data.get("execution_logs"), dict):
+            logs = data["execution_logs"]
+            cur.execute("INSERT OR REPLACE INTO example_logs VALUES (?, ?, ?)",
+                        (example_id, str(logs.get("run", "")), str(logs.get("flow_config", ""))))
         conn.commit()
         # Queue a non-blocking report refresh after the transaction commits.
         enqueue_share_report(task_id)

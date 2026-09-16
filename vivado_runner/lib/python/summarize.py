@@ -29,17 +29,22 @@ def ts_to_str(ts):
     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 
 
-def count_case_list(path):
-    if not path or not os.path.isfile(path):
-        return 0
-
-    count = 0
+def load_case_list(path, workspace_root):
+    if not path:
+        return None
+    cases = set()
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             line = line.strip()
-            if line:
-                count += 1
-    return count
+            if line and not line.startswith('#'):
+                cases.add(normalize_case_path(line, workspace_root))
+    return cases
+
+
+def normalize_case_path(path, workspace_root):
+    if not os.path.isabs(path):
+        path = os.path.join(workspace_root, path)
+    return os.path.normcase(os.path.realpath(path))
 
 
 def format_run_tcl_path(path, workspace_root):
@@ -79,6 +84,11 @@ def build_timeout_lines(records, workspace_root):
 
 
 def build_reports(records, meta):
+    cases = load_case_list(meta.get('case_list', ''), meta.get('workspace_root', ''))
+    if cases is not None:
+        records = [rec for rec in records if normalize_case_path(
+            rec.get('RUN_TCL') or os.path.join(rec.get('CASE_DIR', ''), 'run.tcl'),
+            meta.get('workspace_root', '')) in cases]
     status_counter = Counter()
     reason_counter = Counter()
     runtime_values = []
@@ -90,7 +100,8 @@ def build_reports(records, meta):
         reason = rec.get('REASON', 'UNKNOWN')
 
         status_counter[status] += 1
-        reason_counter[reason] += 1
+        if status in ('FAIL', 'TIMEOUT'):
+            reason_counter[reason] += 1
 
         runtime_sec = safe_int(rec.get('RUNTIME_SEC', '0'))
         runtime_values.append(runtime_sec)
@@ -104,8 +115,7 @@ def build_reports(records, meta):
             end_ts_values.append(end_ts)
 
     runnable_cases = len(records)
-    total_from_case_list = count_case_list(meta.get('case_list', ''))
-    total = total_from_case_list if total_from_case_list > 0 else runnable_cases
+    total = len(cases) if cases is not None else runnable_cases
     skipped_cases = max(0, total - runnable_cases)
 
     avg_runtime = round(mean(runtime_values), 2) if runtime_values else 0
@@ -264,7 +274,7 @@ def main():
     }
 
     summary_text, failed_text, stat_text, report_text, payload = build_reports(records, meta)
-    timeout_text = build_timeout_lines(records, args.workspace_root)
+    timeout_text = build_timeout_lines(payload['records'], args.workspace_root)
 
     write_text(args.summary, summary_text)
     write_text(args.failed, failed_text)

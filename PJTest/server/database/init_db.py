@@ -367,6 +367,7 @@ def ensure_columns(cur, table_name, column_defs):
 
 def migrate_existing_tables(cur):
     """Make old PJTest databases compatible without dropping data."""
+    cur.execute("CREATE TABLE IF NOT EXISTS example_logs (example_id TEXT PRIMARY KEY, run_text TEXT, flow_text TEXT)")
     ensure_columns(
         cur,
         "tasks",
@@ -545,4 +546,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()     
+    main()

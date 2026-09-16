@@ -166,8 +166,9 @@ def load_ui():
         def run(self):
             try:
                 with build_opener(ProxyHandler({})).open(Request(self.url),timeout=25) as reply:
-                    data = reply.read(32*1024*1024+1)
-                if len(data)>32*1024*1024:
+                    limit=(512 if '/api/results/logs?' in self.url else 32)*1024*1024
+                    data = reply.read(limit+1)
+                if len(data)>limit:
                     raise ValueError('Too much data. Select fewer cases.')
                 self.signals.done.emit(self.token,data if self.binary else json.loads(data.decode('utf-8')),None)
             except Exception as exc:
@@ -604,6 +605,61 @@ def load_ui():
                 rows=[r]
             p['details'].setPlainText('\n\n'.join(v['stage']+'\n'+self.run_text(v,True) for v in rows))
             p['details'].show()
+            if rows:
+                self.open_logs(rows)
+
+        def open_logs(self,rows):
+            dialog=QtWidgets.QDialog(self)
+            dialog.setWindowTitle('Execution logs')
+            dialog.resize(1050,720)
+            layout=QtWidgets.QVBoxLayout(dialog)
+            choice=QtWidgets.QComboBox()
+            for row in rows:
+                choice.addItem('%s | r%s | %s | %s' % (row['stage'],row['version'],row['result'],row['example_id']),row)
+            layout.addWidget(choice)
+            tabs=QtWidgets.QTabWidget()
+            editors={}
+            for key,label in [('run','Run log'),('flow_config','Flow config')]:
+                editor=QtWidgets.QPlainTextEdit()
+                editor.setReadOnly(True)
+                editor.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+                editor.setFont(QtGui.QFont('Consolas',10))
+                tabs.addTab(editor,label)
+                editors[key]=editor
+            layout.addWidget(tabs)
+            bar=QtWidgets.QHBoxLayout()
+            search=QtWidgets.QLineEdit()
+            search.setPlaceholderText('Search text')
+            bar.addWidget(search)
+            def find_next():
+                editor=tabs.currentWidget()
+                if not editor.find(search.text()):
+                    editor.moveCursor(QtGui.QTextCursor.Start)
+                    editor.find(search.text())
+            def save():
+                name='run' if tabs.currentIndex()==0 else 'flow_config'
+                path,_=QtWidgets.QFileDialog.getSaveFileName(dialog,'Save log',name)
+                if path:
+                    try:
+                        with open(path,'w',encoding='utf-8') as stream:
+                            stream.write(tabs.currentWidget().toPlainText())
+                    except OSError as exc:
+                        QtWidgets.QMessageBox.warning(dialog,'Save failed',str(exc))
+            self.button(bar,'Find next',find_next)
+            self.button(bar,'Top',lambda: tabs.currentWidget().moveCursor(QtGui.QTextCursor.Start))
+            self.button(bar,'Bottom',lambda: tabs.currentWidget().moveCursor(QtGui.QTextCursor.End))
+            self.button(bar,'Save',save)
+            search.returnPressed.connect(find_next)
+            layout.addLayout(bar)
+            context={'editors':editors}
+            def fetch():
+                for editor in editors.values():
+                    editor.setPlainText('Loading...')
+                self.submit('logs',{'example_id':choice.currentData()['example_id']},context)
+            choice.currentIndexChanged.connect(fetch)
+            dialog.finished.connect(lambda _: self.latest.pop(('logs',id(context)),None))
+            fetch()
+            dialog.show()
 
         def fill(self,p,data):
             p['rows'],p['total']=data['items'],data['total']
@@ -663,7 +719,7 @@ def load_ui():
                 for j in range(2,len(headers)):
                     table.horizontalHeader().setSectionResizeMode(j,QtWidgets.QHeaderView.Stretch)
             elif p['kind']=='history':
-                for j,width in enumerate([250,195,135,85,95,145,75,105,190]):
+                for j,width in enumerate([500,195,135,85,95,145,75,105,190]):
                     table.setColumnWidth(j,width)
             size=p['size'].currentData()
             p['pager'].setText('Page %d / %d' % (p['offset']//size+1,max(1,(p['total']+size-1)//size)))
@@ -688,6 +744,10 @@ def load_ui():
             if error:
                 message=error.get('message','Request failed') if isinstance(error,dict) else str(error)
                 self.message.setText(message)
+                if kind=='logs':
+                    for editor in p['editors'].values():
+                        editor.setPlainText('Failed to load logs: '+message)
+                    return
                 if p is not None and kind==p['kind'] and extra!='detail':
                     p['retry']=True
                     p['summary'].setText('Load failed. Will retry: '+message)
@@ -697,6 +757,11 @@ def load_ui():
                     self.connection.setText('Connection failed')
                 return
             self.message.clear()
+            if kind=='logs':
+                for key,editor in p['editors'].items():
+                    editor.setPlainText(data.get(key) or 'No log text saved.')
+                p['editors']['run'].moveCursor(QtGui.QTextCursor.End)
+                return
             if kind=='status':
                 old=self.generation
                 self.generation=data['generation']

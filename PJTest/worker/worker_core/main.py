@@ -2312,6 +2312,17 @@ def run_one_task(scheduler_url, worker_name, task, shell_name, install_root_over
         "report_dir": None,
     }
 
+    if status in ("failed", "timeout"):
+        logs = {}
+        for name in ("run", "flow_config"):
+            saved = Path(log_dir) / "evidence" / name
+            if not saved.is_file():
+                saved = saved.with_name(saved.name + ".head_tail")
+            try:
+                logs[name] = saved.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                logs[name] = "Log unavailable: file was not captured."
+        report["execution_logs"] = logs
     pending_path = save_pending_report(worker_name, report)
     report_response = report_result_with_retry(
         scheduler_url,

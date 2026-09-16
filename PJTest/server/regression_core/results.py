@@ -67,6 +67,20 @@ class ResultsService:
         self.thread = threading.Thread(target=self.loop, name='results-view', daemon=True)
         self.thread.start()
 
+    def logs(self, query):
+        example_id = query.get('example_id', '')
+        if not example_id:
+            raise ViewError('example_id is required')
+        c = sqlite3.connect(self.source_path.resolve().as_uri() + '?mode=ro', uri=True, timeout=2)
+        try:
+            exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='example_logs'").fetchone()
+            row = c.execute('SELECT run_text,flow_text FROM example_logs WHERE example_id=?',
+                            (example_id,)).fetchone() if exists else None
+            return {'example_id': example_id, 'run': row[0] if row else 'No uploaded run log. Historical logs need to be collected from the worker.',
+                    'flow_config': row[1] if row else 'No uploaded flow_config.'}
+        finally:
+            c.close()
+
     def close(self):
         self.stop.set()
         if self.thread:

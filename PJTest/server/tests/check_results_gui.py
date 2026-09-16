@@ -59,6 +59,28 @@ def main():
                 window.select(row,2)
                 wait(lambda:'PAST RUNS' in p['details'].toPlainText())
                 assert 'SAMPLE: stage assertion' in p['details'].toPlainText()
+                selected=p['selected']
+                run=next(v for runs in selected['stages'].values() for v in runs)
+                with sqlite3.connect(str(source)) as conn:
+                    conn.execute('CREATE TABLE example_logs (example_id TEXT PRIMARY KEY, run_text TEXT, flow_text TEXT)')
+                    conn.execute('INSERT INTO example_logs VALUES (?,?,?)',
+                                 (run['example_id'],'FLOW CONFIG\nplace_design\nERROR: fixture failure','device=fixture'))
+                conn.close()
+                window.open_logs([run])
+                wait(lambda:not window.jobs)
+                dialog=next(d for d in window.findChildren(QtWidgets.QDialog) if d.windowTitle()=='Execution logs')
+                editors=dialog.findChildren(QtWidgets.QPlainTextEdit)
+                assert any('ERROR: fixture failure' in e.toPlainText() for e in editors)
+                assert any('device=fixture' in e.toPlainText() for e in editors)
+                search=dialog.findChild(QtWidgets.QLineEdit)
+                search.setText('ERROR')
+                next(b for b in dialog.findChildren(QtWidgets.QPushButton) if b.text()=='Find next').click()
+                assert any(e.textCursor().selectedText()=='ERROR' for e in editors)
+                output=Path(folder)/'saved-run.txt'
+                with patch.object(QtWidgets.QFileDialog,'getSaveFileName',return_value=(str(output),'')):
+                    next(b for b in dialog.findChildren(QtWidgets.QPushButton) if b.text()=='Save').click()
+                assert 'ERROR: fixture failure' in output.read_text(encoding='utf-8')
+                dialog.close()
                 shots=os.environ.get('PJTEST_RESULTS_SCREENSHOTS')
                 if shots:
                     app.processEvents()

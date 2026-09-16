@@ -25,7 +25,7 @@ import yaml
 SERVER_ROOT = Path(__file__).resolve().parents[1]
 PJTEST_ROOT = SERVER_ROOT.parent
 DEFAULT_DB_PATH = str(PJTEST_ROOT / "data" / "task_queue.db")
-DEFAULT_YAML_PATH = str(SERVER_ROOT / "task.yaml")
+DEFAULT_YAML_PATH = str(SERVER_ROOT / "Tasks.yaml")
 DEFAULT_TASKCTL_PATH = str(SERVER_ROOT / "taskctl.py")
 DEFAULT_LOG_DIR = str(PJTEST_ROOT / "logs" / "clock")
 DEFAULT_ZIP_DIR = "/home/xshare/zhouwei_runcache/GalaxCore/zip"

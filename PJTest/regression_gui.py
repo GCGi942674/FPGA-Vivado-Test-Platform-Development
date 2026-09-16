@@ -347,9 +347,13 @@ def load_ui():
                 controls.removeItem(box)
             for i,key in enumerate(order):
                 controls.insertLayout(i,page['boxes'][key])
-            self.button(controls,'Clear',self.clear)
+            clear_button=self.button(controls,'Clear',self.clear)
+            if kind in ('history','compare'):
+                controls.setAlignment(clear_button,QtCore.Qt.AlignBottom)
             controls.addStretch()
-            self.button(controls,'Save TXT',self.export_txt)
+            export_button=self.button(controls,'Save TXT',self.export_txt)
+            if kind in ('history','compare'):
+                controls.setAlignment(export_button,QtCore.Qt.AlignBottom)
             layout.addWidget(toolbar)
             page['summary']=QtWidgets.QLabel('Loading...')
             page['summary'].setStyleSheet('background:#ffffff;font-size:13px;color:#43556a;padding:4px 12px;')

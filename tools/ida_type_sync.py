@@ -10,17 +10,29 @@ from __future__ import print_function
 # ============================================================
 
 # Converter executable (override: CC_CONVERTER).
-DEFAULT_CONVERTER = "/home/chenggong/workspace/pyscript/container_convert"
+DEFAULT_CONVERTER = "/home/chenggong/exchange/pyscript/container_convert"
 
 # Converter working directory; relative input/output files resolve here.
 # Override: IDA_TYPE_SYNC_WORKDIR.
 DEFAULT_WORKDIR = "/home/chenggong/workspace/galaxcore"
+
+# Runtime libraries for the converter subprocess only, in search order.
+# Override: IDA_TYPE_SYNC_CONVERTER_LIB_PATH (empty disables the extra paths).
+DEFAULT_CONVERTER_LIB_PATH = (
+    "/home/fpga/lib/gcc-9.3.0/lib64:"
+    "/home/fpga/lib/qt-5.8.0/lib"
+)
+# Do not inherit IDA's forced libraries into the converter process.
+# This only edits a child environment copy; IDA retains its own LD_PRELOAD.
+CONVERTER_CLEAR_LD_PRELOAD = True
 
 # Optional settings: keep these defaults for normal use.
 # Registry override must be identical in the IDA and shell environments.
 DEFAULT_REGISTRY_DIR = ""  # Empty means automatic per-user temporary directory.
 DISCOVERY_TIMEOUT = 0.5  # Seconds per instance; increase if busy IDAs time out.
 ENABLE_VECTOR_BOOL_LAYOUT = True  # Supplied 64-bit Linux layout, not universal.
+PLUGIN_PYTHON = "python3"  # External Python 3.6+ executable, not the IDA executable.
+PLUGIN_SHORTCUT = "Ctrl-Alt-I"
 
 # The alias and IDA exec(open(...)) command must use this file's actual path.
 # No script-path setting is needed inside this file.
@@ -1026,8 +1038,133 @@ if IN_IDA:
         )
 
 
-    # Running from IDA Python Console starts the bridge.
-    start_bridge()
+    # Plugin UI and CLI share this file. The converter runs outside the UI thread.
+    class SyncSelectionAction(ida_kernwin.action_handler_t):
+        def __init__(self, plugin):
+            ida_kernwin.action_handler_t.__init__(self)
+            self.plugin = plugin
+
+        def activate(self, ctx):
+            self.plugin.sync_selection(ctx.widget)
+            return 1
+
+        def update(self, ctx):
+            return (ida_kernwin.AST_DISABLE_ALWAYS if self.plugin.process is not None
+                    else ida_kernwin.AST_ENABLE_ALWAYS)
+
+
+    class SyncPopupHooks(ida_kernwin.UI_Hooks):
+        def finish_populating_widget_popup(self, widget, popup, ctx=None):
+            ida_kernwin.attach_action_to_popup(widget, popup, "its:sync_selection", None)
+
+
+    class TypeSyncPlugin(idaapi.plugin_t):
+        flags = idaapi.PLUGIN_FIX
+        comment = "Convert selected container and refill compatible members"
+        help = "Select a member name, then right-click: ITS: Sync selected member"
+        wanted_name = "IDA Type Sync"
+        wanted_hotkey = ""
+
+        def init(self):
+            self.process = None
+            self.namespace_server = None
+            self.output = bytearray()
+            self.handler = SyncSelectionAction(self)
+            action = ida_kernwin.action_desc_t(
+                "its:sync_selection", "ITS: Sync selected member", self.handler,
+                PLUGIN_SHORTCUT, "Import container types and update compatible members", -1)
+            if not ida_kernwin.register_action(action):
+                return idaapi.PLUGIN_SKIP
+            self.hooks = SyncPopupHooks()
+            self.hooks.hook()
+            bridge_log("ITS menu ready; select a member and press %s" % PLUGIN_SHORTCUT)
+            return idaapi.PLUGIN_KEEP
+
+        def sync_selection(self, widget):
+            import re
+            if self.process is not None:
+                bridge_log("ITS is already running")
+                return
+            selected = ida_kernwin.get_highlight(widget)
+            text = selected[0].strip() if selected else ""
+            # Never execute arbitrary selected text as a shell command.
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*_0x[0-9a-fA-F]+$", text):
+                ida_kernwin.warning("Select one complete member name ending in _0xOFFSET.")
+                return
+            try:
+                from PyQt5.QtCore import QProcess
+                script_path = os.path.abspath(__file__)
+                if not os.path.isfile(script_path):
+                    raise RuntimeError("Cannot locate ida_type_sync.py")
+                if not idc.get_idb_path():
+                    raise RuntimeError("Open an IDA database first")
+                # Always reload our own bridge, never choose another focused IDA.
+                start_bridge()
+                self.namespace_server = getattr(builtins, SERVER_OBJECT_NAME)
+                self.output = bytearray()
+                process = QProcess()
+                self.process = process
+                process.setProcessChannelMode(QProcess.MergedChannels)
+                process.readyReadStandardOutput.connect(self.read_output)
+                process.finished.connect(self.finished)
+                process.errorOccurred.connect(self.process_error)
+                process.start(PLUGIN_PYTHON, [script_path, text, "--ida", str(os.getpid())])
+                bridge_log("ITS: %s" % text)
+            except Exception as exc:
+                self.process = None
+                ida_kernwin.warning("ITS could not start: %s" % exc)
+
+        def read_output(self):
+            if self.process is not None:
+                self.output.extend(bytes(self.process.readAllStandardOutput()))
+
+        def process_error(self, error):
+            if self.process is None:
+                return
+            from PyQt5.QtCore import QProcess
+            if error == QProcess.FailedToStart:
+                bridge_log("[FAIL] Cannot start %s: %s" % (
+                    PLUGIN_PYTHON, self.process.errorString()))
+                self.process.deleteLater()
+                self.process = None
+
+        def finished(self, exit_code, exit_status):
+            if self.process is None:
+                return
+            self.read_output()
+            message = self.output.decode("utf-8", errors="replace").strip()
+            if message:
+                ida_kernwin.msg(message + "\n")
+            if exit_code or exit_status:
+                bridge_log("[FAIL] ITS process exited: %s; see output above" % exit_code)
+            elif "[WARN]" in message:
+                bridge_log("Types imported; finish the reported member changes manually.")
+            self.process.deleteLater()
+            self.process = None
+            ida_kernwin.refresh_idaview_anyway()
+
+        def run(self, arg):
+            self.sync_selection(ida_kernwin.get_current_widget())
+
+        def term(self):
+            if self.process is not None:
+                self.process.kill()
+                self.process = None
+            if hasattr(self, "hooks"):
+                self.hooks.unhook()
+            ida_kernwin.unregister_action("its:sync_selection")
+            if (self.namespace_server is not None and
+                    getattr(builtins, SERVER_OBJECT_NAME, None) is self.namespace_server):
+                stop_old_bridge()
+
+
+    def PLUGIN_ENTRY():
+        return TypeSyncPlugin()
+
+
+    # Manual console execution preserves the original bridge-only workflow.
+    if __name__ == "__main__":
+        start_bridge()
 
 
 # ============================================================
@@ -1370,6 +1507,19 @@ else:
     # Converter
     # ========================================================
 
+    def converter_environment():
+        environment = os.environ.copy()
+        if sys.platform.startswith("linux") and CONVERTER_CLEAR_LD_PRELOAD:
+            environment.pop("LD_PRELOAD", None)
+        extra = environment.get("IDA_TYPE_SYNC_CONVERTER_LIB_PATH",
+                                DEFAULT_CONVERTER_LIB_PATH)
+        if extra and sys.platform.startswith("linux"):
+            inherited = environment.get("LD_LIBRARY_PATH", "")
+            environment["LD_LIBRARY_PATH"] = extra + (
+                ":" + inherited if inherited else "")
+        return environment
+
+
     def run_converter(pattern):
 
         if not os.path.isfile(
@@ -1390,6 +1540,7 @@ else:
                     pattern
                 ],
                 cwd=WORKDIR,
+                env=converter_environment(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True

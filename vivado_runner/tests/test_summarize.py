@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib' / 'python'))
-from summarize import build_reports, build_timeout_lines
+from summarize import build_reports
 
 
 class SummaryTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(data['reason_counter'], {'FAIL_REASON': 1})
         self.assertEqual(summary, '')
         self.assertNotIn('old', failed + stat + text)
-        self.assertEqual(build_timeout_lines(data['records'], str(self.root)), '')
+        self.assertEqual(data['timeout_cases'], 0)
 
     def test_empty_list_does_not_fall_back_to_history(self):
         self.list.write_text('', encoding='utf-8')
@@ -51,7 +51,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(data['total'], 4)
         self.assertEqual(data['skipped_cases'], 1)
         self.assertEqual(data['reason_counter'], {'FAIL_REASON': 1, 'TIMEOUT_REASON': 1})
-        self.assertEqual(build_timeout_lines(data['records'], str(self.root)), '/timeout/run.tcl\n')
+        self.assertEqual(data['timeout_cases'], 1)
 
     def test_missing_explicit_list_fails_instead_of_counting_history(self):
         with self.assertRaises(FileNotFoundError):

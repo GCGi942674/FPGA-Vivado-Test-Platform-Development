@@ -123,4 +123,41 @@ printf 'DCP Shape Compare FAIL : DIFFERENT\nRuntime: 34\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result shape_marker_ignored_without_shape_cmp PASS PASS
 
+# Both timing artifacts are mandatory, even when another flow can pass early.
+for extra in timing shape dcp checksum utilization; do
+    for result in pass rpt_missing rpt_fail rpx_missing rpx_fail; do
+        new_case "timing_${extra}_${result}"
+        FLOW_ARGS=(report_timing_summary)
+        case "$extra" in
+            shape) FLOW_ARGS+=(read_edif read_xdc write_checkpoint shape_cmp) ;;
+            dcp) FLOW_ARGS+=(dcp_cmp) ;;
+            checksum) FLOW_ARGS+=(checksum_cmp); : > "$CASE_DIR/mis_checksum.txt" ;;
+            utilization) FLOW_ARGS+=(report_utilization); : > "$CASE_DIR/mis_report_utilization.txt" ;;
+        esac
+        printf 'DCP Shape Compare PASS : SAME\nDCP_PASS (route_design)\nRuntime: 34\n' > "$RUN_LOG"
+        : > "$CASE_DIR/mis_timing_summary.txt"
+        : > "$CASE_DIR/mis_rpx.txt"
+        case "$result" in
+            rpt_missing) rm "$CASE_DIR/mis_timing_summary.txt"; expected=TIMING_SUMMARY_MISSING ;;
+            rpt_fail) echo mismatch > "$CASE_DIR/mis_timing_summary.txt"; expected=TIMING_SUMMARY_FAIL ;;
+            rpx_missing) rm "$CASE_DIR/mis_rpx.txt"; expected=RPX_RESULT_MISSING ;;
+            rpx_fail) echo mismatch > "$CASE_DIR/mis_rpx.txt"; expected=RPX_COMPARE_FAIL ;;
+        esac
+        judge_case_result "$CASE_DIR" "$RUN_LOG"
+        if [ "$result" = pass ]; then
+            [ "$CASE_STATUS" = PASS ] || { echo "Combined timing flow did not pass: $extra"; exit 1; }
+        else
+            assert_result "timing_${extra}_${result}" FAIL "$expected"
+            [ "$CASE_STAGE" = report_timing_summary ] || exit 1
+        fi
+    done
+done
+
+new_case timing_disabled
+FLOW_ARGS=()
+printf 'mismatch\n' > "$CASE_DIR/mis_rpx.txt"
+printf 'Runtime: 34\n' > "$RUN_LOG"
+judge_case_result "$CASE_DIR" "$RUN_LOG"
+assert_result timing_disabled PASS PASS
+
 printf 'All judge tests passed.\n'

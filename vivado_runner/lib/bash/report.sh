@@ -5,7 +5,6 @@ FAILED_TXT="$REPORT_DIR/list_fail_to_run"
 STAT_TXT="$REPORT_DIR/stat_summary"
 EXECUTION_TXT="$REPORT_DIR/execution_report.txt"
 EXECUTION_JSON="$REPORT_DIR/execution_report.json"
-TIMEOUT_TXT="$WORKSPACE_ROOT/timeout_list"
 
 sort_reports() {
     # Sort runtime summary by runtime number if the format contains one.
@@ -18,10 +17,6 @@ sort_reports() {
         sort "$FAILED_TXT" -o "$FAILED_TXT"
     fi
 
-    # Keep timeout report stable and unique.
-    if [ -f "$TIMEOUT_TXT" ]; then
-        sort -u "$TIMEOUT_TXT" -o "$TIMEOUT_TXT"
-    fi
 }
 
 refresh_reports() {
@@ -35,7 +30,6 @@ refresh_reports() {
         --stat "$STAT_TXT" \
         --text-report "$EXECUTION_TXT" \
         --json-report "$EXECUTION_JSON" \
-        --timeout-list "$TIMEOUT_TXT" \
         --workspace-root "$WORKSPACE_ROOT" \
         --workspace-id "$WORKSPACE_ID" \
         --runtime-namespace "$RUNTIME_NAMESPACE" \
@@ -70,14 +64,12 @@ finalize_reports() {
           "$EXECUTION_JSON" \
           "$archive_dir/" 2>/dev/null || true
 
-    # timeout_list intentionally stays under WORKSPACE_ROOT and is not copied to Share.
 }
 
 print_final_summary() {
     log_info "Latest summary: $SUMMARY_TXT"
     log_info "Latest fail list: $FAILED_TXT"
     log_info "Latest stat file: $STAT_TXT"
-    log_info "Timeout list: $TIMEOUT_TXT"
 
     if [ -f "$EXECUTION_TXT" ]; then
         cat "$EXECUTION_TXT" || true

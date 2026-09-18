@@ -91,6 +91,30 @@ judge_case_result() {
         return 0
     fi
 
+    # Timing reporting owns both comparisons. Check before any other flow
+    # can return PASS, including shape and DCP comparisons.
+    if flow_arg_enabled "report_timing_summary"; then
+        CASE_STAGE="report_timing_summary"
+        if [ ! -f "$case_dir/mis_timing_summary.txt" ]; then
+            CASE_REASON="TIMING_SUMMARY_MISSING"
+            return 0
+        fi
+        if [ -s "$case_dir/mis_timing_summary.txt" ]; then
+            CASE_REASON="TIMING_SUMMARY_FAIL"
+            return 0
+        fi
+        if [ ! -f "$case_dir/mis_rpx.txt" ]; then
+            CASE_REASON="RPX_RESULT_MISSING"
+            return 0
+        fi
+        if [ -s "$case_dir/mis_rpx.txt" ]; then
+            CASE_REASON="RPX_COMPARE_FAIL"
+            return 0
+        fi
+        compare_artifacts_passed=1
+        CASE_STAGE="none"
+    fi
+
     # Runtime proves only that GalaxCore completed. An explicitly enabled
     # shape_cmp flow must still honor the shape PASS/FAIL marker in run.
     if flow_arg_enabled "shape_cmp"; then
@@ -156,19 +180,6 @@ judge_case_result() {
         fi
     fi
 
-    if flow_arg_enabled "report_timing_summary"; then
-        if [ -e "$case_dir/mis_timing_summary.txt" ]; then
-            if [ -s "$case_dir/mis_timing_summary.txt" ]; then
-                CASE_REASON="TIMING_SUMMARY_FAIL"
-                return 0
-            fi
-        else
-            CASE_REASON="TIMING_SUMMARY_MISSING"
-            return 0
-        fi
-        compare_artifacts_passed=1
-    fi
-
     # checksum compare
     # checksum_cmp is independent from write_bitstream.
     #
@@ -227,33 +238,6 @@ judge_case_result() {
         CASE_STATUS="PASS"
         CASE_REASON="REPORT_UTILIZATION_COMPARE_PASS"
         CASE_STAGE="report_utilization"
-        return 0
-    fi
-
-    # rpx compare
-    # The result is determined only by mis_rpx.txt:
-    #   missing   -> rpx compare flow unfinished
-    #   non-empty -> rpx compare failed
-    #   empty     -> rpx compare passed
-    if flow_arg_enabled "rpx_cmp"; then
-
-        local rpx_file="$case_dir/mis_rpx.txt"
-
-        if [ ! -f "$rpx_file" ]; then
-            CASE_REASON="RPX_RESULT_MISSING"
-            CASE_STAGE="rpx_cmp"
-            return 0
-        fi
-
-        if [ -s "$rpx_file" ]; then
-            CASE_REASON="RPX_COMPARE_FAIL"
-            CASE_STAGE="rpx_cmp"
-            return 0
-        fi
-
-        CASE_STATUS="PASS"
-        CASE_REASON="RPX_COMPARE_PASS"
-        CASE_STAGE="rpx_cmp"
         return 0
     fi
 

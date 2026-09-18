@@ -1,5 +1,6 @@
 read_edif 0
 read_xdc 0
+# Compare both timing RPT and RPX reports.
 report_timing_summary 0
 opt_design 0
 place_design 0
@@ -16,4 +17,3 @@ bgn_cmp 1
 dcp_cmp 0
 checksum_cmp 0
 report_utilization 0
-rpx_cmp 0

@@ -65,24 +65,6 @@ def format_run_tcl_path(path, workspace_root):
     return abs_path.replace(os.sep, '/')
 
 
-def build_timeout_lines(records, workspace_root):
-    timeout_lines = []
-    seen_paths = set()
-
-    for rec in records:
-        if rec.get('STATUS', 'UNKNOWN') != 'TIMEOUT':
-            continue
-
-        run_tcl = rec.get('RUN_TCL') or os.path.join(rec.get('CASE_DIR', ''), 'run.tcl')
-        timeout_path = format_run_tcl_path(run_tcl, workspace_root)
-
-        if timeout_path and timeout_path not in seen_paths:
-            timeout_lines.append(timeout_path)
-            seen_paths.add(timeout_path)
-
-    return '\n'.join(timeout_lines) + ('\n' if timeout_lines else '')
-
-
 def build_reports(records, meta):
     cases = load_case_list(meta.get('case_list', ''), meta.get('workspace_root', ''))
     if cases is not None:
@@ -245,7 +227,6 @@ def main():
     parser.add_argument('--stat', required=True)
     parser.add_argument('--text-report', required=True)
     parser.add_argument('--json-report', required=True)
-    parser.add_argument('--timeout-list', required=True)
     parser.add_argument('--workspace-root', required=True)
     parser.add_argument('--workspace-id', default='')
     parser.add_argument('--runtime-namespace', default='')
@@ -274,13 +255,11 @@ def main():
     }
 
     summary_text, failed_text, stat_text, report_text, payload = build_reports(records, meta)
-    timeout_text = build_timeout_lines(payload['records'], args.workspace_root)
 
     write_text(args.summary, summary_text)
     write_text(args.failed, failed_text)
     write_text(args.stat, stat_text)
     write_text(args.text_report, report_text)
-    write_text(args.timeout_list, timeout_text)
     write_json(args.json_report, payload)
 
 

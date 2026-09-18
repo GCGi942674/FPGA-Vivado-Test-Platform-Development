@@ -249,6 +249,7 @@ proc reportTimingSummary {} {
   report_timing_summary -file output_timing.rpt -rpx output_timing.rpx
   set case_home [getCaseHome]
   timing_summary_cmp ${case_home}/golden_timing.rpt output_timing.rpt mis_timing_summary.txt
+  rpx_cmp ${case_home}/golden_timing.rpx output_timing.rpx mis_rpx.txt
 }
 
 proc placeDesign {} {
@@ -315,12 +316,6 @@ proc checksumCmp {} {
   }
 }
 
-proc rpxCmp {} {
-  global params
-  set case_home [getCaseHome]
-  rpx_cmp ${case_home}/golden_timing.rpx output_timing.rpx mis_rpx.txt
-}
-
 proc dcpCmp {} {
   global params
   set case_home [getCaseHome]
@@ -385,7 +380,6 @@ proc argParser {num args} {
   dict set params "write_checkpoint" 0
   dict set params "dcp_cmp" 0
   dict set params "checksum_cmp" 0
-  dict set params "rpx_cmp" 0
 
   dict set params "input_dcp" ""
   dict set params "cmp_golden_dcp" ""
@@ -423,7 +417,6 @@ proc argParser {num args} {
       if { $var == "write_checkpoint" } { dict set params "write_checkpoint" 1 }
       if { $var == "dcp_cmp"} {dict set params "dcp_cmp" 1}
       if { $var == "report_utilization"} {dict set params "report_utilization" 1}
-      if { $var == "rpx_cmp"} {dict set params "rpx_cmp" 1}
     }
   }
 
@@ -487,9 +480,6 @@ proc runFlow {} {
 
   if {[dict get $params "dcp_cmp"] == 1 && [dict get $params "cmp_golden_dcp"] != ""}  {
     dcpCmp
-  }
-  if {[dict get $params "rpx_cmp"] == 1}  {
-      rpxCmp
   }
 
 }

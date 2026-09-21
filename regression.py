@@ -40,26 +40,74 @@ def resolve_testcase(value, test2):
     return candidate
 
 
-def cached_versions(output):
-    output = re.sub(r'\x1b\[[0-9;]*m', '', output)
-    match = re.search(r'All available (?:release\s+)?success versions:\s*\[([^]]*)\]', output)
-    if not match:
-        raise RuntimeError('Cannot parse qkmk -v success versions')
-    return sorted(set(int(v) for v in re.findall(r'\d+', match.group(1))))
+DEFAULT_VERSION_FILE = '/home/xshare/zhouwei_runcache/projectObj/GalaxCore/opt/success_version'
 
 
-def locate(versions, step, test):
-    """Search cached indices, assuming a single PASS to FAIL transition."""
-    high = len(versions) - 1
-    if test(versions[high], 'BASE') == 'PASS':
-        return {'outcome': 'BASE_PASS', 'base': versions[high]}
-    while high > 0:
-        low = max(0, high - step)
-        if test(versions[low], 'BACKWARD') == 'PASS':
-            break
-        high = low
-    else:
-        return {'outcome': 'NO_PASS_IN_CACHE', 'oldest': versions[0]}
+def parse_version_manifest(content):
+    """Parse the complete cache manifest, not the abbreviated qkmk display.
+
+    E revisions reuse unchanged source and are not separate cache candidates.
+    Day versions extend the history beyond the rolling success cache.
+    """
+    groups, equivalent = {}, set()
+    for label in ('success version', 'day_version'):
+        headers = re.findall(r'^[ \t]*' + re.escape(label) + r'\b', content, re.MULTILINE)
+        matches = re.findall(r'^[ \t]*' + re.escape(label) + r'\s*\[([^\]]*)\][ \t]*\r?$',
+                             content, re.MULTILINE)
+        if (len(headers) != len(matches) or len(matches) > 1 or
+                (label == 'success version' and not matches)):
+            raise RuntimeError('Invalid success_version file: expected one ' + label + ' list')
+        versions = groups[label] = set()
+        if not matches or not matches[0].strip():
+            continue
+        for item in matches[0].split(','):
+            token = item.strip()
+            if not re.fullmatch(r'[0-9]+E?', token):
+                raise RuntimeError('Invalid version token in {}: {!r}; a complete manifest is required'.format(label, token))
+            if token.endswith('E'):
+                equivalent.add(int(token[:-1]))
+            else:
+                versions.add(int(token))
+    result = sorted((groups['success version'] | groups['day_version']) - equivalent)
+    if not result:
+        raise RuntimeError('No usable cached versions in success_version file')
+    return {'versions': result, 'day_versions': sorted(groups['day_version'] - equivalent)}
+
+
+def read_candidates(path, current, snapshot):
+    path = Path(path).expanduser()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError('Cannot read version file {}: {}'.format(path, exc))
+    Path(snapshot).write_bytes(data)
+    manifest = parse_version_manifest(data.decode('utf-8-sig'))
+    # The checkout can be newer than the build cache or an equivalent E
+    # revision. Do not ask qkmk to build an unavailable candidate.
+    versions = [v for v in manifest['versions'] if v <= current]
+    if not versions:
+        raise RuntimeError('No usable cached version at or before checkout r{}'.format(current))
+    return {'versions': versions,
+            'day_versions': [v for v in manifest['day_versions'] if v < versions[-1]]}
+
+
+def cached_test(test):
+    """Only cache conclusive testcase results, never infrastructure errors."""
+    results = {}
+
+    def checked(version, phase):
+        if version not in results:
+            status = test(version, phase)
+            if status not in ('PASS', 'FAIL'):
+                raise RuntimeError('Inconclusive testcase status at r{}: {}'.format(version, status))
+            results[version] = status
+        return results[version]
+
+    return checked
+
+
+def bisect_boundary(versions, low, high, test):
+    """Refine a tested PASS/FAIL bracket using available cache entries only."""
     while high - low > 1:
         mid = (low + high) // 2
         if test(versions[mid], 'BISECT') == 'PASS':
@@ -70,9 +118,51 @@ def locate(versions, step, test):
             'first_fail': versions[high], 'uncached_gap': versions[high] - versions[low] > 1}
 
 
+def locate(versions, step, test):
+    """Search cached indices, assuming a single PASS to FAIL transition."""
+    test = cached_test(test)
+    high = len(versions) - 1
+    if test(versions[high], 'BASE') == 'PASS':
+        return {'outcome': 'BASE_PASS', 'base': versions[high]}
+    while high > 0:
+        low = max(0, high - step)
+        if test(versions[low], 'BACKWARD') == 'PASS':
+            break
+        high = low
+    else:
+        return {'outcome': 'NO_PASS_IN_CACHE', 'oldest': versions[0]}
+    return bisect_boundary(versions, low, high, test)
+
+
+def locate_by_day(versions, day_versions, test):
+    """Probe daily caches backwards, then bisect one PASS-to-FAIL interval."""
+    test = cached_test(test)
+    high = len(versions) - 1
+    if test(versions[high], 'BASE') == 'PASS':
+        return {'outcome': 'BASE_PASS', 'base': versions[high]}
+    indices = {version: index for index, version in enumerate(versions)}
+    days = sorted({indices[v] for v in day_versions if v in indices and v < versions[-1]},
+                  reverse=True)
+    for low in days:
+        if test(versions[low], 'DAY') == 'PASS':
+            return bisect_boundary(versions, low, high, test)
+        high = low
+    # With a single PASS-to-FAIL transition, the oldest available cache is
+    # enough to bracket any boundary older than all failed daily checkpoints.
+    # This also handles a manifest without any day versions.
+    if high > 0 and test(versions[0], 'OLDEST') == 'PASS':
+        return bisect_boundary(versions, 0, high, test)
+    return {'outcome': 'NO_PASS_IN_CACHE', 'oldest': versions[0]}
+
+
 def format_summary(result, current, case, count, records):
     """Render a readable terminal summary while keeping JSON machine-readable."""
     lines = ['', '=' * 60, 'Regression Search Result', '-' * 60, 'Testcase: {}'.format(case)]
+    original = result.get('original_revision')
+    base = result.get('test_base_revision')
+    if original is not None and base is not None and original != base:
+        lines.extend(['Original checkout: r{} (not tested; not a usable cache entry)'.format(original),
+                      'Tested base: r{}'.format(base)])
     outcome = result['outcome']
     if outcome == 'BOUNDARY':
         if result.get('uncached_gap'):
@@ -84,13 +174,13 @@ def format_summary(result, current, case, count, records):
             ])
         else:
             lines.extend([
-                'Status: First failing version in history identified',
+                'Status: First failing version identified (single-transition assumption)',
                 'First failure: r{}  [FAIL]'.format(result['first_fail']),
                 'Previous pass: r{}  [PASS]'.format(result['last_pass']),
                 'Suggested check: Review the code changes in r{}.'.format(result['first_fail']),
             ])
     elif outcome == 'BASE_PASS':
-        lines.extend(['Status: Current version passed; failure not reproduced',
+        lines.extend(['Status: Starting cached version passed; failure not reproduced',
                       'Base version: r{}  [PASS]'.format(result['base']),
                       'Historical versions were not searched.'])
     elif outcome == 'NO_PASS_IN_CACHE':
@@ -133,7 +223,10 @@ class Regression:
         self.output = self.test2 / 'vivado_runner' / 'regression_results' / stamp
         self.output.mkdir(parents=True)
         self.rows = []
+        self.strategy = 'step' if args.step is not None else 'day'
         self.current = None
+        self.original_revision = None
+        self.test_base_revision = None
         self.lock = None
 
     def command(self, argv, cwd, log, env=None):
@@ -172,6 +265,8 @@ class Regression:
 
     def save(self, result=None):
         data = {'case': str(self.case), 'step': self.args.step,
+                'strategy': self.strategy, 'versions_file': self.args.versions_file,
+                'original_revision': self.original_revision, 'test_base_revision': self.test_base_revision,
                 'current_revision': self.current, 'tests': self.rows,
                 'result': result, 'assumption': 'Single PASS-to-FAIL transition in cached versions'}
         (self.output / 'results.json').write_text(json.dumps(data, indent=2), encoding='utf-8')
@@ -272,12 +367,28 @@ class Regression:
                             str(self.snapshot / 'vivado_runner' / name),
                             ignore=shutil.ignore_patterns('__pycache__'))
         self.current = self.revision()
-        output = self.command(['csh', '-ic', 'qkmk -v'], self.root, self.output / 'versions.log')
-        versions = [v for v in cached_versions(output) if v < self.current] + [self.current]
-        print('Case: {}\nBase: r{} | cached candidates: {} | step: {}\nLogs: {}'.format(
-            self.case, self.current, len(versions), self.args.step, self.output), flush=True)
+        self.original_revision = self.current
         try:
-            result = locate(versions, self.args.step, self.test)
+            candidates = read_candidates(self.args.versions_file, self.current,
+                                         self.output / 'success_version.snapshot')
+            versions, days = candidates['versions'], candidates['day_versions']
+            self.test_base_revision = versions[-1]
+            (self.output / 'candidate_versions.json').write_text(json.dumps(candidates, indent=2))
+            mode = 'day checkpoints, then bisect' if self.strategy == 'day' else 'step {}'.format(self.args.step)
+            print('Version file: {}'.format(self.args.versions_file), flush=True)
+            print('Case: {}\nOriginal checkout: r{}\nBase: r{} | candidates (including base): {} | day checkpoints: {}\nSearch: {}\nLogs: {}'.format(
+                self.case, self.original_revision, self.test_base_revision,
+                len(versions), len(days), mode, self.output), flush=True)
+            if self.original_revision != self.test_base_revision:
+                print('r{} has no separate usable cache entry; starting from r{}.'.format(
+                    self.original_revision, self.test_base_revision), flush=True)
+            if self.strategy == 'day':
+                if not days:
+                    print('No earlier day checkpoints; bracket with the oldest available cache.', flush=True)
+                result = locate_by_day(versions, days, self.test)
+            else:
+                result = locate(versions, self.args.step, self.test)
+            result.update(original_revision=self.original_revision, test_base_revision=self.test_base_revision)
             self.save(result)
             summary = format_summary(result, self.current, self.case,
                                      len(self.rows), self.output / 'results.tsv')
@@ -289,16 +400,25 @@ class Regression:
             raise
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('testcase', help='One testcase directory or run.tcl')
-    parser.add_argument('step', nargs='?', type=int, default=4, help='Cached-version stride (default: 4)')
+    parser.add_argument('step', nargs='?', type=int,
+                        help='Use legacy cached-version stride; omit for day checkpoints followed by bisection')
+    parser.add_argument('--versions-file', default=DEFAULT_VERSION_FILE,
+                        help='Complete success_version manifest (default: %(default)s)')
     parser.add_argument('--timeout', type=int, default=10800)
-    args = parser.parse_args()
-    if args.step < 1 or args.timeout < 1:
+    args = parser.parse_args(argv)
+    if (args.step is not None and args.step < 1) or args.timeout < 1:
         parser.error('step and timeout must be positive')
+    return args
+
+
+def main():
+    args = parse_args()
     if os.name != 'posix':
-        parser.error('Run this command on the Linux GalaxCore workstation')
+        print('ERROR: Run this command on the Linux GalaxCore workstation', file=sys.stderr)
+        return 2
     def interrupted(signum, frame):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, interrupted)

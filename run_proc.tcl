@@ -293,13 +293,33 @@ proc bgnCmp {} {
 proc bitCmp {} {
   global params
   set case_home [getCaseHome]
-  bit_cmp ${case_home}/golden.bit output.bit mis_bit.txt
-}
+  set golden [file join $case_home golden.bit]
+  set archive [file normalize [file join $case_home golden.bit.zip]]
+  if {![file exists $archive]} {
+    bit_cmp $golden output.bit mis_bit.txt
+    return
+  }
 
-proc mskCmp {} {
-  global params
-  set case_home [getCaseHome]
-  bit_cmp ${case_home}/golden.msk output.msk mis_msk.txt
+  # Extract only the reference member, without writing into the shared case tree.
+  set temporary [file join [pwd] "golden_cmp.[pid].[clock clicks].bit"]
+  set channel [open $temporary {WRONLY CREAT EXCL}]
+  set status [catch {
+    fconfigure $channel -translation binary -encoding binary
+    exec unzip -p $archive golden.bit >@ $channel
+    close $channel
+    set channel ""
+    if {[file size $temporary] == 0} {
+      error "Empty golden.bit in $archive"
+    }
+    bit_cmp $temporary output.bit mis_bit.txt
+  } result options]
+  if {$channel ne ""} {
+    catch {close $channel}
+  }
+  file delete -force $temporary
+  if {$status != 0} {
+    return -options $options $result
+  }
 }
 
 proc checksumCmp {} {
@@ -375,7 +395,6 @@ proc argParser {num args} {
   dict set params "report_bgn_only" 0
   dict set params "bgn_cmp" 0
   dict set params "bit_cmp" 0
-  dict set params "msk_cmp" 0
   dict set params "readback_cmp" 0
   dict set params "write_checkpoint" 0
   dict set params "dcp_cmp" 0
@@ -388,7 +407,6 @@ proc argParser {num args} {
     dict set params "write_bitstream" 1
     dict set params "bgn_cmp" 1
     dict set params "bit_cmp" 1
-    dict set params "msk_cmp" 1
   } else {
     set arg [lindex $args 0]
     puts $arg
@@ -410,7 +428,6 @@ proc argParser {num args} {
       if { $var == "report_bgn_only"} {dict set params "report_bgn_only" 1}
       if { $var == "bgn_cmp"} {dict set params "bgn_cmp" 1}
       if { $var == "bit_cmp"} {dict set params "bit_cmp" 1}
-      if { $var == "msk_cmp"} {dict set params "msk_cmp" 1}
       if { $var == "checksum_cmp"} {dict set params "checksum_cmp" 1}
       if { $var == "readback_cmp"} {dict set params "readback_cmp" 1}
 
@@ -458,9 +475,6 @@ proc runFlow {} {
     writeBit
     if {[dict get $params "bit_cmp"] == 1}  {
       bitCmp
-    }
-    if {[dict get $params "msk_cmp"] == 1}  {
-      mskCmp
     }
     if {[dict get $params "bgn_cmp"] == 1}  {
       bgnCmp

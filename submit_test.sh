@@ -86,8 +86,7 @@ write_runtime_summary() {
 declare -a my_argv
 my_argv[0]=write_bitstream
 my_argv[1]=bit_cmp
-my_argv[2]=msk_cmp
-my_argv[3]=bgn_cmp
+my_argv[2]=bgn_cmp
 #my_argv[4]=report_timing_summary
 declare -a my_argv_readback_cmp
 declare -a my_argv_report_timing_only

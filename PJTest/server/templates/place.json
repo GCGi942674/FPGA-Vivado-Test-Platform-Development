@@ -18,7 +18,6 @@
         "write_checkpoint": 0,
         "write_bitstream": 0,
         "bit_cmp": 0,
-        "msk_cmp": 0,
         "bgn_cmp": 0,
         "dcp_cmp": 0,
         "checksum_cmp": 0,

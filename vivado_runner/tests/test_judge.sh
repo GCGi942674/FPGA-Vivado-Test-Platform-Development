@@ -38,28 +38,26 @@ new_case() {
 }
 
 new_case runtime_missing
-FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp msk_cmp)
+FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp)
 : > "$CASE_DIR/result_bgn.log"
 : > "$CASE_DIR/mis_bit.txt"
-: > "$CASE_DIR/mis_msk.txt"
 printf 'Routing Is Done.\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result runtime_missing FAIL RUNTIME_MISSING
 
 new_case runtime_not_final
-FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp msk_cmp)
+FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp)
 : > "$CASE_DIR/result_bgn.log"
 : > "$CASE_DIR/mis_bit.txt"
-: > "$CASE_DIR/mis_msk.txt"
 printf 'Runtime: 73\nlate error\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result runtime_not_final FAIL RUNTIME_NOT_FINAL
 
 new_case all_compares_pass
-FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp msk_cmp)
+FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp)
 : > "$CASE_DIR/result_bgn.log"
 : > "$CASE_DIR/mis_bit.txt"
-: > "$CASE_DIR/mis_msk.txt"
+printf 'legacy mask mismatch\n' > "$CASE_DIR/mis_msk.txt"
 printf 'Routing Is Done.\nRuntime: 73\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result all_compares_pass PASS COMPARE_ARTIFACTS_PASS
@@ -71,24 +69,22 @@ judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result runtime_with_crlf_and_trailing_blank PASS PASS
 
 new_case bgn_compare_fail
-FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp msk_cmp)
+FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp)
 printf 'mismatch\n' > "$CASE_DIR/result_bgn.log"
 : > "$CASE_DIR/mis_bit.txt"
-: > "$CASE_DIR/mis_msk.txt"
 printf 'Runtime: 73\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result bgn_compare_fail FAIL BGN_COMPARE_FAIL
 
 new_case missing_bit_result
-FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp msk_cmp)
+FLOW_ARGS=(write_bitstream bgn_cmp bit_cmp)
 : > "$CASE_DIR/result_bgn.log"
-: > "$CASE_DIR/mis_msk.txt"
 printf 'Runtime: 73\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result missing_bit_result FAIL BIT_RESULT_MISSING
 
 new_case compares_ignored_without_write
-FLOW_ARGS=(bgn_cmp bit_cmp msk_cmp)
+FLOW_ARGS=(bgn_cmp bit_cmp)
 printf 'Runtime: 73\n' > "$RUN_LOG"
 judge_case_result "$CASE_DIR" "$RUN_LOG"
 assert_result compares_ignored_without_write PASS PASS

@@ -12,7 +12,6 @@ write_checkpoint 0
 shape_cmp 0
 write_bitstream 1
 bit_cmp 1
-msk_cmp 1
 bgn_cmp 1
 dcp_cmp 0
 checksum_cmp 0

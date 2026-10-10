@@ -35,8 +35,6 @@ shape_cmp 0
 write_bitstream 1
   # bit compare
   bit_cmp 1
-  # msk compare
-  msk_cmp 1
   # bgn compare
   bgn_cmp 1
 

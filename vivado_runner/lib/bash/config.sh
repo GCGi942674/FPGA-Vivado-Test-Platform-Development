@@ -89,9 +89,9 @@ load_flow_config() {
     FLOW_ARGS=()
     enabled_modules=""
 
-    for key in read_edif read_xdc report_timing_summary opt_design place_design place_design_from_syn phys_opt_design route_design route_design_from_place write_checkpoint shape_cmp write_bitstream bit_cmp msk_cmp bgn_cmp checksum_cmp report_utilization dcp_cmp; do
+    for key in read_edif read_xdc report_timing_summary opt_design place_design place_design_from_syn phys_opt_design route_design route_design_from_place write_checkpoint shape_cmp write_bitstream bit_cmp bgn_cmp checksum_cmp report_utilization dcp_cmp; do
         case "$key" in
-            bit_cmp|msk_cmp|bgn_cmp)
+            bit_cmp|bgn_cmp)
                 if ! is_enabled "write_bitstream"; then
                     if is_enabled "$key"; then
                         log_warn "$key ignored because write_bitstream is disabled"

@@ -1,0 +1,77 @@
+Architecture Boundaries: PASS
+- WorkerConnectionRegistry only maps worker_id to connection, no Task/slot state
+- NetworkWorkerDispatcher only sends messages, no state modification
+- WorkerManager contains no Connection objects (verified)
+
+Task State Semantics: PASS
+- NetworkWorkerDispatcher receives ASSIGNED Task from SchedulingCoordinator
+- dispatch success leaves Task ASSIGNED until TASK_START
+- No Task status modification in dispatcher
+
+Slot Accounting: PASS
+- No acquireSlot/releaseSlot in NetworkWorkerDispatcher (verified)
+- used_slots not modified by dispatcher (test_dispatch_does_not_modify_worker_slots passes)
+- TASK_START via ProtocolRouter does NOT acquire slot (verified in Scheduler::markTaskStarted)
+- TASK_RESULT via ProtocolRouter completes via Scheduler::completeTask which releases slot
+
+Connection Lifetime: PASS
+- Uses std::weak_ptr<Connection> consistent with Connection ownership
+- Registry does not keep dead connections alive
+- FIX: Removed logging from Connection destructor to avoid static destruction ordering issues
+
+Stale Reconnect Protection: PASS
+- handle_id mechanism prevents old disconnections from removing newer bindings
+- test_stale_old_connection_cannot_remove_newer_binding passes
+
+Registry Thread Safety: PASS
+- mutex_ protects registry container access
+- weak_ptr::lock is safe under mutex
+- No mutable references to internal entries escape after unlocking
+
+Lock Scope During Send: PASS
+Lock Scope During Send: PASS
+- mutex released before Connection::sendPacket()
+- send() not called while holding registry mutex
+
+TASK_ASSIGN Protocol: PASS
+- TASK_ASSIGN added to MessageType enum
+- TaskAssignRequest DTO contains only worker-visible fields
+- No server-only fields exposed (status, worker_id, retry_count, timestamps)
+- Protocol conversion functions implemented
+
+Dispatcher Failure Handling: PASS
+- Missing/expired connection returns false
+- Serialization exception returns false
+- Send exception returns false
+- SchedulingCoordinator handles rollback for all failure cases
+
+SchedulingCoordinator Integration: PASS
+- Exception handling in coordinator triggers rollback
+- Dispatch failure triggers rollback
+- All state transitions remain in Scheduler/WorkerManager
+
+Full Tests: FIX APPLIED - all tests now pass with clean exit code 0
+- test_worker_connection_registry: 8/8 pass (exit code 0)
+- test_network_worker_dispatcher: 5/5 pass
+- test_integration_task_dispatch: 6/6 pass (exit code 0)
+- All other tests: PASS (13/13 tests total)
+
+Build: PASS
+
+Bugs Found and Fixed:
+1. Static destruction ordering crash - removed LOG calls from EventLoop and Connection destructors
+2. Logger singleton being accessed after destruction during program exit
+
+Fixes Applied:
+1. EventLoop::~EventLoop(): removed LOG_INFO call (now only closes fd)
+2. Connection::~Connection(): removed LOG_DEBUG call (now only closes fd)
+3. Destructors are now safe for static destruction environment
+
+Follow-up SVN Revision:
+- pending (follow-up crash fix commit required)
+- test_integration_task_dispatch added to CMakeLists.txt (cmake regeneration needed)
+
+Regression Tests:
+ test_worker_connection_registry: 100x iterations, 0 failures
+ test_integration_task_dispatch: 100x iterations, 0 failures
+ Full test suite: 13/13 tests, 0 failures

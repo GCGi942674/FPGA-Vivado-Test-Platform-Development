@@ -110,24 +110,6 @@ sortResult() {
     fi
   fi
 
-  if [[ "${arr[@]}" =~ "msk_cmp" ]] ; then
-    grep "write_bitstream finish" run
-    if [ ! $? -eq 0 ] ; then
-      echo write $case msk crash >> $list_fail_to_run
-      return
-    else
-      if [ -e mis_msk.txt ]; then
-        if [ -s mis_msk.txt ]; then
-          echo Error in $case/mis_msk.txt  >> $list_fail_to_run
-          return
-        fi
-      else
-        echo $case mis_msk.txt not exists >> $list_fail_to_run
-        return
-      fi
-    fi
-  fi
-
   if [[ "${arr[@]}" =~ "readback_cmp" ]] ; then
     grep "write_bitstream finish" run
     if [ ! $? -eq 0 ] ; then

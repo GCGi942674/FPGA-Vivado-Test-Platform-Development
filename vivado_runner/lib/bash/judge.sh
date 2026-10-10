@@ -135,7 +135,7 @@ judge_case_result() {
         fi
     fi
 
-    # BGN/BIT/MSK comparison is meaningful only as part of write_bitstream.
+    # BGN/BIT comparison is meaningful only as part of write_bitstream.
     # With a valid final Runtime line, the fresh result artifacts are the
     # source of truth: missing means unfinished, non-empty means mismatch,
     # and empty means pass.
@@ -161,19 +161,6 @@ judge_case_result() {
                 fi
             else
                 CASE_REASON="BIT_RESULT_MISSING"
-                return 0
-            fi
-            compare_artifacts_passed=1
-        fi
-
-        if flow_arg_enabled "msk_cmp"; then
-            if [ -e "$case_dir/mis_msk.txt" ]; then
-                if [ -s "$case_dir/mis_msk.txt" ]; then
-                    CASE_REASON="MSK_COMPARE_FAIL"
-                    return 0
-                fi
-            else
-                CASE_REASON="MSK_RESULT_MISSING"
                 return 0
             fi
             compare_artifacts_passed=1

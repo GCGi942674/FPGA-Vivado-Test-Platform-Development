@@ -41,7 +41,7 @@ from datetime import datetime
 
 WORK_DIR = Path(os.environ.get(
     "GALAXCORE_WORK_DIR",
-    "/home/user3/workspace/galaxcore",
+    "/home/user3/workspace/galaxcore/galaxcore",
 )).expanduser()
 
 BIN_SRC = Path(os.environ.get(
@@ -94,6 +94,10 @@ SUBMIT_TEST_SCRIPT = os.environ.get(
     "GALAXCORE_SUBMIT_TEST_SCRIPT",
     "./submit_test.sh",
 )
+
+SUBMIT_TIMEOUT_SECONDS = int(os.environ.get("GALAXCORE_SUBMIT_TIMEOUT_SECONDS", "3600"))
+if SUBMIT_TIMEOUT_SECONDS <= 0:
+    raise ValueError("GALAXCORE_SUBMIT_TIMEOUT_SECONDS must be positive")
 
 SUBMIT_SUCCESS_MARKER = os.environ.get(
     "GALAXCORE_SUBMIT_SUCCESS_MARKER",
@@ -193,19 +197,40 @@ def strip_ansi(text):
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text or "")
 
 
-def run_cmd_capture(cmd, cwd=None, shell=False):
+def run_cmd_capture(cmd, cwd=None, shell=False, timeout=None):
     """Run command and return (ok, return_code, output)."""
     try:
-        p = subprocess.run(
+        p = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
             shell=shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
-            check=False,
+            start_new_session=(os.name == "posix" and timeout is not None),
         )
-        output = strip_ansi(p.stdout or "")
+        try:
+            output, _ = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # The shell and GalaxCore share this private process group on Linux.
+            if os.name == "posix":
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                p.kill()
+            try:
+                output, _ = p.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Do not wait forever if a detached descendant inherited stdout.
+                output = exc.output or ""
+                p.stdout.close()
+                p.wait(timeout=5)
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            return False, 124, strip_ansi(output or "") + "\nsubmit timed out after %s seconds" % timeout
+        output = strip_ansi(output or "")
         return p.returncode == 0, p.returncode, output
     except Exception as e:
         return False, -1, str(e)
@@ -518,7 +543,11 @@ def run_submit_test():
     ok, return_code, output = run_cmd_capture(
         ["csh", "-c", f"{SUBMIT_TEST_SCRIPT}; exit $status"],
         cwd=SUBMIT_TEST_DIR,
+        timeout=SUBMIT_TIMEOUT_SECONDS,
     )
+
+    if return_code == 124:
+        return False, "submit_timeout", output
 
     if SUBMIT_SUCCESS_MARKER in output:
         return True, "submit_success", output
@@ -1116,12 +1145,13 @@ def build_revision(rev):
     submit_ok, submit_reason, submit_output = run_submit_test()
     if not submit_ok:
         detail = summarize_submit_output(submit_output)
-        ci_log(f"FAIL r{rev} submit_failed")
+        failure_reason = "submit_timeout" if submit_reason == "submit_timeout" else "submit_failed"
+        ci_log(f"FAIL r{rev} {failure_reason}")
         ci_debug(f"submit failed for r{rev}: {submit_reason}: {detail}")
         record_failure(
             rev,
             author,
-            "submit_failed",
+            failure_reason,
             revision_time,
         )
         return False

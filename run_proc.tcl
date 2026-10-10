@@ -285,9 +285,33 @@ proc reportBgnOnly {} {
 proc bgnCmp {} {
   global params
   set case_home [getCaseHome]
-  transform_bgn ${case_home}/golden.bgn golden_cmp.bgn
-  transform_bgn output.bgn output_cmp.bgn
-  set status [catch {exec /usr/bin/diff golden_cmp.bgn output_cmp.bgn > result_bgn.log} result]
+  set archive [file normalize [file join $case_home golden.bgn.zip]]
+  if {![file isfile $archive]} {
+    puts stderr "ERROR: Golden ZIP file not found: $archive"
+    error "Golden ZIP file not found: $archive"
+  }
+
+  set temporary [file join [pwd] golden.bgn]
+  set channel [open $temporary {WRONLY CREAT EXCL}]
+  set status [catch {
+    fconfigure $channel -translation binary -encoding binary
+    exec unzip -p $archive golden.bgn >@ $channel
+    close $channel
+    set channel ""
+    if {[file size $temporary] == 0} {
+      error "Empty golden.bgn in $archive"
+    }
+    transform_bgn $temporary golden_cmp.bgn
+    transform_bgn output.bgn output_cmp.bgn
+    set diff_status [catch {exec /usr/bin/diff golden_cmp.bgn output_cmp.bgn > result_bgn.log} diff_result]
+  } result options]
+  if {$channel ne ""} {
+    catch {close $channel}
+  }
+  file delete -force $temporary
+  if {$status != 0} {
+    return -options $options $result
+  }
 }
 
 proc bitCmp {} {

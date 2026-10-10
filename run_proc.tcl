@@ -293,15 +293,14 @@ proc bgnCmp {} {
 proc bitCmp {} {
   global params
   set case_home [getCaseHome]
-  set golden [file join $case_home golden.bit]
   set archive [file normalize [file join $case_home golden.bit.zip]]
-  if {![file exists $archive]} {
-    bit_cmp $golden output.bit mis_bit.txt
-    return
+  if {![file isfile $archive]} {
+    puts stderr "ERROR: Golden ZIP file not found: $archive"
+    error "Golden ZIP file not found: $archive"
   }
 
-  # Extract only the reference member, without writing into the shared case tree.
-  set temporary [file join [pwd] "golden_cmp.[pid].[clock clicks].bit"]
+  # Keep the extracted reference beside output.bit; never overwrite an existing file.
+  set temporary [file join [pwd] golden.bit]
   set channel [open $temporary {WRONLY CREAT EXCL}]
   set status [catch {
     fconfigure $channel -translation binary -encoding binary

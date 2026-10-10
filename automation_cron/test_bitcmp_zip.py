@@ -29,11 +29,10 @@ class BitCmpZipTests(unittest.TestCase):
                     puts -nonewline [lindex $args end] "BITDATA"
                 }
             ''')
-            tcl.eval('bitCmp')
-            self.assertEqual(Path(str(tcl.getvar('compared'))), Path(root) / 'golden.bit')
             tcl.eval('close [open [file join $test_root golden.bit.zip] w]')
             tcl.setvar('unzip_fail', 0)
             tcl.eval('bitCmp')
+            self.assertEqual(Path(str(tcl.getvar('compared'))), Path(root) / 'golden.bit')
             self.assertEqual(tcl.getvar('payload'), b'BITDATA')
             self.assertFalse(Path(str(tcl.getvar('compared'))).exists())
             tcl.setvar('unzip_fail', 1)
@@ -41,7 +40,7 @@ class BitCmpZipTests(unittest.TestCase):
             with self.assertRaises(tkinter.TclError):
                 tcl.eval('bitCmp')
             self.assertEqual(tcl.getvar('compared'), '')
-            self.assertEqual(list(Path(root).glob('golden_cmp.*')), [])
+            self.assertFalse((Path(root) / 'golden.bit').exists())
 
 
 if __name__ == '__main__':

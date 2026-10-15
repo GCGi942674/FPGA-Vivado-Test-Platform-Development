@@ -1,4 +1,5 @@
 set params [dict create]
+set vvd_cmp_script [file normalize [file join [file dirname [info script]] vivado_runner lib python vvdCmpFiles.py]]
 
 proc getCaseHome {} {
   global params
@@ -286,6 +287,7 @@ proc bgnCmp {} {
   global params
   set case_home [getCaseHome]
   set archive [file normalize [file join $case_home golden.bgn.zip]]
+  puts "BGN_COMPARE_START: $archive"
   if {![file isfile $archive]} {
     puts stderr "ERROR: Golden ZIP file not found: $archive"
     error "Golden ZIP file not found: $archive"
@@ -315,34 +317,49 @@ proc bgnCmp {} {
 }
 
 proc bitCmp {} {
-  global params
+  global vvd_cmp_script
   set case_home [getCaseHome]
   set archive [file normalize [file join $case_home golden.bit.zip]]
+  puts "BIT_COMPARE_START: $archive"
   if {![file isfile $archive]} {
     puts stderr "ERROR: Golden ZIP file not found: $archive"
     error "Golden ZIP file not found: $archive"
   }
 
-  # Keep the extracted reference beside output.bit; never overwrite an existing file.
-  set temporary [file join [pwd] golden.bit]
-  set channel [open $temporary {WRONLY CREAT EXCL}]
-  set status [catch {
-    fconfigure $channel -translation binary -encoding binary
-    exec unzip -p $archive golden.bit >@ $channel
-    close $channel
-    set channel ""
-    if {[file size $temporary] == 0} {
-      error "Empty golden.bit in $archive"
-    }
-    bit_cmp $temporary output.bit mis_bit.txt
-  } result options]
-  if {$channel ne ""} {
-    catch {close $channel}
+  if {![file isfile $vvd_cmp_script]} {
+    puts stderr "ERROR: BIT comparator script not found: $vvd_cmp_script"
+    error "BIT comparator script not found: $vvd_cmp_script"
   }
-  file delete -force $temporary
+  file delete -force mis_bit.txt
+  # The deployed comparator accepts exactly two file arguments. Older versions
+  # return zero even for a mismatch; newer ones return one for a mismatch.
+  set status [catch {exec python3 $vvd_cmp_script $archive output.bit} result options]
+  set mismatch_exit 0
   if {$status != 0} {
-    return -options $options $result
+    set error_code [dict get $options -errorcode]
+    set mismatch_exit [expr {[lindex $error_code 0] eq "CHILDSTATUS" && [lindex $error_code 2] == 1}]
   }
+  if {$status == 0 || $mismatch_exit} {
+    set same [regexp {Files are same} $result]
+    set different [regexp {Files are different} $result]
+    if {$same && !$different && $status == 0} {
+      close [open mis_bit.txt w]
+      puts $result
+      return
+    }
+    if {$different && !$same} {
+      set channel [open mis_bit.txt w]
+      puts $channel $result
+      close $channel
+      puts $result
+      return
+    }
+  }
+  puts stderr "ERROR: BIT comparator failed: $result"
+  if {$status == 0} {
+    error "BIT comparator returned no unambiguous comparison result: $result"
+  }
+  return -options $options $result
 }
 
 proc checksumCmp {} {
